@@ -25,6 +25,7 @@
 //! truncated reply requires.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::pin;
 use std::str::FromStr;
@@ -200,6 +201,66 @@ struct ResolveTarget<'a> {
     config: ResolverConfig,
 }
 
+/// How long a resolver built for a custom nameserver is reused (see
+/// [`CustomResolvers`]). Short, so a nameserver given by hostname — a DoT or
+/// DoH spec, typically — is re-resolved and its addresses re-vetted at least
+/// this often in a long-lived process (REPL, TUI, seer-py, the API).
+const CUSTOM_RESOLVER_TTL: Duration = Duration::from_secs(60);
+
+/// The most custom-nameserver resolvers kept at once; the oldest is dropped
+/// to make room, so a process fed many specs (the API) stays bounded.
+const MAX_CUSTOM_RESOLVERS: usize = 32;
+
+/// One spec's resolver, filled by the first lookup through it. Lookups that
+/// arrive while it is being built wait for it rather than build their own,
+/// so concurrent lookups (posture's) share one record cache from the start.
+type CustomSlot = Arc<tokio::sync::Mutex<Option<(TokioResolver, ResolverConfig)>>>;
+
+/// Resolvers built for custom nameserver specs, shared by a [`DnsResolver`]
+/// and its clones. A resolver built per lookup started with an empty record
+/// cache and connection pool, so posture, CAA or a bulk run through one
+/// nameserver re-asked it for every repeated name (and a DoT/DoH spec paid a
+/// handshake per lookup) where the default upstream answered from cache.
+///
+/// Each entry is reused for [`CUSTOM_RESOLVER_TTL`] after it was created, at
+/// most [`MAX_CUSTOM_RESOLVERS`] at once. Keyed by the spec string: the port
+/// override, timeout and SSRF setting are fixed per `DnsResolver`, and the
+/// builder methods that change them start a new memo.
+#[derive(Default)]
+struct CustomResolvers {
+    slots: std::sync::Mutex<HashMap<String, (Instant, CustomSlot)>>,
+}
+
+impl CustomResolvers {
+    /// The slot for `spec`: its live one, or a new empty one (replacing an
+    /// expired one, after dropping every expired entry and, when still full,
+    /// the oldest).
+    fn slot(&self, spec: &str) -> CustomSlot {
+        let now = Instant::now();
+        // A panic while the map was held leaves it consistent (no partial
+        // writes), so a poisoned lock is safe to keep using.
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((created, slot)) = slots.get(spec) {
+            if now.duration_since(*created) < CUSTOM_RESOLVER_TTL {
+                return slot.clone();
+            }
+        }
+        slots.retain(|_, (created, _)| now.duration_since(*created) < CUSTOM_RESOLVER_TTL);
+        if slots.len() >= MAX_CUSTOM_RESOLVERS {
+            let oldest = slots
+                .iter()
+                .min_by_key(|(_, (created, _))| *created)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                slots.remove(&oldest);
+            }
+        }
+        let slot = CustomSlot::default();
+        slots.insert(spec.to_string(), (now, slot.clone()));
+        slot
+    }
+}
+
 /// `config` with every UDP connection replaced by TCP on the same port.
 /// Encrypted transports are kept as they are: they never truncate.
 fn tcp_only(config: &ResolverConfig) -> ResolverConfig {
@@ -354,6 +415,9 @@ pub struct DnsResolver {
     /// Not settable outside `#[cfg(test)]` builds — production paths always
     /// validate.
     allow_private_hosts: bool,
+    /// Resolvers built for custom nameservers, reused across lookups (see
+    /// [`CustomResolvers`]).
+    custom: Arc<CustomResolvers>,
     /// Test-only: nameserver spec used when a caller passes `None`, so code
     /// that always queries the default upstream (posture, CAA) can be pointed
     /// at the loopback fixture. Absent from release builds.
@@ -390,6 +454,7 @@ impl DnsResolver {
             transport: Transport::new(timeout),
             port_override: None,
             allow_private_hosts: false,
+            custom: Arc::default(),
             #[cfg(test)]
             test_default_nameserver: None,
         }
@@ -419,6 +484,7 @@ impl DnsResolver {
     #[cfg(test)]
     pub(crate) fn allowing_private_hosts(mut self) -> Self {
         self.allow_private_hosts = true;
+        self.custom = Arc::default();
         self
     }
 
@@ -427,6 +493,7 @@ impl DnsResolver {
     #[cfg(test)]
     pub(crate) fn with_port(mut self, port: u16) -> Self {
         self.port_override = Some(port);
+        self.custom = Arc::default();
         self
     }
 
@@ -448,6 +515,7 @@ impl DnsResolver {
             self.timeout,
         )
         .expect("a plain UDP resolver builds");
+        self.custom = Arc::default();
         self
     }
 
@@ -471,6 +539,7 @@ impl DnsResolver {
         self.timeout = timeout;
         self.default_resolver = build_default_resolver(timeout);
         self.transport = Transport::new(timeout);
+        self.custom = Arc::default();
         self
     }
 
@@ -479,6 +548,22 @@ impl DnsResolver {
     #[cfg(test)]
     async fn create_custom_resolver(&self, nameserver: &str) -> Result<TokioResolver> {
         Ok(self.custom_target(nameserver).await?.resolver.into_owned())
+    }
+
+    /// The resolver for `nameserver`: the memo's (see [`CustomResolvers`]),
+    /// built by [`custom_target`](Self::custom_target) on first use.
+    async fn memoized_custom_target(&self, nameserver: &str) -> Result<ResolveTarget<'static>> {
+        let slot = self.custom.slot(nameserver);
+        let mut built = slot.lock().await;
+        if built.is_none() {
+            let target = self.custom_target(nameserver).await?;
+            *built = Some((target.resolver.into_owned(), target.config));
+        }
+        let (resolver, config) = built.as_ref().expect("filled above").clone();
+        Ok(ResolveTarget {
+            resolver: Cow::Owned(resolver),
+            config,
+        })
     }
 
     /// A resolver built for `nameserver` (parsed, resolved and SSRF-vetted by
@@ -584,11 +669,13 @@ impl DnsResolver {
         }
     }
 
-    /// The resolver a [`resolve`](Self::resolve) call runs on: one built for
-    /// `nameserver`, or the cached default.
-    async fn upstream(&self, nameserver: Option<&str>) -> Result<ResolveTarget<'_>> {
+    /// The resolver a [`resolve`](Self::resolve) call runs on: the memoized
+    /// one for `nameserver` (one built for this call alone when `fresh`), or
+    /// the cached default.
+    async fn upstream(&self, nameserver: Option<&str>, fresh: bool) -> Result<ResolveTarget<'_>> {
         Ok(match self.effective_nameserver(nameserver) {
-            Some(ns) => self.custom_target(ns).await?,
+            Some(ns) if fresh => self.custom_target(ns).await?,
+            Some(ns) => self.memoized_custom_target(ns).await?,
             None => self.default_target(),
         })
     }
@@ -759,6 +846,11 @@ impl DnsResolver {
     ///   None. Accepts a bare IP/hostname with optional port (UDP),
     ///   `tls://host[:port]` (DNS over TLS), or `https://host[:port][/path]`
     ///   (DNS over HTTPS) — see [`NameserverSpec`]
+    ///
+    /// A custom nameserver's resolver is reused for up to a minute, so a
+    /// repeated name may be answered from its cache, as the default
+    /// upstream's always may. Callers that must observe the server afresh
+    /// each time (`follow`, `doctor`) use the crate's `resolve_uncached`.
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn resolve(
         &self,
@@ -766,10 +858,36 @@ impl DnsResolver {
         record_type: RecordType,
         nameserver: Option<&str>,
     ) -> Result<Vec<DnsRecord>> {
+        self.resolve_on(domain, record_type, nameserver, false)
+            .await
+    }
+
+    /// [`resolve`](Self::resolve) through a resolver built for this call
+    /// alone when `nameserver` is given, so nothing is served from an earlier
+    /// answer: for callers that watch a server over time (`follow`) or probe
+    /// its health (`doctor`), where a cached answer would hide a change or a
+    /// dead server.
+    pub(crate) async fn resolve_uncached(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        nameserver: Option<&str>,
+    ) -> Result<Vec<DnsRecord>> {
+        self.resolve_on(domain, record_type, nameserver, true).await
+    }
+
+    /// [`resolve`](Self::resolve), with a fresh custom-nameserver resolver
+    /// when `fresh`.
+    async fn resolve_on(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        nameserver: Option<&str>,
+        fresh: bool,
+    ) -> Result<Vec<DnsRecord>> {
         // Input first: a bad name must not cost a nameserver-hostname lookup.
         let domain = prepare_query(domain, record_type)?;
-        // Reuse the cached default resolver when no custom nameserver is specified
-        let target = self.upstream(nameserver).await?;
+        let target = self.upstream(nameserver, fresh).await?;
 
         debug!(
             nameserver = nameserver.unwrap_or(DEFAULT_UPSTREAM),
@@ -2645,6 +2763,82 @@ mod tests {
             .resolve(domain, record_type, Some("127.0.0.1"))
             .await
             .unwrap_or_else(|e| panic!("{record_type} lookup against mock must succeed: {e}"))
+    }
+
+    /// A loopback server answering every query with one A record, and the
+    /// count of queries it has received.
+    async fn counting_server() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let queries = Arc::new(AtomicUsize::new(0));
+        let seen = queries.clone();
+        let port = spawn_mock_dns_fn(move |_, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            MockReply::Answer(vec![a_rdata([192, 0, 2, 1])])
+        })
+        .await;
+        (port, queries)
+    }
+
+    /// Regression: a custom nameserver got a new resolver per `resolve()`,
+    /// so 100 lookups of one name sent 100 queries where the default
+    /// upstream sent one. The resolver is now reused, record cache and all,
+    /// and lookups racing to build it share one.
+    #[tokio::test]
+    async fn a_custom_nameservers_resolver_is_reused() {
+        use std::sync::atomic::Ordering;
+        let (port, queries) = counting_server().await;
+        let resolver = mock_dns_resolver(port);
+        let ns = Some("127.0.0.1");
+
+        // A clone shares the memo.
+        let clone = resolver.clone();
+        let (first, second) = tokio::join!(
+            resolver.resolve("seer.test", RecordType::A, ns),
+            clone.resolve("seer.test", RecordType::A, ns),
+        );
+        assert_eq!(first.unwrap().len(), 1);
+        assert_eq!(second.unwrap().len(), 1);
+        for _ in 0..10 {
+            resolver
+                .resolve("seer.test", RecordType::A, ns)
+                .await
+                .unwrap();
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// `resolve_uncached` (follow, doctor) asks the server every time.
+    #[tokio::test]
+    async fn resolve_uncached_asks_the_server_every_time() {
+        use std::sync::atomic::Ordering;
+        let (port, queries) = counting_server().await;
+        let resolver = mock_dns_resolver(port);
+        resolver
+            .resolve("seer.test", RecordType::A, Some("127.0.0.1"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            resolver
+                .resolve_uncached("seer.test", RecordType::A, Some("127.0.0.1"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 4);
+    }
+
+    /// The memo holds at most `MAX_CUSTOM_RESOLVERS` specs, dropping the
+    /// oldest, and hands back a live spec's own slot.
+    #[test]
+    fn the_custom_resolver_memo_is_bounded() {
+        let memo = CustomResolvers::default();
+        let first = memo.slot("ns0");
+        assert!(Arc::ptr_eq(&first, &memo.slot("ns0")));
+        for i in 1..=MAX_CUSTOM_RESOLVERS {
+            memo.slot(&format!("ns{i}"));
+        }
+        let slots = memo.slots.lock().unwrap();
+        assert_eq!(slots.len(), MAX_CUSTOM_RESOLVERS);
+        assert!(!slots.contains_key("ns0"), "the oldest is dropped");
     }
 
     #[tokio::test]

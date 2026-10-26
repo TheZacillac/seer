@@ -127,6 +127,10 @@ insta = { version = "1", features = ["filters"] }
 # reqwest and hickory; seer-core's inspection handshake (tls.rs) uses them
 # directly on the same aws-lc-rs provider.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+# The certificate verifier reqwest's `rustls` feature uses (same version range).
+# seer-core builds it once for every reqwest client (`net::client_builder`):
+# reqwest otherwise rebuilds it per client, re-reading the OS root store.
+rustls-platform-verifier = { version = "0.7", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 x509-parser = "0.18"
 

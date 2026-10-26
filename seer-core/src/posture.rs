@@ -989,19 +989,28 @@ async fn follow_spf_redirect(dns: Dns<'_>, first_target: String) -> RedirectOutc
 
 /// Counts the DNS-querying terms evaluating `record` needs (RFC 7208
 /// §4.6.4), following `include:` and `redirect=` into their records. Stops
-/// as soon as the count passes [`MAX_SPF_LOOKUPS`], so at most that many
-/// records are fetched; a target that cannot be read adds nothing beyond its
-/// own term (the count is then a lower bound).
+/// as soon as the count passes [`MAX_SPF_LOOKUPS`], and fetches at most that
+/// many records; a target that cannot be read adds nothing beyond its own
+/// term (the count is then a lower bound).
+///
+/// The targets of one level are fetched concurrently (at most
+/// [`MAX_SPF_LOOKUPS`] in flight), so N includes cost one round trip, not
+/// N. Every target was counted as a term when it was found, so a record
+/// within the limit fetches each of its targets either way, and the verdict
+/// (count above the limit or not) is the one a target-by-target walk gives.
 async fn count_spf_lookups(dns: Dns<'_>, record: &str) -> usize {
-    let (mut count, mut pending) = spf_lookup_terms(record);
-    while let Some(target) = pending.pop() {
-        if count > MAX_SPF_LOOKUPS {
-            break;
-        }
-        if let Some(included) = dns.spf_record(&target).await {
+    let (mut count, mut level) = spf_lookup_terms(record);
+    let mut fetched = 0;
+    while !level.is_empty() && count <= MAX_SPF_LOOKUPS && fetched < MAX_SPF_LOOKUPS {
+        level.truncate(MAX_SPF_LOOKUPS - fetched);
+        fetched += level.len();
+        let records =
+            futures::future::join_all(level.iter().map(|target| dns.spf_record(target))).await;
+        level = Vec::new();
+        for included in records.into_iter().flatten() {
             let (terms, targets) = spf_lookup_terms(&included);
             count += terms;
-            pending.extend(targets);
+            level.extend(targets);
         }
     }
     count
@@ -1755,6 +1764,50 @@ mod tests {
             "{:?}",
             posture.notes
         );
+    }
+
+    /// Regression: `include:` targets were fetched one at a time, so N
+    /// includes cost N round trips. Each level is now fetched at once: every
+    /// first-level target is asked before any second-level one (the
+    /// one-at-a-time walk went depth-first), and the count is unchanged.
+    #[tokio::test]
+    async fn spf_includes_are_fetched_a_level_at_a_time() {
+        use std::sync::{Arc, Mutex};
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = asked.clone();
+        let port = spawn_mock_dns_fn(move |qname, qtype| {
+            log.lock().unwrap().push(qname.to_string());
+            match (qname, qtype) {
+                ("_a.wide.test", WireType::TXT) => txt("v=spf1 include:_a2.wide.test ~all"),
+                ("_b.wide.test", WireType::TXT) => txt("v=spf1 include:_b2.wide.test ~all"),
+                ("_c.wide.test", WireType::TXT) => txt("v=spf1 ip4:192.0.2.1 ~all"),
+                (_, WireType::TXT) => txt("v=spf1 a ~all"),
+                _ => MockReply::NxDomain,
+            }
+        })
+        .await;
+        let resolver = mock_dns_resolver(port);
+        let dns = Dns {
+            resolver: &resolver,
+            nameserver: Some("127.0.0.1"),
+        };
+        let record = "v=spf1 include:_a.wide.test include:_b.wide.test include:_c.wide.test -all";
+
+        // 3 includes, 2 nested includes, and an `a` in each nested record.
+        assert_eq!(count_spf_lookups(dns, record).await, 7);
+        let asked = asked.lock().unwrap();
+        let position = |name: &str| asked.iter().position(|q| q == name).unwrap();
+        let last_first = ["_a.wide.test", "_b.wide.test", "_c.wide.test"]
+            .map(position)
+            .into_iter()
+            .max()
+            .unwrap();
+        let first_second = ["_a2.wide.test", "_b2.wide.test"]
+            .map(position)
+            .into_iter()
+            .min()
+            .unwrap();
+        assert!(last_first < first_second, "{asked:?}");
     }
 
     /// Regression: a SERVFAIL on `_dmarc` or the apex TXT read as "No

@@ -320,8 +320,35 @@ pub async fn resolve_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr
 /// User agent for seer's own HTTP probes (status, headers, takeover, webhook).
 pub(crate) const USER_AGENT: &str = concat!("Seer/", env!("CARGO_PKG_VERSION"));
 
+/// The TLS config every reqwest client is built with: what reqwest 0.13's
+/// `rustls` feature builds for a default client — the OS trust store through
+/// `rustls-platform-verifier`, TLS 1.2 and 1.3, ALPN `h2` then `http/1.1` —
+/// on the aws-lc-rs provider named explicitly, built once.
+///
+/// reqwest rebuilds the verifier for every client, and on Linux that re-reads
+/// the system root store from disk (~1.7 ms of blocking file I/O on an async
+/// worker). The guarded fetcher builds a client per redirect hop, so a bulk
+/// `status` paid that per domain and per hop. `Err` when the verifier cannot
+/// be built; [`client_builder`] then lets reqwest build its own, which
+/// reports the same failure.
+static HTTP_TLS: LazyLock<std::result::Result<rustls::ClientConfig, String>> =
+    LazyLock::new(|| {
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier =
+            rustls_platform_verifier::Verifier::new(provider.clone()).map_err(|e| e.to_string())?;
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(rustls::ALL_VERSIONS)
+            .map_err(|e| e.to_string())?
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(config)
+    });
+
 /// Starts a reqwest client for an outbound leg: an overall `timeout`,
-/// redirects never followed automatically, and no proxy.
+/// redirects never followed automatically, no proxy, and the shared TLS
+/// config (`HTTP_TLS`).
 ///
 /// reqwest's own redirect policy would resolve each `Location` host itself,
 /// skipping the SSRF guard and any `resolve_to_addrs` pin (redirect-based
@@ -330,10 +357,17 @@ pub(crate) const USER_AGENT: &str = concat!("Seer/", env!("CARGO_PKG_VERSION"));
 /// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, and a proxy resolves the target
 /// host itself, so the vetted, pinned addresses would never be used.
 pub(crate) fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
+        .no_proxy();
+    match &*HTTP_TLS {
+        Ok(tls) => builder.tls_backend_preconfigured(tls.clone()),
+        Err(e) => {
+            debug!(error = %e, "shared TLS config unavailable; reqwest builds its own");
+            builder
+        }
+    }
 }
 
 /// Orders addresses IPv4 first, each family keeping its given order.
@@ -859,5 +893,35 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ConnectError::TimedOut), "got {err:?}");
+    }
+
+    /// The shared TLS config (`HTTP_TLS`) must keep certificate verification
+    /// on: a client from `client_builder` refuses a chain that no trusted
+    /// root signs, as reqwest's own config did.
+    #[tokio::test]
+    async fn shared_tls_config_still_verifies_certificates() {
+        use crate::tls::test_support::{serve_once, CA_DER, LEAF_DER};
+
+        assert!(HTTP_TLS.is_ok(), "{:?}", HTTP_TLS.as_ref().err());
+        let addr = serve_once(&[LEAF_DER, CA_DER], rustls::ALL_VERSIONS).await;
+        let client = client_builder(Duration::from_secs(5))
+            .resolve("chain.test", addr)
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("https://chain.test:{}/", addr.port()))
+            .send()
+            .await
+            .expect_err("an untrusted chain must be refused");
+        let mut chain = Vec::new();
+        let mut source: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = source {
+            chain.push(e.to_string());
+            source = e.source();
+        }
+        assert!(
+            chain.iter().any(|m| m.contains("invalid peer certificate")),
+            "{chain:?}"
+        );
     }
 }
