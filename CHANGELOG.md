@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- HTTP clients (status, headers, takeover, audit web checks, RDAP, CT logs,
+  webhooks) share one TLS configuration instead of rebuilding it for every
+  client — on Linux each build re-read the system certificate store, about
+  1.7 ms of blocking work per fetch and per redirect hop (now ~27 µs).
+- A custom nameserver (`--nameserver`, `@ns`, `nameserver` in
+  `config.toml`) now reuses its resolver for up to a minute, so posture,
+  CAA and bulk runs through it answer repeated names from cache instead of
+  re-asking the server (and DoT/DoH no longer reconnect per lookup).
+  `follow` and `doctor` still ask the server every time.
+- `posture` fetches an SPF record's `include:` targets concurrently, one
+  level at a time: four includes went from five round trips to two.
+
 ## [0.56.0] - 2026-10-23
 
 ### Added

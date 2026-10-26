@@ -265,6 +265,9 @@ step). The tables:
   resolver so NXDOMAIN/NODATA/referrals keep their header and CNAME chain;
   everything else uses `resolve()`. NXDOMAIN/NODATA are `Ok` results there,
   and a referral is `referral_zone()`, never `is_nodata()`.
+- **`resolve()` caches a custom nameserver's answers** (its resolver is
+  memoized for a minute). Anything that watches a server over time or
+  probes its health (`follow`, `doctor`) calls `resolve_uncached`.
 - **Exit codes are a contract.** Check-style commands (status, avail,
   dnssec, compare, drift, takeover, audit, `subdomains --diff`, doctor, delegation)
   exit 1 on failure; dig, headers and posture don't. All of it lives in

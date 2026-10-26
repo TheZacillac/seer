@@ -263,10 +263,11 @@ impl DnsFollower {
             let timestamp = Utc::now();
             let iteration_num = i + 1;
 
-            // Perform DNS lookup
+            // Uncached, so a change on a custom nameserver shows at the next
+            // iteration rather than when a cached answer expires.
             let (records, error) = match self
                 .resolver
-                .resolve(&domain, record_type, nameserver)
+                .resolve_uncached(&domain, record_type, nameserver)
                 .await
             {
                 Ok(records) => (records, None),

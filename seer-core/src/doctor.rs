@@ -321,8 +321,9 @@ impl Doctor {
         let start = Instant::now();
         let outcome = timeout(
             self.probe_timeout,
+            // Uncached: a health probe must ask the server itself.
             self.resolver
-                .resolve(&self.probe_domain, RecordType::A, nameserver),
+                .resolve_uncached(&self.probe_domain, RecordType::A, nameserver),
         )
         .await;
         let latency = Some(latency_since(start));
