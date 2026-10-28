@@ -251,9 +251,11 @@ impl PropagationChecker {
                     let lookups = async {
                         // Held for the task's lifetime; caps concurrent lookups.
                         let _permit = sem.acquire().await.ok();
+                        // Uncached: a re-check must report what the vantage
+                        // says now, not its answer from the last check.
                         tokio::join!(
-                            resolver.resolve(&ns, RecordType::A, Some(&server_ip)),
-                            resolver.resolve(&ns, RecordType::AAAA, Some(&server_ip)),
+                            resolver.resolve_uncached(&ns, RecordType::A, Some(&server_ip)),
+                            resolver.resolve_uncached(&ns, RecordType::AAAA, Some(&server_ip)),
                         )
                     };
                     let ips = match tokio::time::timeout_at(deadline, lookups).await {
@@ -844,6 +846,47 @@ mod tests {
             details.per_vantage["127.0.0.1"].len(),
             MAX_ENRICHED_NAMESERVERS
         );
+    }
+
+    /// Regression: enrichment asked each vantage through `resolve()`, which
+    /// reuses a custom nameserver's resolver (record cache and all) for a
+    /// minute, so a re-check in the same process — the REPL, TUI or API —
+    /// reported the nameserver addresses the vantage gave last time. Each
+    /// check now asks the vantage afresh.
+    #[tokio::test]
+    async fn ns_enrichment_asks_each_vantage_afresh() {
+        use crate::dns::test_support::{a_rdata, mock_dns_resolver, spawn_mock_dns_fn};
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let last_octet = Arc::new(AtomicU8::new(1));
+        let current = last_octet.clone();
+        let port = spawn_mock_dns_fn(
+            move |name, qtype| match (name, qtype.to_string().as_str()) {
+                ("seer.test", "NS") => many_ns(1),
+                (_, "A") => {
+                    MockReply::Answer(vec![a_rdata([192, 0, 2, current.load(Ordering::SeqCst)])])
+                }
+                _ => MockReply::NoData,
+            },
+        )
+        .await;
+        let timeout = Duration::from_millis(500);
+        let checker = PropagationChecker::new()
+            .with_servers(mock_servers(1))
+            .with_resolver(mock_dns_resolver(port).with_timeout(timeout), timeout);
+        // The one vantage's addresses for the one nameserver.
+        let vantage_ips = |result: PropagationResult| {
+            let details = result.nameserver_details.expect("NS details");
+            let hosts = &details.per_vantage["127.0.0.1"];
+            assert_eq!(hosts.len(), 1, "{hosts:?}");
+            hosts.values().next().unwrap().clone()
+        };
+
+        let first = checker.check("seer.test", RecordType::NS).await.unwrap();
+        assert_eq!(vantage_ips(first), ["192.0.2.1"]);
+        last_octet.store(2, Ordering::SeqCst);
+        let second = checker.check("seer.test", RecordType::NS).await.unwrap();
+        assert_eq!(vantage_ips(second), ["192.0.2.2"]);
     }
 
     /// Regression: enrichment had no overall deadline — each lookup was

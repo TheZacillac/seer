@@ -211,10 +211,13 @@ const CUSTOM_RESOLVER_TTL: Duration = Duration::from_secs(60);
 /// to make room, so a process fed many specs (the API) stays bounded.
 const MAX_CUSTOM_RESOLVERS: usize = 32;
 
-/// One spec's resolver, filled by the first lookup through it. Lookups that
-/// arrive while it is being built wait for it rather than build their own,
-/// so concurrent lookups (posture's) share one record cache from the start.
-type CustomSlot = Arc<tokio::sync::Mutex<Option<(TokioResolver, ResolverConfig)>>>;
+/// One spec's resolver, installed by the first build through it to finish.
+/// Lookups racing to fill it each build their own and then use whichever
+/// was installed first, so concurrent lookups (posture's) share one record
+/// cache from the start. Nothing waits on another's build: a slow or failing
+/// one (a hostname spec that times out) would otherwise be repeated by each
+/// waiter in turn.
+type CustomSlot = Arc<std::sync::Mutex<Option<(TokioResolver, ResolverConfig)>>>;
 
 /// Resolvers built for custom nameserver specs, shared by a [`DnsResolver`]
 /// and its clones. A resolver built per lookup started with an empty record
@@ -551,15 +554,23 @@ impl DnsResolver {
     }
 
     /// The resolver for `nameserver`: the memo's (see [`CustomResolvers`]),
-    /// built by [`custom_target`](Self::custom_target) on first use.
+    /// built by [`custom_target`](Self::custom_target) on first use (see
+    /// [`CustomSlot`]).
     async fn memoized_custom_target(&self, nameserver: &str) -> Result<ResolveTarget<'static>> {
+        // Held only to read or fill the slot, never across an await. A panic
+        // there leaves it empty or filled, so a poisoned lock is safe to use.
         let slot = self.custom.slot(nameserver);
-        let mut built = slot.lock().await;
-        if built.is_none() {
-            let target = self.custom_target(nameserver).await?;
-            *built = Some((target.resolver.into_owned(), target.config));
-        }
-        let (resolver, config) = built.as_ref().expect("filled above").clone();
+        let installed = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (resolver, config) = match installed {
+            Some(built) => built,
+            None => {
+                let target = self.custom_target(nameserver).await?;
+                slot.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(|| (target.resolver.into_owned(), target.config))
+                    .clone()
+            }
+        };
         Ok(ResolveTarget {
             resolver: Cow::Owned(resolver),
             config,
@@ -850,7 +861,8 @@ impl DnsResolver {
     /// A custom nameserver's resolver is reused for up to a minute, so a
     /// repeated name may be answered from its cache, as the default
     /// upstream's always may. Callers that must observe the server afresh
-    /// each time (`follow`, `doctor`) use the crate's `resolve_uncached`.
+    /// each time (`follow`, `doctor`, propagation) use the crate's
+    /// `resolve_uncached`.
     #[instrument(skip(self), fields(domain = %domain, record_type = %record_type))]
     pub async fn resolve(
         &self,
@@ -864,9 +876,9 @@ impl DnsResolver {
 
     /// [`resolve`](Self::resolve) through a resolver built for this call
     /// alone when `nameserver` is given, so nothing is served from an earlier
-    /// answer: for callers that watch a server over time (`follow`) or probe
-    /// its health (`doctor`), where a cached answer would hide a change or a
-    /// dead server.
+    /// answer: for callers that watch a server over time (`follow`,
+    /// propagation) or probe its health (`doctor`), where a cached answer
+    /// would hide a change or a dead server.
     pub(crate) async fn resolve_uncached(
         &self,
         domain: &str,
@@ -4241,6 +4253,33 @@ mod tests {
             // Two attempts took at least two timeouts.
             assert!(elapsed < timeout * 2 - timeout / 5, "took {elapsed:?}");
         }
+    }
+
+    /// Regression: lookups through one custom nameserver waited on its memo
+    /// slot while the first built the resolver, and a failed build left the
+    /// slot empty, so each waiter then made its own attempt in turn: four
+    /// concurrent lookups through a hostname that never resolves took four
+    /// timeouts. They now fail together, in about one.
+    #[tokio::test]
+    async fn concurrent_lookups_through_a_failing_nameserver_fail_together() {
+        use crate::dns::test_support::{spawn_mock_dns_fn, MockReply};
+
+        let timeout = Duration::from_millis(500);
+        let bootstrap = spawn_mock_dns_fn(|_, _| MockReply::NoReply).await;
+        let resolver = DnsResolver::new()
+            .with_timeout(timeout)
+            .with_default_upstream_port(bootstrap)
+            .allowing_private_hosts();
+        let lookup = || resolver.resolve("seer.test", RecordType::A, Some("ns.bootstrap.test"));
+
+        let started = Instant::now();
+        let results = future::join_all((0..4).map(|_| lookup())).await;
+        let elapsed = started.elapsed();
+        for result in results {
+            let err = result.expect_err("the hostname never resolves");
+            assert!(err.to_string().contains("ns.bootstrap.test"), "{err}");
+        }
+        assert!(elapsed < timeout * 2, "took {elapsed:?}");
     }
 
     /// Regression: `query()`'s two-timeout budget started only after the

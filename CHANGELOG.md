@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config.toml`) now reuses its resolver for up to a minute, so posture,
   CAA and bulk runs through it answer repeated names from cache instead of
   re-asking the server (and DoT/DoH no longer reconnect per lookup).
-  `follow` and `doctor` still ask the server every time.
+  `follow`, `doctor` and propagation's per-vantage nameserver lookups
+  still ask the server every time.
 - `posture` fetches an SPF record's `include:` targets concurrently, one
   level at a time: four includes went from five round trips to two.
 
