@@ -4,7 +4,7 @@ members = ["cargo:."]
 # Config for 'dist'
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.32.0"
+cargo-dist-version = "0.33.1"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app.
@@ -22,7 +22,7 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 # Windows release build (see the file for the history).
 github-build-setup = "../build-setup.yml"
 
-# Override the GitHub Action refs dist bakes into `release.yml`. dist 0.32.0
+# Override the GitHub Action refs dist bakes into `release.yml`. dist 0.33.1
 # still defaults `actions/checkout` to `v6`, while every hand-written workflow
 # (ci.yml, publish.yml) is on `v7` — so Dependabot repeatedly opened a
 # github-actions PR bumping release.yml, which then failed the `plan` job
