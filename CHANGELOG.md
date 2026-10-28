@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The crates now declare their MSRV (Rust 1.89) in their own manifests;
+  `seer-core` on crates.io previously listed none. The workspace also moves
+  to Cargo's MSRV-aware resolver (`resolver = "3"`), so `cargo update` no
+  longer picks dependency versions that need a newer Rust.
+- Releases are built with cargo-dist 0.33.1 (was 0.32.0). For flat
+  installs, the shell installer now keeps its `env` PATH helper in
+  `~/.config/seer` beside the install receipt, and moves an existing one
+  there on upgrade.
+- Dependencies refreshed to their latest semver-compatible versions.
+
 ### Fixed
 - `dnssec`: a name that is a CNAME to a deleted target (a dangling `www`)
   was reported as nonexistent and graded unsigned; it is now evaluated at
