@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-10-28
+
 ### Changed
 - The crates now declare their MSRV (Rust 1.89) in their own manifests;
   `seer-core` on crates.io previously listed none. The workspace also moves
@@ -2204,7 +2206,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.56.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.57.0...HEAD
+[0.57.0]: https://github.com/TheZacillac/seer/compare/v0.56.0...v0.57.0
 [0.56.0]: https://github.com/TheZacillac/seer/compare/v0.55.0...v0.56.0
 [0.55.0]: https://github.com/TheZacillac/seer/compare/v0.54.0...v0.55.0
 [0.54.0]: https://github.com/TheZacillac/seer/compare/v0.53.1...v0.54.0
