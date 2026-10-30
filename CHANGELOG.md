@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rustyline 19 uses the `cfg_select!` macro, which raises the workspace MSRV
   from **Rust 1.89 to 1.95** (the release that stabilized `cfg_select!`). The
   `msrv` CI job and the README / AGENTS.md references move to 1.95 to match.
+- `seer-py`: when the compiled extension (`seer._seer`) is out of date or
+  incompatible with the Python layer — a missing binding, or a library that
+  won't load — the import now fails with an actionable "rebuild with
+  `maturin develop`" message instead of a bare `ImportError`. This is the
+  stale-build failure that had repeatedly crash-looped the MCP server
+  (`bulk_ssl`, `subdomains_classify`, `ConfigError`).
 
 ## [0.57.0] - 2026-10-28
 
