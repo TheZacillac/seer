@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `rustyline` 18 → 19. The REPL's file-history API is unchanged, but
+  rustyline 19 uses the `cfg_select!` macro, which raises the workspace MSRV
+  from **Rust 1.89 to 1.95** (the release that stabilized `cfg_select!`). The
+  `msrv` CI job and the README / AGENTS.md references move to 1.95 to match.
+
 ## [0.57.0] - 2026-10-28
 
 ### Changed
