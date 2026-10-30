@@ -105,7 +105,7 @@ cd seer-api && pytest                                                           
 
 CI also runs clippy with `--features otel`, the rustdoc gate with
 `--no-default-features`, tests on Linux/macOS/Windows, an MSRV
-`cargo check --locked` (Rust 1.89, set by rustyline 18's `File::lock`) and
+`cargo check --locked` (Rust 1.95, set by rustyline 19's `cfg_select!`) and
 informational coverage. Python test failures block merges like Rust ones.
 
 ---

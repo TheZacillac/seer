@@ -14,10 +14,10 @@ unused_qualifications = "warn"
 [workspace.package]
 version = "0.57.0"
 edition = "2021"
-# Real MSRV, enforced by the `msrv` CI job. The floor comes from rustyline 18
-# (uses `File::lock`, stabilized in 1.89). Bump this when a dependency raises
-# it; don't lower it below what CI verifies.
-rust-version = "1.89"
+# Real MSRV, enforced by the `msrv` CI job. The floor comes from rustyline 19
+# (uses the `cfg_select!` macro, stabilized in 1.95). Bump this when a
+# dependency raises it; don't lower it below what CI verifies.
+rust-version = "1.95"
 authors = ["Zac Roach"]
 license = "MIT"
 repository = "https://github.com/TheZacillac/seer"
@@ -67,7 +67,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "now", 
 
 # CLI
 # Only file history is used — no custom key bindings or filename completion.
-rustyline = { version = "18", default-features = false, features = ["with-file-history"] }
+rustyline = { version = "19", default-features = false, features = ["with-file-history"] }
 shlex = "2"
 colored = "3"
 indicatif = "0.18"
