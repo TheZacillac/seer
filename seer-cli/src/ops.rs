@@ -35,6 +35,18 @@ pub const BULK_OPS: &[(&str, &str)] = &[
     ("caa", "Look up CAA (cert authority) policy"),
 ];
 
+/// The [`BULK_OPS`] names alone, for the TUI's Op choice. Derived, so it
+/// cannot drift from the table.
+pub const BULK_OP_NAMES: &[&str] = &{
+    let mut names = [""; BULK_OPS.len()];
+    let mut i = 0;
+    while i < names.len() {
+        names[i] = BULK_OPS[i].0;
+        i += 1;
+    }
+    names
+};
+
 /// Comma-separated bulk operation names, for error messages and help.
 pub static BULK_OPS_SUMMARY: LazyLock<String> = LazyLock::new(|| {
     let names: Vec<&str> = BULK_OPS.iter().map(|(name, _)| *name).collect();
@@ -479,6 +491,12 @@ pub fn no_subdomain_baseline_note(domain: &str, record: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_op_names_follow_the_table() {
+        let from_table: Vec<&str> = BULK_OPS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(BULK_OP_NAMES, from_table.as_slice());
+    }
 
     #[test]
     fn every_canonical_op_maps_to_an_operation() {

@@ -16,6 +16,7 @@ mod event;
 mod filter;
 mod lenses;
 mod line_editor;
+mod options;
 mod panes;
 mod render;
 #[cfg(test)]

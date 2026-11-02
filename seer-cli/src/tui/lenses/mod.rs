@@ -3,7 +3,8 @@
 //! flags — `interactive` (↵ focuses it without rows), `filter` (`/` filters
 //! its rows) and `heavy` (an active scan, run only on request) — so `App`
 //! reads them here instead of keeping its own lists of keys, and its `keys`:
-//! the pane keys the status bar and `?` overlay list for it.
+//! the pane keys the status bar and `?` overlay list for it. Its `options`
+//! are the fields of the Options box, declared in `options.rs`.
 
 pub mod audit;
 pub mod avail;
@@ -29,6 +30,8 @@ pub mod watch;
 pub mod whois;
 
 use crossterm::event::KeyCode;
+
+use crate::tui::options::{self, OptSpec};
 
 /// A lens's identity. Every lens-keyed table (per-lens state, fetch
 /// generations, filters, the renderer and pane dispatch) is keyed by this
@@ -148,6 +151,8 @@ pub struct Lens {
     pub cmd: &'static str,
     pub group: &'static str,
     pub tabs: &'static [&'static str],
+    /// The Options box's fields (see `options.rs`); empty collapses the box.
+    pub options: &'static [OptSpec],
     /// ↵ focuses the pane even with no rows: its controls work without data.
     pub interactive: bool,
     /// `/` filters the loaded rows.
@@ -170,6 +175,7 @@ const fn lens(key: LensKey, label: &'static str, glyph: &'static str, group: &'s
         cmd: key.as_str(),
         group,
         tabs: &[],
+        options: &[],
         interactive: false,
         filter: false,
         heavy: false,
@@ -186,6 +192,10 @@ impl Lens {
     /// Sub-tabs, cycled with `[` / `]`.
     const fn tabs(self, tabs: &'static [&'static str]) -> Self {
         Self { tabs, ..self }
+    }
+
+    const fn options(self, options: &'static [OptSpec]) -> Self {
+        Self { options, ..self }
     }
 
     const fn interactive(self) -> Self {
@@ -226,6 +236,7 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Whois, "WHOIS", "▤", "LOOKUP"),
     lens(LensKey::Rdap, "RDAP", "▦", "LOOKUP")
         .tabs(&["Domain", "IP", "ASN"])
+        .options(options::RDAP)
         .interactive(),
     lens(LensKey::Reverse, "Reverse DNS", "↩", "LOOKUP"),
     lens(LensKey::Avail, "Availability", "◎", "LOOKUP"),
@@ -238,22 +249,25 @@ static LENSES: &[Lens] = &[
     // Interactive so `s` can change the nameserver of an empty answer.
     lens(LensKey::Dns, "Records", "≣", "DNS")
         .cmd("dig")
+        .options(options::RECORDS)
         .interactive()
         .filter()
         .keys(&[hint(KeyCode::Char('s'), "nameserver")]),
     lens(LensKey::Dnssec, "DNSSEC", "◑", "DNS"),
     // `a` / `b` cycle the resolvers even before a comparison has loaded.
     lens(LensKey::Compare, "Compare", "≍", "DNS")
+        .options(options::COMPARE)
         .interactive()
         .keys(&[
             hint(KeyCode::Char('a'), "resolver A"),
             hint(KeyCode::Char('b'), "resolver B"),
         ]),
-    lens(LensKey::Trace, "Trace", "⇶", "DNS"),
+    lens(LensKey::Trace, "Trace", "⇶", "DNS").options(options::TRACE),
     lens(LensKey::Propagation, "Propagation", "◐", "DNS")
         .cmd("prop")
         .filter(),
     lens(LensKey::Follow, "Follow", "⟳", "DNS")
+        .options(options::FOLLOW)
         .interactive()
         .keys(&[
             hint(KeyCode::Char('s'), "start"),
@@ -273,9 +287,11 @@ static LENSES: &[Lens] = &[
         .heavy(),
     // `↵` diffs only once a second domain is set, so it is not hinted.
     lens(LensKey::Diff, "Diff", "⇄", "POWER")
+        .options(options::DIFF)
         .interactive()
         .keys(&[hint(KeyCode::Char('e'), "2nd domain")]),
     lens(LensKey::Bulk, "Bulk", "⧉", "POWER")
+        .options(options::BULK)
         .interactive()
         .keys(&[
             hint(KeyCode::Char('o'), "op"),
@@ -454,6 +470,17 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_ids_are_unique_per_lens() {
+        for lens in lenses() {
+            let mut ids: Vec<_> = lens.options.iter().map(|s| s.id).collect();
+            let n = ids.len();
+            ids.sort_by_key(|id| format!("{id:?}"));
+            ids.dedup();
+            assert_eq!(ids.len(), n, "{} declares an option twice", lens.label);
+        }
+    }
 
     #[test]
     fn hint_labels_come_from_their_key_code() {
