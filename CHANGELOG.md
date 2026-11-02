@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interval and count, Diff's second domain, Bulk's op, source (domains or
   file) and the domains or file it takes, and RDAP's Domain / IP / ASN query
   (formerly sub-tabs). Changing an option re-runs the function; Audit,
-  Subdomains, Takeover, Bulk and Follow still wait for `↵`. `Tab` /
-  `Shift-Tab` move between sections and `1`–`4` jump to one; the old
+  Subdomains, Takeover, Bulk and Follow still wait for `↵` in Function
+  (which also retries a failed lookup). `Tab` /
+  `Shift-Tab` move between sections and `1`–`4` jump to one; frames under 70
+  columns stack the sections, with Function as a popup; the old
   single-key option shortcuts (`s`, `a`/`b`, `i`/`n`, `o`/`d`/`f`/`r` in
   Bulk, `e` in Diff, `f` in TLD), `[`/`]` sub-tabs and `1`–`9` lens jumps are
   gone. Records and Trace no longer share one record type.
