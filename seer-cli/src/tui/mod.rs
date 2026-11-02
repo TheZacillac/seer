@@ -3,10 +3,12 @@
 //! `run()` sets up the terminal (raw mode + alternate screen + panic-restore
 //! hook) and drives an async `tokio::select!` loop over crossterm input, a
 //! results channel, and an animation tick. `App` (in `app`) is the pure state
-//! machine; `render` draws it (only when it changed, or while something
-//! animates); `data` runs lookups through the CLI's single-shot pipeline.
-//! Every background task is owned by [`Tasks`], which aborts it when its
-//! result is superseded and when the loop ends.
+//! machine; the screen is four sections — Domain, Function, Options, Details
+//! (`layout`) — and each lens's options are declared in `options`. `render`
+//! draws it (only when it changed, or while something animates); `data` runs
+//! lookups through the CLI's single-shot pipeline. Every background task is
+//! owned by [`Tasks`], which aborts it when its result is superseded and when
+//! the loop ends.
 
 mod action;
 mod app;

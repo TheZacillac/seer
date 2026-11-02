@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **TUI layout (breaking keys).** The TUI is now four sections — Domain,
+  Function, Options and Details — replacing the top bar and the two nav
+  strips. Each function's settings sit in a visible Options box: Records'
+  type and nameserver, Compare's two resolvers, Trace's type, Follow's
+  interval and count, Diff's second domain, Bulk's op, source (domains or
+  file) and the domains or file it takes, and RDAP's Domain / IP / ASN query
+  (formerly sub-tabs). Changing an option re-runs the function; Audit,
+  Subdomains, Takeover, Bulk and Follow still wait for `↵`. `Tab` /
+  `Shift-Tab` move between sections and `1`–`4` jump to one; the old
+  single-key option shortcuts (`s`, `a`/`b`, `i`/`n`, `o`/`d`/`f`/`r` in
+  Bulk, `e` in Diff, `f` in TLD), `[`/`]` sub-tabs and `1`–`9` lens jumps are
+  gone. Records and Trace no longer share one record type.
+
 ## [0.57.0] - 2026-10-28
 
 ### Changed

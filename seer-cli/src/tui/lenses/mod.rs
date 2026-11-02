@@ -1,10 +1,10 @@
 //! Registry of the 22 lenses shown in the Function list, grouped LOOKUP / DNS /
 //! SECURITY / POWER. Each `LENSES` entry also carries the lens's behaviour
 //! flags — `interactive` (↵ focuses it without rows), `filter` (`/` filters
-//! its rows) and `heavy` (an active scan, run only on request) — so `App`
-//! reads them here instead of keeping its own lists of keys, and its `keys`:
-//! the pane keys the status bar and `?` overlay list for it. Its `options`
-//! are the fields of the Options box, declared in `options.rs`.
+//! its rows), `heavy` (an active scan, run only on request) and `options` (its
+//! Options-section fields, see `options.rs`) — so `App` reads them here
+//! instead of keeping its own lists of keys, and its `keys`: the Details-section
+//! action keys the status bar and `?` overlay list for it.
 
 pub mod audit;
 pub mod avail;

@@ -1,5 +1,7 @@
 //! Pure application state for the TUI. No ratatui imports — `render.rs` reads
-//! this. `update(Msg) -> Vec<Action>` is the single state transition.
+//! this. `update(Msg) -> Vec<Action>` is the single state transition. Focus is
+//! one of four `Section`s; option values live in `options`, and `default_req`
+//! is the only place they become a request.
 
 use std::collections::HashMap;
 

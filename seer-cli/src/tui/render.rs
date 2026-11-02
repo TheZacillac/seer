@@ -1,7 +1,8 @@
 //! Reads `&App` and draws the full frame: the four numbered sections (1 Domain,
-//! 2 Function, 3 Options, 4 Details) placed by `layout`, the status/command
-//! bar, and the switcher and help overlays. Narrow frames show Function as a
-//! one-row line and open the list as a popup while it has focus.
+//! 2 Function, 3 Options (collapsed when empty), 4 Details) placed by `layout`,
+//! the status/command bar, and the switcher and help overlays. Frames under 70
+//! columns stack the sections, showing Function as a one-row line that opens
+//! the list as a popup while it has focus.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
