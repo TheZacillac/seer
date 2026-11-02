@@ -14,6 +14,7 @@ mod command;
 mod data;
 mod event;
 mod filter;
+mod layout;
 mod lenses;
 mod line_editor;
 mod options;

@@ -1,7 +1,9 @@
-//! Reads `&App` and draws the full frame: top bar, nav, main pane, status/cmd
-//! bar, and the help overlay.
+//! Reads `&App` and draws the full frame: the four numbered sections (1 Domain,
+//! 2 Function, 3 Options, 4 Details) placed by `layout`, the status/command
+//! bar, and the switcher and help overlays. Narrow frames show Function as a
+//! one-row line and open the list as a popup while it has focus.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
@@ -10,11 +12,12 @@ use seer_core::output::sanitize_line;
 
 use crate::tui::action::{EditTarget, InputMode, LensData, LensKey, LensState, Section};
 use crate::tui::app::{App, SPIN};
-use crate::tui::lenses::{self};
+use crate::tui::layout;
+use crate::tui::lenses;
 use crate::tui::line_editor::LineEditor;
 use crate::tui::options::OptId;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{inspector, page, panel};
+use crate::tui::widgets::{self, function_list, inspector, page, panel};
 
 /// The in-progress editor for `target`, if a matching field is active (the
 /// editor, not just its text, so renderers can place the caret at the cursor).
@@ -26,7 +29,7 @@ fn field_buf(mode: &InputMode, target: EditTarget) -> Option<&LineEditor> {
 }
 
 /// Status-bar prompt for edit fields that no pane draws inline. `None` means
-/// the field is rendered elsewhere (top bar, its lens, or the filter line) —
+/// the field is rendered elsewhere (the domain box, its lens, or the filter line) —
 /// the match is exhaustive so a new field can't silently go undrawn again.
 fn status_prompt(target: EditTarget) -> Option<&'static str> {
     match target {
@@ -50,24 +53,58 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
         area,
     );
-    // Top bar, the group row, the active group's lenses, the lens, status.
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let fields = option_fields(app);
+    let inner_w = if area.width < layout::NARROW_W {
+        area.width
+    } else {
+        area.width.saturating_sub(layout::LEFT_W)
+    }
+    .saturating_sub(2);
+    let opt_lines =
+        widgets::options::lines(theme, &fields, inner_w, app.section == Section::Options);
+    let rows = if fields.is_empty() {
+        0
+    } else {
+        u16::try_from(opt_lines.len()).unwrap_or(u16::MAX)
+    };
+    let a = layout::split(area, rows);
 
-    top_bar(f, rows[0], app, theme);
-    strip_groups(f, rows[1], app, theme);
-    strip_lenses(f, rows[2], app, theme);
-    main_pane(f, rows[3], app, theme);
-    status_or_command(f, rows[4], app, theme);
+    domain_box(f, a.domain, app, theme);
+    if a.narrow {
+        function_line(f, a.function, app, theme);
+    } else {
+        function_list::draw(
+            f,
+            a.function,
+            theme,
+            app.lens,
+            app.section == Section::Function,
+        );
+    }
+    if let Some(r) = a.options {
+        let title = section_title(Section::Options, "Options");
+        let inner = panel::render(
+            f,
+            r,
+            theme,
+            &title,
+            theme.peach,
+            app.section == Section::Options,
+        );
+        f.render_widget(Paragraph::new(opt_lines), inner);
+    }
+    main_pane(f, a.details, app, theme);
+    status_or_command(f, a.status, app, theme);
 
+    if a.narrow && app.section == Section::Function {
+        let want = u16::try_from(lenses::lenses().len() + 6).unwrap_or(u16::MAX);
+        let popup = Rect {
+            height: a.details.height.min(want),
+            ..a.details
+        };
+        f.render_widget(Clear, popup);
+        function_list::draw(f, popup, theme, app.lens, true);
+    }
     if let Some(buf) = field_buf(&app.input_mode, EditTarget::Switcher) {
         switcher(f, area, buf, theme);
     }
@@ -76,136 +113,88 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     }
 }
 
-fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let domain = app.domain.as_deref().unwrap_or("(no target)");
-    let target = match &app.input_mode {
-        InputMode::Field {
-            target: EditTarget::Target,
-            buf,
-        } => format!("⌕ {}", buf.with_caret("▏")),
-        // Other field targets are rendered inside their panes; top-bar shows current domain.
-        _ => format!("⌕ {domain}"),
-    };
-    let ip = match app.state_of(app.lens) {
-        LensState::Loading => format!("{} resolving…", SPIN[app.spin]),
-        _ => String::new(),
-    };
-    let mode = if app.section == Section::Details {
-        "‹pane›"
-    } else {
-        "‹nav›"
-    };
-    let mut spans = vec![
-        Span::styled(
-            "🔮 seer",
-            Style::default()
-                .fg(theme.mauve)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  │  ", Style::default().fg(theme.surface1)),
-        Span::styled("target ", Style::default().fg(theme.overlay)),
-        Span::styled(target, Style::default().fg(theme.text)),
-        Span::styled(format!("  {ip}  "), Style::default().fg(theme.teal)),
-    ];
-    if app.format != seer_core::output::OutputFormat::Human {
-        spans.push(Span::styled(
-            format!(" --format {:?} ", app.format).to_lowercase(),
-            Style::default().fg(theme.green),
-        ));
-    }
-    spans.push(Span::styled(
-        format!("  {mode}  "),
-        Style::default().fg(theme.lavender),
-    ));
-    spans.push(Span::styled(
-        format!("│ v{}", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(theme.overlay0),
-    ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
-        area,
-    );
+/// A section box's title: its number, then `name`.
+fn section_title(section: Section, name: &str) -> String {
+    format!("{} {name}", section.number())
 }
 
-/// The nav groups, the active one highlighted.
-fn strip_groups(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let active = app.current_lens().group;
-    let mut spans = vec![Span::raw(" ")];
-    for group in lenses::groups() {
-        let style = if group == active {
-            Style::default()
-                .fg(theme.base)
-                .bg(theme.mauve)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.subtext)
-        };
-        spans.push(Span::styled(format!(" {group} "), style));
-        spans.push(Span::raw(" "));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
-        area,
-    );
-}
-
-/// The active group's lenses, numbered for `1`–`9`. When they are wider
-/// than the row, leading lenses give way until the active one fits, and a
-/// `‹` / `›` marks each clipped edge.
-fn strip_lenses(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let all = lenses::lenses();
-    let members = lenses::group_members(app.current_lens().group);
-    let items: Vec<Span> = members
-        .iter()
+/// The current lens's visible options as Options-box fields.
+fn option_fields(app: &App) -> Vec<widgets::options::Field<'_>> {
+    let key = app.current_lens().key;
+    app.visible_options()
+        .into_iter()
         .enumerate()
-        .map(|(n, &i)| {
-            let l = &all[i];
-            let text = format!(" {} {} {} ", n + 1, l.glyph, l.label);
-            let style = if i == app.lens {
-                Style::default()
-                    .fg(theme.text)
-                    .bg(theme.surface0)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.subtext)
-            };
-            Span::styled(text, style)
+        .map(|(i, spec)| {
+            let (value, placeholder) = app.options.display(key, spec);
+            widgets::options::Field {
+                label: spec.label,
+                value,
+                placeholder,
+                selected: i == app.opt_cursor,
+                editing: field_buf(&app.input_mode, EditTarget::Option(spec.id)),
+                invalid: app.opt_error == Some(spec.id),
+            }
         })
-        .collect();
-    let active = members.iter().position(|&i| i == app.lens).unwrap_or(0);
-    let width = usize::from(area.width);
-    let span_w = |range: &[Span]| range.iter().map(Span::width).sum::<usize>();
-    // Room for the marks either side.
-    const MARK: usize = 2;
-    let mut start = 0;
-    while start < active && MARK + span_w(&items[start..=active]) + MARK > width {
-        start += 1;
-    }
-    let mut end = start;
-    while end < items.len() {
-        let more = end + 1 < items.len();
-        let reserve = if more { MARK } else { 0 };
-        if MARK + span_w(&items[start..=end]) + reserve > width && end > active {
-            break;
-        }
-        end += 1;
-    }
-    let mut spans = vec![Span::styled(
-        if start > 0 { "‹ " } else { "  " },
-        Style::default().fg(theme.overlay0),
-    )];
-    spans.extend(items[start..end].iter().cloned());
-    if end < items.len() {
-        spans.push(Span::styled(" ›", Style::default().fg(theme.overlay0)));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
+        .collect()
+}
+
+fn domain_box(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let title = section_title(Section::Domain, "Domain");
+    let inner = panel::render(
+        f,
         area,
+        theme,
+        &title,
+        theme.mauve,
+        app.section == Section::Domain,
     );
+    let (text, style) = match field_buf(&app.input_mode, EditTarget::Target) {
+        Some(buf) => (buf.with_caret("▏"), Style::default().fg(theme.text)),
+        None => match app.domain.as_deref() {
+            Some(d) => (d.to_string(), Style::default().fg(theme.text)),
+            None => (
+                "type a domain".to_string(),
+                Style::default().fg(theme.overlay0),
+            ),
+        },
+    };
+    let line = Line::from(vec![
+        Span::styled("⌕ ", Style::default().fg(theme.overlay)),
+        Span::styled(sanitize_line(&text), style),
+    ]);
+    f.render_widget(Paragraph::new(line), inner);
+}
+
+/// The narrow frame's one-row stand-in for the function list.
+fn function_line(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let l = app.current_lens();
+    let style = if app.section == Section::Function {
+        Style::default().fg(theme.base).bg(theme.mauve)
+    } else {
+        Style::default().fg(theme.subtext)
+    };
+    let text = format!(
+        " {} {} › {} {} ",
+        Section::Function.number(),
+        l.group,
+        l.glyph,
+        l.label
+    );
+    f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+}
+
+/// The Details section's title: `4 <title>`, with the spinner while loading.
+fn details_title(app: &App, title: &str) -> String {
+    let t = section_title(Section::Details, title);
+    match app.state_of(app.lens) {
+        LensState::Loading => format!("{t}  {} resolving…", SPIN[app.spin]),
+        _ => t,
+    }
 }
 
 fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let lens = app.current_lens();
+    let focused = app.section == Section::Details;
 
     // Pane-driven interactive lenses render from `app.panes` state, not from a
     // fetched `LensData`, so they never reach `LensState::Loaded`. They have no
@@ -228,7 +217,6 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 theme,
                 domain_a.as_deref(),
                 &b,
-                app.section == Section::Details,
                 app.state_of(app.lens),
             ))
         }
@@ -249,8 +237,9 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
         _ => None,
     };
-    if let Some(p) = pane_page {
-        page::draw(f, area, theme, p, app.section == Section::Details);
+    if let Some(mut p) = pane_page {
+        p.title = details_title(app, &p.title);
+        page::draw(f, area, theme, p, focused);
         return;
     }
 
@@ -267,11 +256,14 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 format!("{} querying {target}…", SPIN[app.spin]),
                 Style::default().fg(theme.overlay),
             ));
-            f.render_widget(Paragraph::new(line), area);
+            let title = details_title(app, lens.label);
+            let inner = panel::render(f, area, theme, &title, theme.overlay, false);
+            f.render_widget(Paragraph::new(line), inner);
             return;
         }
         LensState::Error(e) => {
-            let inner = panel::render(f, area, theme, lens.label, theme.red, false);
+            let title = details_title(app, lens.label);
+            let inner = panel::render(f, area, theme, &title, theme.red, false);
             // Errors quote remote servers: one sanitized line, wrapped to
             // the panel rather than clipped at its edge.
             f.render_widget(
@@ -291,18 +283,18 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 (LensKey::Rdap, Some(2), _) => {
                     "use :rdap AS<number>  (e.g. :rdap AS15169)".to_string()
                 }
-                (LensKey::Rdap, Some(1), _) => {
-                    "use :rdap <ip>  or navigate to a domain first".to_string()
-                }
+                (LensKey::Rdap, Some(1), _) => "use :rdap <ip>  or run Records first".to_string(),
                 // A heavy lens waits for ↵ rather than scanning on navigation.
                 (_, _, Some(domain)) if lens.heavy => format!(
                     "press ↵ to run {} for {domain}  (active scan: CT logs + HTTP probes)",
                     lens.label
                 ),
-                _ => "press / to look up a domain".to_string(),
+                _ => "type a domain in 1 Domain".to_string(),
             };
             let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
-            f.render_widget(Paragraph::new(hint), area);
+            let title = details_title(app, lens.label);
+            let inner = panel::render(f, area, theme, &title, theme.overlay, focused);
+            f.render_widget(Paragraph::new(hint), inner);
             return;
         }
         LensState::Loaded(_) => {}
@@ -316,15 +308,8 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             let text = crate::payload::serialize(data, app.format);
             let lines: Vec<Line> = text.lines().map(|l| Line::from(sanitize_line(l))).collect();
             let total = lines.len();
-            let raw_title = format!("{} · raw", lens.label);
-            let inner = panel::render(
-                f,
-                area,
-                theme,
-                &raw_title,
-                theme.green,
-                app.section == Section::Details,
-            );
+            let raw_title = details_title(app, &format!("{} · raw", lens.label));
+            let inner = panel::render(f, area, theme, &raw_title, theme.green, focused);
             // Stop once the last line reaches the panel's bottom.
             let max = total.saturating_sub(usize::from(inner.height));
             let top = usize::from(app.raw_scroll).min(max);
@@ -343,7 +328,6 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // centrally here (same `filter::apply` used by `App::row_count`) so the
     // renderer, selection, and scroll all see the same visible subset.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
-        let focused = app.section == Section::Details;
         let filter = app.active_filter();
         let filtered = crate::tui::filter::apply(data, &filter);
         let render_data = filtered.as_ref().unwrap_or(data);
@@ -352,9 +336,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             .options
             .choice(LensKey::Rdap, OptId::RdapQuery)
             .unwrap_or(0);
-        lenses::render(
-            f,
-            area,
+        if let Some(mut p) = lenses::page(
             theme,
             lens.key,
             rdap_query,
@@ -362,7 +344,10 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             &filter,
             focused,
             app.sel,
-        );
+        ) {
+            p.title = details_title(app, &p.title);
+            page::draw(f, area, theme, p, focused);
+        }
     }
 }
 
@@ -434,9 +419,17 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
     let lens = app.current_lens();
     let mut spans = vec![Span::styled(
-        format!("{} {}  ", lens.glyph, lens.label),
-        Style::default().fg(theme.lavender),
+        "🔮 seer  ",
+        Style::default()
+            .fg(theme.mauve)
+            .add_modifier(Modifier::BOLD),
     )];
+    if app.format != seer_core::output::OutputFormat::Human {
+        spans.push(Span::styled(
+            format!("--format {:?}  ", app.format).to_lowercase(),
+            Style::default().fg(theme.green),
+        ));
+    }
     if let Some(t) = &app.toast {
         spans.push(Span::styled(
             format!("● {}", sanitize_line(&t.msg)),
@@ -452,29 +445,41 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ));
     }
     spans.push(Span::raw(" "));
-    // A focused pane lists its own keys; otherwise the global ones.
-    let lens_keys: Vec<(String, &str)> = lens.keys.iter().map(|h| (h.label(), h.what)).collect();
-    let keys: Vec<(String, &str)> = if app.section == Section::Details && !lens_keys.is_empty() {
-        let mut keys = lens_keys;
-        if lens.filterable() {
-            keys.push(("/".to_string(), "filter"));
+    // The focused section lists the keys that act in it.
+    let keys: Vec<(String, &str)> = match app.section {
+        Section::Domain => vec![
+            ("↵".into(), "apply"),
+            ("esc".into(), "revert"),
+            ("tab".into(), "next"),
+        ],
+        Section::Options => vec![
+            ("j/k".into(), "field"),
+            ("h/l".into(), "change"),
+            ("↵".into(), "edit · run"),
+            ("esc".into(), "back"),
+            ("?".into(), "help"),
+        ],
+        Section::Details => {
+            let mut keys: Vec<(String, &str)> =
+                lens.keys.iter().map(|h| (h.label(), h.what)).collect();
+            if lens.filterable() {
+                keys.push(("/".into(), "filter"));
+            }
+            keys.extend([("esc".into(), "back"), ("?".into(), "help")]);
+            keys
         }
-        keys.extend([("h".to_string(), "back"), ("?".to_string(), "help")]);
-        keys
-    } else {
-        [
+        Section::Function => [
             ("j/k", "move"),
+            ("tab", "section"),
             ("␣", "go to"),
-            ("tab", "focus"),
             ("r", "raw"),
             ("y", "copy"),
-            ("/", "lookup"),
             (":", "cmd"),
             ("?", "help"),
         ]
         .into_iter()
         .map(|(k, t)| (k.to_string(), t))
-        .collect()
+        .collect(),
     };
     for (k, t) in keys {
         spans.push(Span::styled(
@@ -515,7 +520,7 @@ fn switcher(f: &mut Frame, area: Rect, buf: &LineEditor, theme: &Theme) {
                 Span::raw(format!("{:<14}", l.label)),
                 Span::styled(l.group, Style::default().fg(theme.overlay0)),
             ])
-            .style(crate::tui::widgets::row_style(theme, n == 0)),
+            .style(widgets::row_style(theme, n == 0)),
         );
     }
     let w = 40u16.min(area.width.saturating_sub(4));
@@ -542,18 +547,19 @@ const HELP_KEY_COL: usize = 16;
 
 fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let global = [
-        ("j / k  ·  ↑ ↓", "move selection (nav or pane)"),
-        ("1 … 4", "jump to Domain / Function / Options / Details"),
+        ("Tab / Shift-Tab", "next / previous section"),
+        ("1 2 3 4", "Domain · Function · Options · Details"),
+        ("j / k  ·  ↑ ↓", "move (functions, fields, rows)"),
+        ("h / l  ·  ← →", "change the selected option"),
+        ("↵", "edit an option · run · open"),
         ("{ / }", "previous / next group"),
-        ("Space", "go to any lens by name"),
-        ("Tab / S-Tab", "next / previous section"),
-        ("↵ / l", "enter Options or Details · run a heavy lens"),
-        ("h / Esc", "back to the function list"),
+        ("Space", "go to any function by name"),
+        ("Esc", "close · back to Function"),
         ("g / G", "jump to top / bottom"),
         ("r", "raw output ⇄ human view"),
-        ("PgUp / PgDn", "scroll the raw view (j / k once focused)"),
+        ("PgUp / PgDn", "scroll the raw view (j / k in Details)"),
         ("y", "copy current output to clipboard"),
-        ("/", "look up a domain"),
+        ("/", "edit the domain · filter rows in Details"),
         (":", "command (lookup · dig · ssl · set output · theme · q)"),
         ("?", "this help · Esc closes"),
     ];
@@ -616,31 +622,61 @@ mod tests {
     }
 
     #[test]
-    fn strip_shows_groups_and_the_active_groups_lenses() {
-        let mut app = App::new(None);
-        app.lens = LensKey::Dnssec.index();
-        let s = render_lines(140, 30, |f| view(f, &app, app.theme()));
-        let rows: Vec<&str> = s.lines().collect();
-        assert!(
-            rows[1].contains("LOOKUP") && rows[1].contains("POWER"),
-            "{s}"
-        );
-        assert!(
-            rows[2].contains("1 ≣ Records") && rows[2].contains("2 ◑ DNSSEC"),
-            "{s}"
-        );
-        assert!(!rows[2].contains("WHOIS"), "{s}");
-        // No sidebar: the lens (here its idle hint) starts at column 0.
-        assert!(rows[3].starts_with("press /"), "{s}");
+    fn the_frame_shows_four_numbered_sections() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Dns.index();
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        for title in ["1 Domain", "2 Function", "3 Options", "4 "] {
+            assert!(s.contains(title), "missing {title}:\n{s}");
+        }
+        assert!(s.contains("example.com"));
+        assert!(s.contains("Type ‹A›"), "{s}");
     }
 
     #[test]
-    fn a_narrow_strip_keeps_the_active_lens_visible() {
-        let mut app = App::new(None);
-        app.lens = LensKey::Follow.index();
-        let s = render_lines(40, 20, |f| view(f, &app, app.theme()));
-        let row = s.lines().nth(2).unwrap_or_default();
-        assert!(row.contains("Follow") && row.starts_with('‹'), "{s}");
+    fn options_collapse_for_a_function_without_any() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Whois.index();
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        assert!(!s.contains("3 Options"), "{s}");
+    }
+
+    // Review Focus 4.
+    #[test]
+    fn tiny_and_narrow_frames_render() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Bulk.index();
+        for (w, h) in [(40, 12), (69, 20), (80, 24), (20, 5)] {
+            let s = render_lines(w, h, |f| view(f, &app, app.theme()));
+            assert!(
+                s.lines().last().unwrap().contains("seer"),
+                "{w}×{h} status row:\n{s}"
+            );
+        }
+        app.set_section(Section::Function);
+        let s = render_lines(60, 24, |f| view(f, &app, app.theme()));
+        assert!(s.contains("POWER › ⧉ Bulk"), "narrow function line:\n{s}");
+        assert!(
+            s.contains("Function") && s.contains("▸ ⧉ Bulk"),
+            "narrow Function focus opens the list popup:\n{s}"
+        );
+    }
+
+    #[test]
+    fn the_focused_option_editor_draws_inline() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Diff.index();
+        app.set_section(Section::Options);
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Option(OptId::SecondDomain),
+            buf: "other.o".into(),
+        };
+        let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
+        assert!(s.contains("other.o▏"), "{s}");
     }
 
     #[test]
@@ -659,11 +695,12 @@ mod tests {
         assert!(s.contains("Subdomains") && s.contains("SECURITY"), "{s}");
     }
 
-    /// At 80 columns the global hints still end with `? help`.
+    /// At 80 columns the Function hints still end with `? help`.
     #[test]
     fn the_status_bar_fits_its_help_hint_at_80_columns() {
         let mut app = App::new(None);
         app.lens = LensKey::Audit.index();
+        app.set_section(Section::Function);
         let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
         let status = s.lines().last().unwrap_or_default();
         assert!(status.contains("? help"), "{status}");
@@ -730,7 +767,7 @@ mod tests {
         let s = full_buf(&app, &theme);
         assert!(s.contains("waiting"), "Follow pane should render");
         assert!(
-            !s.contains("press / to look up a domain"),
+            !s.contains("type a domain in 1 Domain"),
             "Follow must not fall back to the generic idle hint"
         );
     }
@@ -862,7 +899,7 @@ mod tests {
         let theme = Theme::frappe();
         let app = App::new(None);
         let s = full_buf(&app, &theme);
-        assert!(s.contains("seer"), "top-bar brand missing");
+        assert!(s.contains("seer"), "status-bar brand missing");
         assert!(s.contains("Overview"), "first lens label missing");
         assert!(s.contains("LOOKUP"), "group header missing");
     }
@@ -900,14 +937,15 @@ mod tests {
     /// verify a live `:theme latte` swap actually recolors the frame.
     #[test]
     fn live_theme_swap_recolors_the_frame() {
-        let top_bar_bg =
-            |app: &App| render_buffer(100, 30, |f| view(f, app, app.theme()))[(0, 0)].bg;
+        // The status row's background is the mantle.
+        let status_bg =
+            |app: &App| render_buffer(100, 30, |f| view(f, app, app.theme()))[(0, 29)].bg;
 
         let mut app = App::new(None);
-        assert_eq!(top_bar_bg(&app), Theme::frappe().mantle);
+        assert_eq!(status_bg(&app), Theme::frappe().mantle);
 
         assert!(app.set_theme_by_name("latte"));
-        assert_eq!(top_bar_bg(&app), Theme::latte().mantle);
+        assert_eq!(status_bg(&app), Theme::latte().mantle);
         assert_ne!(Theme::frappe().mantle, Theme::latte().mantle);
     }
 }

@@ -1,14 +1,17 @@
 //! Small reusable TUI building blocks: `panel` (bordered block → inner
 //! `Rect`), `kv` rows, `gauge`, status `dot` and `chips`, the selected-row
-//! `inspector`, the `page` every lens is drawn through, plus the shared
+//! `inspector`, the `page` every lens is drawn through, the `function_list`
+//! and `options` section widgets, plus the shared
 //! `or_dash` missing-value mark, `row_style` selection styling, `scroll_to`,
 //! and `wrap` / `wrap_hard` for text sized to its width before it is drawn.
 
 pub mod chips;
 pub mod dot;
+pub mod function_list;
 pub mod gauge;
 pub mod inspector;
 pub mod kv;
+pub mod options;
 pub mod page;
 pub mod panel;
 

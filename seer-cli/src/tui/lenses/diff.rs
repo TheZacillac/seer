@@ -16,18 +16,11 @@ use crate::tui::widgets::page::{Block, Page, TableBlock};
 /// The Diff lens. Pure function of its inputs (no `App` coupling):
 /// - `domain`  domain A (the `:diff` override, else the session target)
 /// - `b`       the second domain (B), from the Options box
-/// - `_focused` whether the pane has focus (the body has no focus-aware part)
 /// - `state`   the lens load state (drives the body)
 ///
 /// Once a comparison is loaded the input bar names the domains that result
 /// is actually for (`domain_a`/`domain_b`), not whatever is configured now.
-pub fn page(
-    theme: &Theme,
-    domain: Option<&str>,
-    b: &str,
-    _focused: bool,
-    state: &LensState,
-) -> Page {
+pub fn page(theme: &Theme, domain: Option<&str>, b: &str, state: &LensState) -> Page {
     // ── input bar: A · <domain>   ⇄   B · <value> ────────────────────────────
     let loaded = match state {
         LensState::Loaded(LensData::Diff(d)) => Some(d),
@@ -167,13 +160,7 @@ mod tests {
         focused: bool,
         state: &LensState,
     ) {
-        page::draw(
-            f,
-            area,
-            theme,
-            page(theme, domain, b, focused, state),
-            focused,
-        );
+        page::draw(f, area, theme, page(theme, domain, b, state), focused);
     }
     use crate::tui::test_util::render_text;
     use seer_core::diff::{DnsDiff, DomainDiff, RegistrationDiff, SslDiff};

@@ -1,4 +1,4 @@
-//! Registry of the 22 lenses shown in the nav, grouped LOOKUP / DNS /
+//! Registry of the 22 lenses shown in the Function list, grouped LOOKUP / DNS /
 //! SECURITY / POWER. Each `LENSES` entry also carries the lens's behaviour
 //! flags — `interactive` (↵ focuses it without rows), `filter` (`/` filters
 //! its rows) and `heavy` (an active scan, run only on request) — so `App`
@@ -320,24 +320,6 @@ pub fn switch_matches(query: &str) -> Vec<usize> {
     ranked.into_iter().take(SHOWN).map(|(_, i)| i).collect()
 }
 
-/// The nav groups, in order.
-pub fn groups() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for l in LENSES {
-        if out.last() != Some(&l.group) {
-            out.push(l.group);
-        }
-    }
-    out
-}
-
-/// Indices of the lenses in `group`, in nav order.
-pub fn group_members(group: &str) -> Vec<usize> {
-    (0..LENSES.len())
-        .filter(|&i| LENSES[i].group == group)
-        .collect()
-}
-
 /// The first lens of the group after (`forward`) or before the one `from`
 /// is in, wrapping at either end. Backward from inside a group goes to the
 /// previous group's start, like `{` in an editor.
@@ -362,20 +344,16 @@ pub fn find_by_cmd_or_key(token: &str) -> Option<usize> {
         .position(|l| l.cmd == token || l.key == token)
 }
 
-use ratatui::layout::Rect;
-use ratatui::Frame;
-
 use crate::tui::action::LensData;
 use crate::tui::theme::Theme;
+use crate::tui::widgets::page::Page;
 
-/// Dispatch human-view rendering to the lens's renderer.
+/// The lens's human-view page for `data`, if it renders one. `render.rs`
+/// draws it as the Details section.
 /// `rdap_query` is the RDAP lens's Query choice (its label only).
 /// `filter` is the active `/`-filter, for renderers that filter by reference
 /// (History, DNS Records); other row lenses receive already-filtered `data`.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    f: &mut Frame,
-    area: Rect,
+pub fn page(
     theme: &Theme,
     key: LensKey,
     rdap_query: usize,
@@ -383,8 +361,8 @@ pub fn render(
     filter: &str,
     focused: bool,
     sel: usize,
-) {
-    let page = match key {
+) -> Option<Page> {
+    match key {
         LensKey::Overview => overview::page(theme, data),
         LensKey::Whois => whois::page(theme, data),
         LensKey::Rdap => Some(rdap::page(theme, rdap_query, data)),
@@ -407,9 +385,6 @@ pub fn render(
         // render.rs::main_pane, before the state match, so they never reach
         // this dispatch.
         LensKey::Follow | LensKey::Diff | LensKey::Bulk | LensKey::Tld => None,
-    };
-    if let Some(page) = page {
-        crate::tui::widgets::page::draw(f, area, theme, page, focused);
     }
 }
 
@@ -444,11 +419,6 @@ mod tests {
         assert_eq!(first("TRA"), Some(LensKey::Trace), "case-insensitive");
         assert!(switch_matches("zzzz").is_empty());
         assert_eq!(switch_matches("").len(), 8);
-    }
-
-    #[test]
-    fn groups_are_listed_in_nav_order() {
-        assert_eq!(groups(), ["LOOKUP", "DNS", "SECURITY", "POWER"]);
     }
 
     #[test]
@@ -627,16 +597,14 @@ mod tests {
     }
 
     #[test]
-    fn every_registered_lens_has_a_render_arm() {
+    fn every_registered_lens_has_a_page_arm() {
         // Handed another lens's payload, a renderer skips it or draws its
-        // empty state, so only a key missing from `render`'s match can panic
+        // empty state, so only a key missing from `page`'s match can panic
         // here, via its debug_assert.
         let theme = Theme::frappe();
         let data = LensData::History(vec![]);
         for l in lenses() {
-            crate::tui::test_util::render_buffer(80, 24, |f| {
-                render(f, f.area(), &theme, l.key, 0, &data, "", false, 0);
-            });
+            let _ = page(&theme, l.key, 0, &data, "", false, 0);
         }
     }
 }
