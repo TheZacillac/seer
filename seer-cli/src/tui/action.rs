@@ -26,7 +26,7 @@ impl Section {
     /// Its number in the box titles and the `1`–`4` keys.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "drawn in the box titles by Task 4")
+        expect(dead_code, reason = "drawn in the section box titles")
     )]
     pub fn number(self) -> u8 {
         match self {

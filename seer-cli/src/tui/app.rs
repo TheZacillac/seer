@@ -199,9 +199,8 @@ impl App {
     }
 
     /// Show lens `i` with its first row selected and the Function section
-    /// focused. Every
-    /// lens change goes through here, so no path can carry the previous
-    /// lens's selection over.
+    /// focused. Every lens change goes through here, so no path can carry
+    /// the previous lens's selection, option cursor or pending debounce over.
     fn goto_lens(&mut self, i: usize) {
         self.lens = i;
         self.sel = 0;
@@ -262,8 +261,9 @@ impl App {
         }
     }
 
-    /// An option changed: re-run the lens now (`debounce` false: typed or
-    /// toggled) or after `REFETCH_TICKS` (cycled). Heavy and streaming
+    /// An option changed: re-run the lens now (`debounce` false: a typed
+    /// commit) or after `REFETCH_TICKS` (`debounce` true: a cycled value,
+    /// so holding ← → fetches only the settled one). Heavy and streaming
     /// lenses only drop their stale result; they run on `↵`.
     fn option_changed(&mut self, debounce: bool) -> Vec<Action> {
         self.opt_error = None;
@@ -418,6 +418,7 @@ impl App {
         if self.domain.as_deref() != Some(target.as_str()) {
             self.states.clear();
             self.last_req.clear();
+            self.refetch_in = None;
             // `:diff a b` / `:compare d …` overrides follow the session target
             // only until it changes; the new target becomes domain A again.
             self.panes.diff.a.clear();
@@ -843,13 +844,18 @@ impl App {
             // focus to Function, which would shift the step by one.
             let next = self.next_section(key.code == KeyCode::Tab);
             let actions = self.apply_field(target, buf.as_str().trim().to_string());
-            self.set_section(next);
+            // A refused domain keeps the editor open: stay on Domain.
+            if self.section != Section::Domain {
+                self.set_section(next);
+            }
             return actions;
         }
         match buf.handle_key(key) {
             EditOutcome::Cancel => {
-                if target == EditTarget::Target {
-                    self.section = Section::Function;
+                match target {
+                    EditTarget::Target => self.section = Section::Function,
+                    EditTarget::Option(_) => self.opt_error = None,
+                    _ => {}
                 }
                 vec![]
             }
@@ -864,13 +870,26 @@ impl App {
     fn apply_field(&mut self, target: EditTarget, value: String) -> Vec<Action> {
         match target {
             EditTarget::Target => {
-                self.section = Section::Function;
                 if value.is_empty() {
+                    self.section = Section::Function;
                     return vec![];
                 }
                 let Some(target) = self.target_or_toast(&value) else {
+                    // Refused: keep the editor open on the typed text, as a
+                    // refused option value stays.
+                    self.section = Section::Domain;
+                    self.input_mode = InputMode::Field {
+                        target: EditTarget::Target,
+                        buf: value.into(),
+                    };
                     return vec![];
                 };
+                self.section = Section::Function;
+                // An unchanged domain only moves focus: no re-run, and the
+                // selection stays.
+                if self.domain.as_deref() == Some(target.as_str()) {
+                    return vec![];
+                }
                 // Re-run the current function, not Overview. Not explicit:
                 // a heavy lens still waits for ↵.
                 self.set_domain_and_fetch_with(target, false)
@@ -879,7 +898,10 @@ impl App {
                 let key = self.current_lens().key;
                 match self.options.commit_text(key, id, &value) {
                     Ok(true) => self.option_changed(false),
-                    Ok(false) => vec![],
+                    Ok(false) => {
+                        self.opt_error = None;
+                        vec![]
+                    }
                     Err(msg) => {
                         self.opt_error = Some(id);
                         self.set_toast("fail", &msg);
@@ -1703,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn heavy_and_streaming_lenses_wait_for_enter() {
+    fn bulk_options_never_start_a_run_until_enter() {
         // Bulk: editing options never starts a run; ↵ on a choice does.
         let mut app = app_on_lens(Some("example.com"), "bulk");
         app.set_section(Section::Options);
@@ -1720,6 +1742,199 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::StartBulk(p) if p.op == "status")));
+    }
+
+    #[test]
+    fn follow_options_never_start_a_run_until_enter_in_details() {
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.set_section(Section::Options);
+        let is_run = |a: &Action| matches!(a, Action::StartFollow(_) | Action::Fetch { .. });
+        assert!(key(&mut app, KeyCode::Right).is_empty()); // Interval 30 → 35
+        for _ in 0..REFETCH_TICKS * 2 {
+            assert!(!app.update(Msg::Tick).iter().any(is_run), "ticks never run");
+        }
+        let actions = key(&mut app, KeyCode::Char('4'));
+        assert!(actions.is_empty());
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartFollow(p) if p.interval_secs == 35 && p.iterations == 20
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn heavy_lenses_stage_on_navigation_and_run_on_enter() {
+        for lens in ["subdomains", "audit", "takeover"] {
+            let mut app = app_on_lens(Some("example.com"), lens);
+            assert!(app.current_lens().heavy);
+            // Staging rule: a non-explicit fetch (domain commit, option
+            // change) leaves the lens waiting.
+            assert!(app.fetch_with_current(false).is_empty(), "{lens}");
+            assert!(matches!(app.state_of(app.lens), LensState::Idle));
+            // ↵ in Function runs it.
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Fetch { .. })),
+                "{lens}: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn committing_a_domain_does_not_run_a_heavy_lens() {
+        let mut app = app_on_lens(Some("example.com"), "subdomains");
+        app.set_section(Section::Domain);
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Target,
+            buf: "other.com".into(),
+        };
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.domain.as_deref(), Some("other.com"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        assert!(matches!(app.state_of(app.lens), LensState::Idle));
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Subdomains(d), .. } if d == "other.com"
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_domain_keeps_the_editor_open_with_the_typed_text() {
+        for leave in [KeyCode::Enter, KeyCode::Tab] {
+            let mut app = app_on_lens(Some("example.com"), "whois");
+            key(&mut app, KeyCode::Char('/'));
+            for c in " bad!".chars() {
+                key(&mut app, KeyCode::Char(c));
+            }
+            let actions = key(&mut app, leave);
+            assert!(actions.is_empty(), "{actions:?}");
+            assert_eq!(app.section, Section::Domain, "{leave:?}");
+            assert!(matches!(
+                &app.input_mode,
+                InputMode::Field { target: EditTarget::Target, buf } if buf.as_str() == "example.com bad!"
+            ));
+            assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+            assert_eq!(app.domain.as_deref(), Some("example.com"));
+        }
+    }
+
+    #[test]
+    fn an_unchanged_domain_only_moves_focus() {
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        app.set_section(Section::Details);
+        app.sel = 3;
+        key(&mut app, KeyCode::Tab); // Domain
+        assert_eq!(app.section, Section::Domain);
+        let actions = key(&mut app, KeyCode::Tab); // commits the same domain
+        assert_eq!(app.section, Section::Function);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        assert_eq!(app.sel, 3, "selection survives");
+        // ↵ on the unchanged domain likewise.
+        key(&mut app, KeyCode::Char('1'));
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!((app.section, app.sel), (Section::Function, 3));
+    }
+
+    #[test]
+    fn a_refused_option_stays_marked_until_a_commit_or_esc_clears_it() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Down); // Server
+        key(&mut app, KeyCode::Enter);
+        for c in "9.9.9.9 bad!".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.opt_error, Some(OptId::Server));
+        // Esc on the reopened editor clears the mark.
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.opt_error, None);
+        // So does committing the unchanged value.
+        app.opt_error = Some(OptId::Server);
+        key(&mut app, KeyCode::Enter);
+        for _ in 0..8 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        key(&mut app, KeyCode::Enter); // empty = system = unchanged
+        assert_eq!(app.opt_error, None);
+    }
+
+    #[test]
+    fn a_source_change_keeps_the_option_cursor_on_a_visible_field() {
+        let mut app = app_on_lens(None, "bulk");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Down); // Source
+        key(&mut app, KeyCode::Right); // → file: Domains gives way to File
+        let specs = app.visible_options();
+        assert_eq!(specs[2].id, OptId::BulkFile);
+        assert!(app.opt_cursor < specs.len());
+        // Entering Options clamps a cursor left past the end.
+        app.opt_cursor = 9;
+        app.set_section(Section::Function);
+        app.set_section(Section::Options);
+        assert_eq!(app.opt_cursor, 2);
+    }
+
+    #[test]
+    fn a_lens_change_cancels_a_pending_debounce() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('j')); // another lens
+        assert_ne!(app.current_lens().key, LensKey::Dns);
+        for _ in 0..REFETCH_TICKS * 2 {
+            let actions = app.update(Msg::Tick);
+            assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        }
+    }
+
+    #[test]
+    fn a_second_cycle_restarts_the_debounce_countdown() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        let fetches = |app: &mut App| {
+            app.update(Msg::Tick)
+                .iter()
+                .filter(|a| matches!(a, Action::Fetch { .. }))
+                .count()
+        };
+        key(&mut app, KeyCode::Right);
+        assert_eq!(fetches(&mut app), 0);
+        assert_eq!(fetches(&mut app), 0);
+        key(&mut app, KeyCode::Right); // restarts at 3
+        assert_eq!(fetches(&mut app), 0, "the first press's deadline passed");
+        assert_eq!(fetches(&mut app), 0);
+        assert_eq!(fetches(&mut app), 1);
+        assert_eq!(fetches(&mut app), 0, "once");
+    }
+
+    #[test]
+    fn a_domain_change_drops_a_pending_debounce() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right);
+        let actions = app.set_domain_and_fetch_with("other.com".into(), false);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::Fetch { .. }))
+                .count(),
+            1
+        );
+        for _ in 0..REFETCH_TICKS * 2 {
+            let actions = app.update(Msg::Tick);
+            assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        }
     }
 
     // Review Focus 2.
@@ -3478,10 +3693,14 @@ mod tests {
         app.sel = 4;
         key(&mut app, KeyCode::Char('G'));
         assert_eq!(app.sel, 0);
-        // The `/` target re-runs the lens it is on, from its first row.
+        // A new `/` target re-runs the lens it is on, from its first row.
         app.lens = LensKey::Rdap.index();
         app.sel = 4;
         key(&mut app, KeyCode::Char('/'));
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Target,
+            buf: "other.com".into(),
+        };
         key(&mut app, KeyCode::Enter);
         assert_eq!((app.lens, app.sel), (LensKey::Rdap.index(), 0));
     }
