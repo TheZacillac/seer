@@ -30,57 +30,77 @@ Example usage:
     results = seer.bulk_whois(["google.com", "github.com", "cloudflare.com"])
 """
 
-from seer._seer import (
-    ConfigError,
-    DnsError,
-    LookupFailedError,
-    ParseError,
-    RateLimitedError,
-    SeerError,
-    TlsError,
-    UpstreamError,
-    WhoisServerNotFoundError,
-    all_tlds,
-    audit,
-    availability,
-    bulk_availability,
-    bulk_dig,
-    bulk_info,
-    bulk_lookup,
-    bulk_propagation,
-    bulk_ssl,
-    bulk_status,
-    bulk_whois,
-    caa,
-    cancel_follow,
-    confusables,
-    delegation,
-    diff,
-    dig,
-    dns_compare,
-    dns_follow,
-    dns_trace,
-    dnssec,
-    headers,
-    info,
-    lookup,
-    nameserver_target,
-    posture,
-    propagation,
-    rdap_asn,
-    rdap_auto,
-    rdap_domain,
-    rdap_ip,
-    record_types,
-    ssl,
-    status,
-    subdomains,
-    subdomains_classify,
-    takeover,
-    tld_info,
-    validate_public_host,
-    whois,
-)
+def _stale_extension_error(exc: ImportError) -> ImportError:
+    """Rephrase a raw ``seer._seer`` import failure as an actionable message.
+
+    The compiled extension and this Python layer are versioned together; when
+    the installed ``.so`` lags the source it fails right here — a name is
+    missing, or the library will not load at all. Both mean the bindings need
+    rebuilding, so say that, instead of the bare ImportError that has
+    crash-looped the MCP server before (bulk_ssl, subdomains_classify,
+    ConfigError).
+    """
+    return ImportError(
+        f"seer's compiled extension (seer._seer) is out of date or incompatible: {exc}. "
+        "Rebuild the native bindings with `cd seer-py && maturin develop --release` "
+        "(or `maturin develop` for a debug build)."
+    )
+
+
+try:
+    from seer._seer import (
+        ConfigError,
+        DnsError,
+        LookupFailedError,
+        ParseError,
+        RateLimitedError,
+        SeerError,
+        TlsError,
+        UpstreamError,
+        WhoisServerNotFoundError,
+        all_tlds,
+        audit,
+        availability,
+        bulk_availability,
+        bulk_dig,
+        bulk_info,
+        bulk_lookup,
+        bulk_propagation,
+        bulk_ssl,
+        bulk_status,
+        bulk_whois,
+        caa,
+        cancel_follow,
+        confusables,
+        delegation,
+        diff,
+        dig,
+        dns_compare,
+        dns_follow,
+        dns_trace,
+        dnssec,
+        headers,
+        info,
+        lookup,
+        nameserver_target,
+        posture,
+        propagation,
+        rdap_asn,
+        rdap_auto,
+        rdap_domain,
+        rdap_ip,
+        record_types,
+        ssl,
+        status,
+        subdomains,
+        subdomains_classify,
+        takeover,
+        tld_info,
+        validate_public_host,
+        whois,
+    )
+except ImportError as _exc:  # pragma: no cover - message logic lives in the helper
+    raise _stale_extension_error(_exc) from _exc
 
 # Errors: invalid input raises ValueError, a timeout TimeoutError, a WHOIS
 # connect failure ConnectionError; every other failure raises a subclass of

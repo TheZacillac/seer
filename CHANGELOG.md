@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `rustyline` 18 → 19. The REPL's file-history API is unchanged, but
+  rustyline 19 uses the `cfg_select!` macro, which raises the workspace MSRV
+  from **Rust 1.89 to 1.95** (the release that stabilized `cfg_select!`). The
+  `msrv` CI job and the README / AGENTS.md references move to 1.95 to match.
+- `seer-py`: when the compiled extension (`seer._seer`) is out of date or
+  incompatible with the Python layer — a missing binding, or a library that
+  won't load — the import now fails with an actionable "rebuild with
+  `maturin develop`" message instead of a bare `ImportError`. This is the
+  stale-build failure that had repeatedly crash-looped the MCP server
+  (`bulk_ssl`, `subdomains_classify`, `ConfigError`).
 - **TUI layout (breaking keys).** The TUI is now four sections — Domain,
   Function, Options and Details — replacing the top bar and the two nav
   strips. Each function's settings sit in a visible Options box: Records'
