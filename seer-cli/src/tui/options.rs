@@ -4,12 +4,6 @@
 //! holds only what changed. `App::default_req` is the one place values
 //! become a request, so the box and the fetch cannot disagree. Values are
 //! per lens; only the session domain is shared.
-//!
-//! The editing and display half of the API (`cycle`, `commit_text`,
-//! `display`, `visible`, the spec labels and bounds) is consumed by the
-//! Options box, which is not drawn yet: until it is, those items are
-//! exercised by tests only.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 

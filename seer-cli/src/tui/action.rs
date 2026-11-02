@@ -5,17 +5,35 @@ use seer_core::RecordType;
 
 pub use crate::tui::lenses::LensKey;
 
+/// The four screen sections, in Tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Focus {
+pub enum Section {
+    Domain,
     #[default]
-    Nav,
-    Pane,
+    Function,
+    Options,
+    Details,
 }
-impl Focus {
-    pub fn toggled(self) -> Self {
+
+impl Section {
+    pub const ALL: [Section; 4] = [
+        Section::Domain,
+        Section::Function,
+        Section::Options,
+        Section::Details,
+    ];
+
+    /// Its number in the box titles and the `1`–`4` keys.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "drawn in the box titles by Task 4")
+    )]
+    pub fn number(self) -> u8 {
         match self {
-            Focus::Nav => Focus::Pane,
-            Focus::Pane => Focus::Nav,
+            Section::Domain => 1,
+            Section::Function => 2,
+            Section::Options => 3,
+            Section::Details => 4,
         }
     }
 }
@@ -30,6 +48,8 @@ pub enum EditTarget {
     LensFilter,
     /// The `Space` lens switcher's query.
     Switcher,
+    /// A typed option field (`↵` in the Options section).
+    Option(crate::tui::options::OptId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -299,6 +319,6 @@ mod tests {
     #[test]
     fn input_mode_default_and_focus() {
         assert_eq!(InputMode::Normal, InputMode::default());
-        assert_eq!(Focus::Nav.toggled(), Focus::Pane);
+        assert_eq!(Section::Details.number(), 4);
     }
 }

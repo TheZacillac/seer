@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use seer_core::output::sanitize_line;
 
-use crate::tui::action::{EditTarget, Focus, InputMode, LensData, LensKey, LensState};
+use crate::tui::action::{EditTarget, InputMode, LensData, LensKey, LensState, Section};
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::line_editor::LineEditor;
@@ -34,7 +34,8 @@ fn status_prompt(target: EditTarget) -> Option<&'static str> {
         EditTarget::Target
         | EditTarget::TldFilter
         | EditTarget::LensFilter
-        | EditTarget::Switcher => None,
+        | EditTarget::Switcher
+        | EditTarget::Option(_) => None,
     }
 }
 
@@ -89,7 +90,7 @@ fn top_bar(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         LensState::Loading => format!("{} resolving…", SPIN[app.spin]),
         _ => String::new(),
     };
-    let mode = if app.focus == Focus::Pane {
+    let mode = if app.section == Section::Details {
         "‹pane›"
     } else {
         "‹nav›"
@@ -227,7 +228,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 theme,
                 domain_a.as_deref(),
                 &b,
-                app.focus == Focus::Pane,
+                app.section == Section::Details,
                 app.state_of(app.lens),
             ))
         }
@@ -249,7 +250,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         _ => None,
     };
     if let Some(p) = pane_page {
-        page::draw(f, area, theme, p, app.focus == Focus::Pane);
+        page::draw(f, area, theme, p, app.section == Section::Details);
         return;
     }
 
@@ -322,7 +323,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 theme,
                 &raw_title,
                 theme.green,
-                app.focus == Focus::Pane,
+                app.section == Section::Details,
             );
             // Stop once the last line reaches the panel's bottom.
             let max = total.saturating_sub(usize::from(inner.height));
@@ -342,7 +343,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // centrally here (same `filter::apply` used by `App::row_count`) so the
     // renderer, selection, and scroll all see the same visible subset.
     if let LensState::Loaded(data) = app.state_of(app.lens) {
-        let focused = app.focus == Focus::Pane;
+        let focused = app.section == Section::Details;
         let filter = app.active_filter();
         let filtered = crate::tui::filter::apply(data, &filter);
         let render_data = filtered.as_ref().unwrap_or(data);
@@ -453,7 +454,7 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     spans.push(Span::raw(" "));
     // A focused pane lists its own keys; otherwise the global ones.
     let lens_keys: Vec<(String, &str)> = lens.keys.iter().map(|h| (h.label(), h.what)).collect();
-    let keys: Vec<(String, &str)> = if app.focus == Focus::Pane && !lens_keys.is_empty() {
+    let keys: Vec<(String, &str)> = if app.section == Section::Details && !lens_keys.is_empty() {
         let mut keys = lens_keys;
         if lens.filterable() {
             keys.push(("/".to_string(), "filter"));
@@ -542,12 +543,12 @@ const HELP_KEY_COL: usize = 16;
 fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let global = [
         ("j / k  ·  ↑ ↓", "move selection (nav or pane)"),
-        ("1 … 9", "lens in the current group"),
+        ("1 … 4", "jump to Domain / Function / Options / Details"),
         ("{ / }", "previous / next group"),
         ("Space", "go to any lens by name"),
-        ("Tab", "toggle focus: nav ⇄ pane"),
-        ("↵ / l", "enter the pane · run Subdomains / Takeover"),
-        ("h / Esc", "back to nav"),
+        ("Tab / S-Tab", "next / previous section"),
+        ("↵ / l", "enter Options or Details · run a heavy lens"),
+        ("h / Esc", "back to the function list"),
         ("g / G", "jump to top / bottom"),
         ("r", "raw output ⇄ human view"),
         ("PgUp / PgDn", "scroll the raw view (j / k once focused)"),
@@ -646,6 +647,7 @@ mod tests {
     fn switcher_popup_lists_matches() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
         let mut app = App::new(None);
+        app.set_section(Section::Function); // past the Domain field
         for c in [' ', 's', 'u', 'b'] {
             app.update(crate::tui::action::Msg::Input(Event::Key(KeyEvent::new(
                 KeyCode::Char(c),
@@ -716,7 +718,7 @@ mod tests {
                 .to_string()
         };
         assert!(!status(&app).contains("stop"), "{}", status(&app));
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         assert!(status(&app).contains("stop"), "{}", status(&app));
     }
 

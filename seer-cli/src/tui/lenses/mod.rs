@@ -338,12 +338,6 @@ pub fn group_members(group: &str) -> Vec<usize> {
         .collect()
 }
 
-/// The `n`-th (0-based) lens of the group lens `from` is in, if it has one.
-pub fn nth_in_group(from: usize, n: usize) -> Option<usize> {
-    let group = LENSES.get(from)?.group;
-    group_members(group).get(n).copied()
-}
-
 /// The first lens of the group after (`forward`) or before the one `from`
 /// is in, wrapping at either end. Backward from inside a group goes to the
 /// previous group's start, like `{` in an editor.
@@ -453,11 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn nth_in_group_counts_within_the_active_group() {
-        let records = LensKey::Dns.index();
-        assert_eq!(nth_in_group(records, 3), Some(LensKey::Trace.index()));
-        assert_eq!(nth_in_group(0, 1), Some(LensKey::Whois.index()));
-        assert_eq!(nth_in_group(LensKey::Diff.index(), 7), None);
+    fn groups_are_listed_in_nav_order() {
         assert_eq!(groups(), ["LOOKUP", "DNS", "SECURITY", "POWER"]);
     }
 
