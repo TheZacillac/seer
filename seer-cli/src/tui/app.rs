@@ -385,17 +385,19 @@ impl App {
             },
         };
         // Cached (or in flight) for the current domain → revisiting is
-        // instant, unless the cache answers another request: an option
-        // changed since (Type, Server, RDAP Query…) or it came from an
-        // ad-hoc `:rdap AS…` / `:compare other.com …` target.
+        // instant, unless the cache answers another request than the one
+        // the options now make (Type, Server… changed; `:rdap other.org`
+        // or `:compare other.com …` while a session domain is set). With
+        // no default request (`want` is None) an ad-hoc result stays,
+        // unless it contradicts an option (the RDAP Query).
         if matches!(
             self.states.get(&key),
             Some(LensState::Loaded(_) | LensState::Loading)
         ) {
-            let stale = self
-                .last_req
-                .get(&key)
-                .is_some_and(|prev| want.as_ref() != Some(prev));
+            let stale = self.last_req.get(&key).is_some_and(|prev| match &want {
+                Some(w) => w != prev,
+                None => !self.cache_fits_options(prev),
+            });
             if !stale {
                 return None;
             }
@@ -410,6 +412,18 @@ impl App {
             return None;
         }
         want.map(|req| self.fetch_action(req))
+    }
+
+    /// Whether a cached request still matches the options that pick what a
+    /// lens shows: only the RDAP Query (Domain / IP / ASN) does today.
+    fn cache_fits_options(&self, prev: &FetchReq) -> bool {
+        let kind = match prev {
+            FetchReq::RdapDomain(_) => 0,
+            FetchReq::RdapIp(_) => 1,
+            FetchReq::RdapAsn(_) => 2,
+            _ => return true,
+        };
+        self.options.choice(LensKey::Rdap, OptId::RdapQuery) == Some(kind)
     }
 
     /// The request lens `key` makes at `domain` with its current options —
@@ -3314,7 +3328,6 @@ mod tests {
         app.options
             .commit_text(LensKey::Follow, OptId::Count, "5")
             .unwrap();
-        let o = app.options.follow_run();
         let out = app.panes.handle_key(
             LensKey::Follow,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -3324,9 +3337,72 @@ mod tests {
         assert!(
             matches!(
                 out,
-                Some(PaneOutcome::Action(Action::StartFollow(p))) if p.iterations == 5 && p.interval_secs == 30
+                Some(PaneOutcome::Action(Action::StartFollow(ref p))) if p.iterations == 5 && p.interval_secs == 30
             ),
-            "options {o:?}"
+            "got {out:?}"
         );
+
+        // Bulk: Op and Domains come from the options.
+        let mut app = app_on_lens(Some("example.com"), "bulk");
+        assert!(app.options.cycle(LensKey::Bulk, OptId::BulkOp, true));
+        app.options
+            .commit_text(LensKey::Bulk, OptId::BulkDomains, "a.com b.com")
+            .unwrap();
+        let out = app.panes.handle_key(
+            LensKey::Bulk,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Some("example.com"),
+            &app.options,
+        );
+        assert!(
+            matches!(
+                out,
+                Some(PaneOutcome::Action(Action::StartBulk(ref p)))
+                    if p.op == "status" && p.domains == ["a.com", "b.com"]
+            ),
+            "got {out:?}"
+        );
+    }
+
+    /// Answers `fetch`'s request the way the event loop would.
+    fn answer(app: &mut App, actions: &[Action], lens: LensKey, data: LensData) {
+        app.update(Msg::Data {
+            lens,
+            gen: fetch_gen_of(actions),
+            result: Ok(data),
+        });
+    }
+
+    #[test]
+    fn an_ad_hoc_diff_survives_leaving_and_returning() {
+        let mut app = App::new(None);
+        let actions = app.exec_command("diff a.com b.com");
+        answer(&mut app, &actions, LensKey::Diff, empty_dig());
+        assert!(matches!(
+            app.state_of(LensKey::Diff.index()),
+            LensState::Loaded(_)
+        ));
+        let _ = app.nav_to(LensKey::Whois.index());
+        let back = app.nav_to(LensKey::Diff.index());
+        assert!(!has_fetch(&back), "no refetch: {back:?}");
+        assert!(matches!(
+            app.state_of(LensKey::Diff.index()),
+            LensState::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn an_rdap_ip_result_without_a_resolved_ip_survives_leaving_and_returning() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("rdap 8.8.8.8");
+        answer(&mut app, &actions, LensKey::Rdap, empty_dig());
+        let _ = app.nav_to(LensKey::Whois.index());
+        let back = app.nav_to(LensKey::Rdap.index());
+        assert!(!has_fetch(&back), "no refetch: {back:?}");
+        assert!(matches!(
+            app.state_of(LensKey::Rdap.index()),
+            LensState::Loaded(_)
+        ));
     }
 }

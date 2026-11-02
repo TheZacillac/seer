@@ -46,7 +46,7 @@ fn to_query(req: FetchReq) -> Result<Query, Store> {
         FetchReq::Overview(d) => Query::Lookup(d),
         FetchReq::Whois(d) => Query::Whois(d),
         // One RDAP command: `auto_lookup` routes an IP, `AS<n>` or domain
-        // exactly as `rdap_command` picked the lens tab.
+        // exactly as `rdap_command` sets the RDAP Query option.
         FetchReq::RdapDomain(q) | FetchReq::RdapIp(q) => Query::Rdap(q),
         FetchReq::RdapAsn(asn) => Query::Rdap(format!("AS{asn}")),
         // An explicit nameserver wins; otherwise the configured one, like `dig`.

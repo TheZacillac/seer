@@ -81,10 +81,11 @@ pub(super) fn record_table<'r>(
     )
 }
 
-/// The Records lens: dig's status line, then the response — the answers (and, while focused, the selected one's
-/// full fields), the verdict when there are none, the authority records,
-/// and the local-answer or wildcard note. The verdict and notes are kept
-/// whole; the tables give rows up first.
+/// The Records lens: dig's status line, then the response — the answers
+/// (and, while focused, the selected one's full fields), the verdict when
+/// there are none, the authority records, and the local-answer or wildcard
+/// note. The verdict and notes are kept whole; the tables give rows up
+/// first.
 pub fn page(
     theme: &Theme,
     data: &LensData,
