@@ -12,6 +12,7 @@ use crate::tui::action::{EditTarget, Focus, InputMode, LensData, LensKey, LensSt
 use crate::tui::app::{App, SPIN};
 use crate::tui::lenses::{self};
 use crate::tui::line_editor::LineEditor;
+use crate::tui::options::OptId;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{inspector, page, panel};
 
@@ -27,18 +28,10 @@ fn field_buf(mode: &InputMode, target: EditTarget) -> Option<&LineEditor> {
 /// Status-bar prompt for edit fields that no pane draws inline. `None` means
 /// the field is rendered elsewhere (top bar, its lens, or the filter line) —
 /// the match is exhaustive so a new field can't silently go undrawn again.
-fn status_prompt(app: &App, target: EditTarget) -> Option<String> {
-    let follow = &app.panes.follow;
+fn status_prompt(target: EditTarget) -> Option<&'static str> {
     match target {
-        EditTarget::FollowInterval => {
-            Some(format!("interval seconds (now {})> ", follow.interval_secs))
-        }
-        EditTarget::FollowCount => Some(format!("check count (now {})> ", follow.count)),
-        EditTarget::BulkPath => Some("domains file> ".to_string()),
-        EditTarget::WatchAdd => Some("watch add> ".to_string()),
+        EditTarget::WatchAdd => Some("watch add> "),
         EditTarget::Target
-        | EditTarget::DiffB
-        | EditTarget::BulkDomains
         | EditTarget::TldFilter
         | EditTarget::LensFilter
         | EditTarget::Switcher => None,
@@ -213,41 +206,32 @@ fn strip_lenses(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let lens = app.current_lens();
 
-    // Sub-tab bar (human view only) for lenses that have tabs.
-    let content = if !lens.tabs.is_empty() && app.format == seer_core::output::OutputFormat::Human {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(area);
-        sub_tabs(f, chunks[0], app, theme);
-        chunks[1]
-    } else {
-        area
-    };
-
     // Pane-driven interactive lenses render from `app.panes` state, not from a
     // fetched `LensData`, so they never reach `LensState::Loaded`. They have no
     // raw serialization either, so render them the same way in every format —
     // otherwise toggling `r` would drop them to the generic "press /" idle hint.
     let pane_page = match lens.key {
-        LensKey::Follow => Some(lenses::follow::page(theme, &app.panes.follow, app.spin)),
+        LensKey::Follow => Some(lenses::follow::page(
+            theme,
+            &app.panes.follow,
+            app.options.follow_run(),
+            app.spin,
+        )),
         LensKey::Diff => {
             let domain_a = app.panes.diff.effective_a(app.domain.as_deref());
+            let b = app
+                .options
+                .text(LensKey::Diff, OptId::SecondDomain)
+                .unwrap_or_default();
             Some(lenses::diff::page(
                 theme,
                 domain_a.as_deref(),
-                &app.panes.diff.b,
-                field_buf(&app.input_mode, EditTarget::DiffB),
+                &b,
                 app.focus == Focus::Pane,
                 app.state_of(app.lens),
             ))
         }
-        LensKey::Bulk => Some(lenses::bulk::page(
-            theme,
-            &app.panes.bulk,
-            field_buf(&app.input_mode, EditTarget::BulkDomains),
-            app.spin,
-        )),
+        LensKey::Bulk => Some(lenses::bulk::page(theme, &app.panes.bulk, app.spin)),
         LensKey::Tld => {
             let (loaded, loading) = match app.state_of(app.lens) {
                 LensState::Loaded(LensData::Tld(t)) => (Some(t.as_ref()), false),
@@ -265,7 +249,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         _ => None,
     };
     if let Some(p) = pane_page {
-        page::draw(f, content, theme, p, app.focus == Focus::Pane);
+        page::draw(f, area, theme, p, app.focus == Focus::Pane);
         return;
     }
 
@@ -282,11 +266,11 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 format!("{} querying {target}…", SPIN[app.spin]),
                 Style::default().fg(theme.overlay),
             ));
-            f.render_widget(Paragraph::new(line), content);
+            f.render_widget(Paragraph::new(line), area);
             return;
         }
         LensState::Error(e) => {
-            let inner = panel::render(f, content, theme, lens.label, theme.red, false);
+            let inner = panel::render(f, area, theme, lens.label, theme.red, false);
             // Errors quote remote servers: one sanitized line, wrapped to
             // the panel rather than clipped at its edge.
             f.render_widget(
@@ -300,10 +284,13 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             return;
         }
         LensState::Idle => {
-            let hint_text = match (lens.key, app.tab, app.domain.as_deref()) {
-                // Tab-specific idle hints for the RDAP lens.
-                (LensKey::Rdap, 2, _) => "use :rdap AS<number>  (e.g. :rdap AS15169)".to_string(),
-                (LensKey::Rdap, 1, _) => {
+            let rdap_query = app.options.choice(LensKey::Rdap, OptId::RdapQuery);
+            let hint_text = match (lens.key, rdap_query, app.domain.as_deref()) {
+                // Query-specific idle hints for the RDAP lens.
+                (LensKey::Rdap, Some(2), _) => {
+                    "use :rdap AS<number>  (e.g. :rdap AS15169)".to_string()
+                }
+                (LensKey::Rdap, Some(1), _) => {
                     "use :rdap <ip>  or navigate to a domain first".to_string()
                 }
                 // A heavy lens waits for ↵ rather than scanning on navigation.
@@ -314,7 +301,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 _ => "press / to look up a domain".to_string(),
             };
             let hint = Line::from(Span::styled(hint_text, Style::default().fg(theme.overlay0)));
-            f.render_widget(Paragraph::new(hint), content);
+            f.render_widget(Paragraph::new(hint), area);
             return;
         }
         LensState::Loaded(_) => {}
@@ -331,7 +318,7 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             let raw_title = format!("{} · raw", lens.label);
             let inner = panel::render(
                 f,
-                content,
+                area,
                 theme,
                 &raw_title,
                 theme.green,
@@ -359,37 +346,23 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         let filter = app.active_filter();
         let filtered = crate::tui::filter::apply(data, &filter);
         let render_data = filtered.as_ref().unwrap_or(data);
+        // The RDAP renderer's label only; other lenses ignore it.
+        let rdap_query = app
+            .options
+            .choice(LensKey::Rdap, OptId::RdapQuery)
+            .unwrap_or(0);
         lenses::render(
             f,
-            content,
+            area,
             theme,
             lens.key,
-            app.tab,
+            rdap_query,
             render_data,
             &filter,
             focused,
             app.sel,
-            &app.panes,
         );
     }
-}
-
-fn sub_tabs(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let lens = app.current_lens();
-    let mut spans = Vec::new();
-    for (i, t) in lens.tabs.iter().enumerate() {
-        let on = i == app.tab;
-        spans.push(Span::styled(
-            format!(" {t} "),
-            Style::default().fg(if on { theme.mauve } else { theme.subtext }),
-        ));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(
-        "[ ] switch tab",
-        Style::default().fg(theme.overlay0),
-    ));
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -434,11 +407,10 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         );
         return;
     }
-    // Generic fallback for edit fields no pane draws inline (Follow
-    // interval/count, bulk file path, watch add): without it the typed text
-    // is invisible.
+    // Generic fallback for edit fields no pane draws inline (watch add):
+    // without it the typed text is invisible.
     if let InputMode::Field { target, buf } = &app.input_mode {
-        if let Some(prompt) = status_prompt(app, *target) {
+        if let Some(prompt) = status_prompt(*target) {
             let line = Line::from(vec![
                 Span::styled(
                     prompt,
@@ -489,21 +461,19 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         keys.extend([("h".to_string(), "back"), ("?".to_string(), "help")]);
         keys
     } else {
-        // `[ ] tab` only where there are sub-tabs, so `? help` still fits at
-        // 80 columns.
-        let tabs = (!lens.tabs.is_empty()).then_some(("[ ]", "tab"));
-        [("j/k", "move"), ("␣", "go to"), ("tab", "focus")]
-            .into_iter()
-            .chain(tabs)
-            .chain([
-                ("r", "raw"),
-                ("y", "copy"),
-                ("/", "lookup"),
-                (":", "cmd"),
-                ("?", "help"),
-            ])
-            .map(|(k, t)| (k.to_string(), t))
-            .collect()
+        [
+            ("j/k", "move"),
+            ("␣", "go to"),
+            ("tab", "focus"),
+            ("r", "raw"),
+            ("y", "copy"),
+            ("/", "lookup"),
+            (":", "cmd"),
+            ("?", "help"),
+        ]
+        .into_iter()
+        .map(|(k, t)| (k.to_string(), t))
+        .collect()
     };
     for (k, t) in keys {
         spans.push(Span::styled(
@@ -576,7 +546,6 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("{ / }", "previous / next group"),
         ("Space", "go to any lens by name"),
         ("Tab", "toggle focus: nav ⇄ pane"),
-        ("[ / ]", "switch sub-tabs (RDAP)"),
         ("↵ / l", "enter the pane · run Subdomains / Takeover"),
         ("h / Esc", "back to nav"),
         ("g / G", "jump to top / bottom"),
@@ -688,8 +657,7 @@ mod tests {
         assert!(s.contains("Subdomains") && s.contains("SECURITY"), "{s}");
     }
 
-    /// At 80 columns the global hints still end with `? help`: `[ ] tab`
-    /// shows only on a lens that has sub-tabs.
+    /// At 80 columns the global hints still end with `? help`.
     #[test]
     fn the_status_bar_fits_its_help_hint_at_80_columns() {
         let mut app = App::new(None);
@@ -697,13 +665,7 @@ mod tests {
         let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
         let status = s.lines().last().unwrap_or_default();
         assert!(status.contains("? help"), "{status}");
-        assert!(!status.contains("[ ] tab"), "{status}");
-        app.lens = LensKey::Rdap.index();
-        let s = render_lines(140, 24, |f| view(f, &app, app.theme()));
-        assert!(
-            s.lines().last().is_some_and(|l| l.contains("[ ] tab")),
-            "{s}"
-        );
+        assert!(!status.contains("[ ]"), "no sub-tab hint remains: {status}");
     }
 
     #[test]
@@ -714,14 +676,14 @@ mod tests {
         assert!(s.contains("theme · q)"), "the : row must render whole: {s}");
     }
 
-    /// On an 80×24 terminal the lens's own keys come first, so a long list
-    /// (Bulk has seven) is never the part cut off.
+    /// On a short terminal the lens's own keys come first, so the cut falls
+    /// on the global rows, never on the lens's keys.
     #[test]
     fn help_overlay_keeps_every_lens_key_on_a_small_terminal() {
         let mut app = App::new(None);
         app.lens = LensKey::Bulk.index();
         app.help = true;
-        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        let s = render_lines(80, 18, |f| view(f, &app, app.theme()));
         assert!(s.contains(&format!("{:<16}export", "e")), "{s}");
         assert!(
             s.contains("more lines"),
@@ -736,17 +698,16 @@ mod tests {
         app.help = true;
         let s = render_lines(100, 40, |f| view(f, &app, app.theme()));
         // The overlay's own row format: the key padded to its 16-col column.
-        // (The Follow pane behind it also says "interval".)
         assert!(s.contains("Follow keys"), "{s}");
-        assert!(s.contains(&format!("{:<16}interval", "i")), "{s}");
+        assert!(s.contains(&format!("{:<16}start", "↵")), "{s}");
+        assert!(s.contains(&format!("{:<16}stop", "x")), "{s}");
     }
 
     #[test]
     fn status_bar_shows_lens_keys_when_the_pane_is_focused() {
         let mut app = App::new(None);
         app.lens = LensKey::Follow.index();
-        // Only the status bar (last row) is checked: the Follow pane itself
-        // also prints its interval.
+        // Only the status bar (last row) is checked.
         let status = |app: &App| {
             render_lines(140, 30, |f| view(f, app, app.theme()))
                 .lines()
@@ -754,9 +715,9 @@ mod tests {
                 .unwrap_or_default()
                 .to_string()
         };
-        assert!(!status(&app).contains("interval"), "{}", status(&app));
+        assert!(!status(&app).contains("stop"), "{}", status(&app));
         app.focus = Focus::Pane;
-        assert!(status(&app).contains("interval"), "{}", status(&app));
+        assert!(status(&app).contains("stop"), "{}", status(&app));
     }
 
     #[test]
@@ -765,7 +726,7 @@ mod tests {
         let mut app = App::new(None);
         app.lens = lenses::find_by_cmd_or_key("follow").unwrap();
         let s = full_buf(&app, &theme);
-        assert!(s.contains("s start"), "Follow pane (hints) should render");
+        assert!(s.contains("waiting"), "Follow pane should render");
         assert!(
             !s.contains("press / to look up a domain"),
             "Follow must not fall back to the generic idle hint"
@@ -776,31 +737,18 @@ mod tests {
     fn fields_without_an_inline_editor_are_echoed_in_the_status_bar() {
         let theme = Theme::frappe();
         let mut app = App::new(None);
-        app.lens = lenses::find_by_cmd_or_key("follow").unwrap();
-        let mut buf: LineEditor = "60".into();
+        app.lens = lenses::find_by_cmd_or_key("watch").unwrap();
+        let mut buf: LineEditor = "ab".into();
         buf.left();
         app.input_mode = InputMode::Field {
-            target: EditTarget::FollowInterval,
+            target: EditTarget::WatchAdd,
             buf,
         };
         let s = full_buf(&app, &theme);
         assert!(
-            s.contains("interval seconds (now 30)> 6█0"),
-            "typed interval (with caret at the cursor) must be visible"
+            s.contains("watch add> a█b"),
+            "typed text (with caret at the cursor) must be visible: {s}"
         );
-
-        for (target, prompt) in [
-            (EditTarget::FollowCount, "check count (now 20)> "),
-            (EditTarget::BulkPath, "domains file> "),
-            (EditTarget::WatchAdd, "watch add> "),
-        ] {
-            app.input_mode = InputMode::Field {
-                target,
-                buf: "abc".into(),
-            };
-            let s = full_buf(&app, &theme);
-            assert!(s.contains(&format!("{prompt}abc█")), "{target:?}");
-        }
     }
 
     /// A lens error quotes the remote server: it was rendered raw and

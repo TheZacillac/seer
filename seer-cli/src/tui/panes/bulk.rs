@@ -3,16 +3,14 @@ use crossterm::event::{KeyCode, KeyEvent};
 use seer_core::bulk::BulkResult;
 
 use crate::ops::BULK_OPS;
-use crate::tui::action::{Action, BulkParams, EditTarget};
+use crate::tui::action::{Action, BulkParams};
+use crate::tui::options::BulkInput;
 use crate::tui::panes::PaneOutcome;
 
-/// State for the Bulk lens — op selection, entered domains, rows, run status.
+/// Runtime state for the Bulk lens — rows and run status. What to run
+/// (op, domains, file) is in the options (`options::BULK`).
 #[derive(Default)]
 pub struct BulkState {
-    /// Index into [`BULK_OPS`] (the presets cycled with `o`).
-    pub op_idx: usize,
-    /// Raw domains text entered/pasted by the user (space/comma/newline separated).
-    pub domains: String,
     /// Accumulated results for the current run.
     pub rows: Vec<BulkResult>,
     /// True while a bulk task is in flight.
@@ -30,10 +28,8 @@ pub struct BulkState {
     pub detail: bool,
     /// First line of the detail panel shown (PgUp/PgDn scroll it).
     pub detail_scroll: u16,
-    /// `BULK_OPS` index the current `rows` were produced with, captured when the
-    /// run starts. `o` changes `op_idx` for the NEXT run, so the results title
-    /// and CSV export must not follow it.
-    pub run_op_idx: Option<usize>,
+    /// Op the current results were produced with (`None` before any run).
+    pub run_op: Option<&'static str>,
 }
 
 /// Rows a PgUp/PgDn moves the detail panel.
@@ -57,31 +53,52 @@ pub fn parse_domains_input(s: &str) -> Result<Vec<String>, String> {
 }
 
 impl BulkState {
-    /// Current operation name.
-    pub fn op(&self) -> &str {
-        BULK_OPS[self.op_idx].0
-    }
-
-    /// Operation the current results were produced with (falls back to the
-    /// selected op before any run).
+    /// Op the current results were produced with (the first op before any run).
     pub fn results_op(&self) -> &str {
-        BULK_OPS[self.run_op_idx.unwrap_or(self.op_idx)].0
+        self.run_op.unwrap_or(BULK_OPS[0].0)
     }
 
-    /// Start a file-driven run (`f`). An empty path is ignored rather than
-    /// clearing the current results for a load that cannot succeed. The total
-    /// is unknown until the file is read, so the gauge falls back to rows.
-    pub fn start_file_run(&mut self, path: String) -> Option<Action> {
-        if path.is_empty() {
-            return None;
+    /// Start a run of `op` over `input` (the options' Op and Source), or say
+    /// what is missing. An empty file path or domain list never clears the
+    /// current results.
+    pub fn start(&mut self, op: &'static str, input: BulkInput) -> PaneOutcome {
+        match input {
+            BulkInput::File(path) => {
+                if path.is_empty() {
+                    return PaneOutcome::Toast {
+                        tone: "info",
+                        msg: "set a file in Options first".to_string(),
+                    };
+                }
+                self.begin_run(op);
+                // Unknown until the file is read: the gauge falls back to rows.
+                self.total = 0;
+                PaneOutcome::Action(Action::StartBulkFromFile {
+                    op: op.to_string(),
+                    path,
+                    gen: self.gen,
+                })
+            }
+            BulkInput::Domains(text) => {
+                let domains = match parse_domains_input(&text) {
+                    Ok(d) if d.is_empty() => {
+                        return PaneOutcome::Toast {
+                            tone: "info",
+                            msg: "enter domains in Options first".to_string(),
+                        }
+                    }
+                    Ok(d) => d,
+                    Err(msg) => return PaneOutcome::Toast { tone: "fail", msg },
+                };
+                self.begin_run(op);
+                self.total = domains.len();
+                PaneOutcome::Action(Action::StartBulk(BulkParams {
+                    op: op.to_string(),
+                    domains,
+                    gen: self.gen,
+                }))
+            }
         }
-        self.begin_run();
-        self.total = 0;
-        Some(Action::StartBulkFromFile {
-            op: self.op().to_string(),
-            path,
-            gen: self.gen,
-        })
     }
 
     /// Append a result row (called from `App::update` on `Msg::BulkStep`).
@@ -109,8 +126,8 @@ impl BulkState {
         )
     }
 
-    /// Reset run-scoped view state shared by `r` and file-load starts.
-    fn begin_run(&mut self) {
+    /// Reset run-scoped view state for a new run of `op`.
+    fn begin_run(&mut self, op: &'static str) {
         self.rows.clear();
         self.running = true;
         self.note = None;
@@ -118,7 +135,7 @@ impl BulkState {
         self.selected = None;
         self.detail = false;
         self.detail_scroll = 0;
-        self.run_op_idx = Some(self.op_idx);
+        self.run_op = Some(op);
     }
 
     /// Move the selection by `delta` rows, pinning it (leaving tail-follow).
@@ -134,17 +151,12 @@ impl BulkState {
     }
 
     /// Handle a key event for the Bulk pane. `Some(_)` = consumed; never `Esc`.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<PaneOutcome> {
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        run: Option<(&'static str, BulkInput)>,
+    ) -> Option<PaneOutcome> {
         match key.code {
-            // Cycle operation
-            KeyCode::Char('o') => {
-                self.op_idx = (self.op_idx + 1) % BULK_OPS.len();
-                Some(PaneOutcome::None)
-            }
-            // Edit the domains list
-            KeyCode::Char('d') => Some(PaneOutcome::EditField(EditTarget::BulkDomains)),
-            // Start a run with the entered domains
-            KeyCode::Char('r') => Some(self.start_run()),
             // Move the result selection
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
@@ -168,7 +180,10 @@ impl BulkState {
             KeyCode::Enter | KeyCode::Char('v') => {
                 if self.rows.is_empty() {
                     if matches!(key.code, KeyCode::Enter) {
-                        return Some(self.start_run());
+                        return Some(match run {
+                            Some((op, input)) => self.start(op, input),
+                            None => PaneOutcome::None,
+                        });
                     }
                     return Some(PaneOutcome::None);
                 }
@@ -185,8 +200,6 @@ impl BulkState {
                     Some(PaneOutcome::None)
                 }
             }
-            // Open file-path field
-            KeyCode::Char('f') => Some(PaneOutcome::EditField(EditTarget::BulkPath)),
             // Export results to CSV
             KeyCode::Char('e') => {
                 if self.rows.is_empty() {
@@ -202,28 +215,6 @@ impl BulkState {
             }
             _ => None,
         }
-    }
-
-    /// Validate the entered domains and emit a `StartBulk` action, or a toast
-    /// when the list is empty.
-    fn start_run(&mut self) -> PaneOutcome {
-        let domains = match parse_domains_input(&self.domains) {
-            Ok(domains) if domains.is_empty() => {
-                return PaneOutcome::Toast {
-                    tone: "info",
-                    msg: "enter domains first (d)".to_string(),
-                }
-            }
-            Ok(domains) => domains,
-            Err(msg) => return PaneOutcome::Toast { tone: "fail", msg },
-        };
-        self.begin_run();
-        self.total = domains.len();
-        PaneOutcome::Action(Action::StartBulk(BulkParams {
-            op: self.op().to_string(),
-            domains,
-            gen: self.gen,
-        }))
     }
 }
 
@@ -252,25 +243,10 @@ mod tests {
     #[test]
     fn default_state_is_zeroed() {
         let s = BulkState::default();
-        assert_eq!(s.op_idx, 0);
-        assert!(s.domains.is_empty());
+        assert!(s.run_op.is_none());
         assert!(!s.running);
         assert!(s.rows.is_empty());
         assert!(s.note.is_none());
-    }
-
-    #[test]
-    fn o_cycles_op() {
-        let mut s = BulkState::default();
-        assert_eq!(s.op(), "lookup");
-        let out = s.handle_key(key(KeyCode::Char('o')));
-        assert!(matches!(out, Some(PaneOutcome::None)));
-        assert_eq!(s.op(), "status");
-        // Cycle through all remaining ops and wrap
-        for _ in 0..BULK_OPS.len() - 1 {
-            s.handle_key(key(KeyCode::Char('o')));
-        }
-        assert_eq!(s.op(), "lookup");
     }
 
     #[test]
@@ -298,44 +274,32 @@ mod tests {
         let err = parse_domains_input(&list(crate::ops::MAX_BULK_DOMAINS + 1)).unwrap_err();
         assert!(err.contains("maximum"), "got: {err}");
 
-        let mut s = BulkState {
-            domains: list(crate::ops::MAX_BULK_DOMAINS + 1),
-            ..Default::default()
-        };
-        let out = s.handle_key(key(KeyCode::Char('r')));
+        let mut s = BulkState::default();
+        let out = s.start(
+            "lookup",
+            BulkInput::Domains(list(crate::ops::MAX_BULK_DOMAINS + 1)),
+        );
         assert!(!s.running, "an over-long list must not start");
-        assert!(matches!(out, Some(PaneOutcome::Toast { tone: "fail", .. })));
+        assert!(matches!(out, PaneOutcome::Toast { tone: "fail", .. }));
     }
 
     #[test]
-    fn d_opens_domains_field() {
+    fn start_with_empty_domains_toasts_and_does_not_run() {
         let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(
-            out,
-            Some(PaneOutcome::EditField(EditTarget::BulkDomains))
-        ));
-    }
-
-    #[test]
-    fn r_with_empty_domains_toasts_and_does_not_run() {
-        let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Char('r')));
+        let out = s.start("lookup", BulkInput::Domains(String::new()));
         assert!(!s.running, "empty run must not start");
-        assert!(matches!(out, Some(PaneOutcome::Toast { .. })));
+        assert!(matches!(out, PaneOutcome::Toast { .. }));
     }
 
     #[test]
-    fn r_with_domains_starts_run_with_parsed_list() {
-        let mut s = BulkState {
-            domains: "a.com b.com".into(),
-            ..Default::default()
-        };
-        let out = s.handle_key(key(KeyCode::Char('r')));
+    fn start_with_domains_starts_run_with_parsed_list() {
+        let mut s = BulkState::default();
+        let out = s.start("lookup", BulkInput::Domains("a.com, b.com".into()));
         assert!(s.running);
         assert_eq!(s.gen, 1);
+        assert_eq!(s.run_op, Some("lookup"));
         match out {
-            Some(PaneOutcome::Action(Action::StartBulk(p))) => {
+            PaneOutcome::Action(Action::StartBulk(p)) => {
                 assert_eq!(p.op, "lookup");
                 assert_eq!(p.domains, vec!["a.com", "b.com"]);
                 assert_eq!(p.gen, 1);
@@ -345,19 +309,33 @@ mod tests {
     }
 
     #[test]
-    fn f_returns_edit_field_bulk_path() {
+    fn start_with_a_file_emits_a_file_run() {
         let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Char('f')));
+        let out = s.start("status", BulkInput::File("list.txt".into()));
+        assert!(s.running);
+        assert_eq!(s.run_op, Some("status"));
         assert!(matches!(
             out,
-            Some(PaneOutcome::EditField(EditTarget::BulkPath))
+            PaneOutcome::Action(Action::StartBulkFromFile { ref path, ref op, gen: 1 })
+                if path == "list.txt" && op == "status"
         ));
+    }
+
+    #[test]
+    fn start_with_an_empty_file_keeps_the_rows() {
+        let mut s = BulkState::default();
+        s.rows.push(make_lookup_result("kept.com"));
+        let out = s.start("lookup", BulkInput::File(String::new()));
+        assert!(matches!(out, PaneOutcome::Toast { .. }));
+        assert!(!s.running);
+        assert_eq!(s.gen, 0);
+        assert_eq!(s.rows.len(), 1, "existing results must survive");
     }
 
     #[test]
     fn e_with_no_rows_returns_pane_outcome_none() {
         let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Char('e')));
+        let out = s.handle_key(key(KeyCode::Char('e')), None);
         assert!(matches!(out, Some(PaneOutcome::None)));
     }
 
@@ -365,7 +343,7 @@ mod tests {
     fn e_with_rows_returns_write_csv() {
         let mut s = BulkState::default();
         s.rows.push(make_lookup_result("x.com"));
-        let out = s.handle_key(key(KeyCode::Char('e')));
+        let out = s.handle_key(key(KeyCode::Char('e')), None);
         assert!(matches!(
             out,
             Some(PaneOutcome::Action(Action::WriteCsv { .. }))
@@ -373,53 +351,19 @@ mod tests {
     }
 
     #[test]
-    fn export_names_the_runs_op_not_the_newly_selected_one() {
-        let mut s = BulkState {
-            domains: "a.com".into(),
-            ..Default::default()
-        };
-        s.handle_key(key(KeyCode::Char('r'))); // run `lookup`
-        s.push(make_lookup_result("a.com"));
-        s.handle_key(key(KeyCode::Char('o'))); // select `status` for the next run
-        assert_eq!(s.op(), "status");
-        assert_eq!(s.results_op(), "lookup");
-        match s.handle_key(key(KeyCode::Char('e'))) {
-            Some(PaneOutcome::Action(Action::WriteCsv { name, .. })) => {
-                assert_eq!(name, "seer-bulk-lookup.csv");
-            }
-            other => panic!("expected WriteCsv, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn empty_file_path_does_not_start_a_run_or_clear_rows() {
-        let mut s = BulkState::default();
-        s.rows.push(make_lookup_result("kept.com"));
-        assert!(s.start_file_run(String::new()).is_none());
-        assert!(!s.running);
-        assert_eq!(s.gen, 0);
-        assert_eq!(s.rows.len(), 1, "existing results must survive");
-        assert!(matches!(
-            s.start_file_run("domains.txt".into()),
-            Some(Action::StartBulkFromFile { ref path, gen: 1, .. }) if path == "domains.txt"
-        ));
-        assert!(s.running && s.rows.is_empty());
-    }
-
-    #[test]
     fn esc_returns_none() {
         let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Esc));
+        let out = s.handle_key(key(KeyCode::Esc), None);
         assert!(out.is_none(), "Esc must not be swallowed");
     }
 
     #[test]
     fn enter_with_no_rows_starts_run() {
-        let mut s = BulkState {
-            domains: "a.com".into(),
-            ..Default::default()
-        };
-        let out = s.handle_key(key(KeyCode::Enter));
+        let mut s = BulkState::default();
+        let out = s.handle_key(
+            key(KeyCode::Enter),
+            Some(("lookup", BulkInput::Domains("a.com".into()))),
+        );
         assert!(s.running, "Enter in the empty state should start a run");
         assert!(matches!(
             out,
@@ -432,12 +376,12 @@ mod tests {
         let mut s = BulkState::default();
         s.rows.push(make_lookup_result("x.com"));
         assert!(!s.detail);
-        let out = s.handle_key(key(KeyCode::Enter));
+        let out = s.handle_key(key(KeyCode::Enter), None);
         assert!(s.detail, "Enter with rows should open the detail panel");
         assert!(!s.running, "Enter with rows must not start a run");
         assert!(matches!(out, Some(PaneOutcome::None)));
         // Toggling again closes it.
-        s.handle_key(key(KeyCode::Enter));
+        s.handle_key(key(KeyCode::Enter), None);
         assert!(!s.detail);
     }
 
@@ -445,7 +389,7 @@ mod tests {
     fn v_toggles_detail() {
         let mut s = BulkState::default();
         s.rows.push(make_lookup_result("x.com"));
-        s.handle_key(key(KeyCode::Char('v')));
+        s.handle_key(key(KeyCode::Char('v')), None);
         assert!(s.detail);
     }
 
@@ -459,13 +403,13 @@ mod tests {
         assert_eq!(s.selected, None);
         assert_eq!(s.effective_selected(), Some(3));
         // k moves up from the tail and pins.
-        s.handle_key(key(KeyCode::Char('k')));
+        s.handle_key(key(KeyCode::Char('k')), None);
         assert_eq!(s.selected, Some(2));
         // j moves down.
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Char('j')), None);
         assert_eq!(s.selected, Some(3));
         // j is clamped at the last row.
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Char('j')), None);
         assert_eq!(s.selected, Some(3));
     }
 
@@ -474,9 +418,9 @@ mod tests {
         let mut s = BulkState::default();
         s.rows.push(make_lookup_result("a.com"));
         s.rows.push(make_lookup_result("b.com"));
-        s.handle_key(key(KeyCode::Up));
+        s.handle_key(key(KeyCode::Up), None);
         assert_eq!(s.selected, Some(0));
-        s.handle_key(key(KeyCode::Down));
+        s.handle_key(key(KeyCode::Down), None);
         assert_eq!(s.selected, Some(1));
     }
 
@@ -486,7 +430,7 @@ mod tests {
             running: true,
             ..Default::default()
         };
-        let out = s.handle_key(key(KeyCode::Char('x')));
+        let out = s.handle_key(key(KeyCode::Char('x')), None);
         assert!(!s.running);
         assert!(matches!(out, Some(PaneOutcome::Action(Action::StopBulk))));
     }
@@ -494,20 +438,17 @@ mod tests {
     #[test]
     fn x_when_idle_is_noop() {
         let mut s = BulkState::default();
-        let out = s.handle_key(key(KeyCode::Char('x')));
+        let out = s.handle_key(key(KeyCode::Char('x')), None);
         assert!(matches!(out, Some(PaneOutcome::None)));
     }
 
     #[test]
     fn run_resets_selection_and_detail() {
-        let mut s = BulkState {
-            domains: "a.com b.com".into(),
-            ..Default::default()
-        };
+        let mut s = BulkState::default();
         s.rows.push(make_lookup_result("old.com"));
         s.selected = Some(0);
         s.detail = true;
-        s.handle_key(key(KeyCode::Char('r')));
+        s.start("lookup", BulkInput::Domains("a.com b.com".into()));
         assert_eq!(s.selected, None, "selection resets on a new run");
         assert!(!s.detail, "detail closes on a new run");
         assert!(s.rows.is_empty(), "prior rows cleared on a new run");
@@ -582,7 +523,7 @@ mod tests {
             duration_ms: 10,
         });
         let Some(PaneOutcome::Action(Action::WriteCsv { contents, .. })) =
-            s.handle_key(key(KeyCode::Char('e')))
+            s.handle_key(key(KeyCode::Char('e')), None)
         else {
             panic!("expected WriteCsv");
         };
@@ -602,14 +543,14 @@ mod tests {
         s.rows.push(make_lookup_result("a.com"));
         s.rows.push(make_lookup_result("b.com"));
         // Closed detail: PgDn is not the pane's.
-        assert!(s.handle_key(key(KeyCode::PageDown)).is_none());
-        s.handle_key(key(KeyCode::Char('v')));
-        s.handle_key(key(KeyCode::PageDown));
-        s.handle_key(key(KeyCode::PageDown));
+        assert!(s.handle_key(key(KeyCode::PageDown), None).is_none());
+        s.handle_key(key(KeyCode::Char('v')), None);
+        s.handle_key(key(KeyCode::PageDown), None);
+        s.handle_key(key(KeyCode::PageDown), None);
         assert_eq!(s.detail_scroll, 2 * DETAIL_PAGE);
-        s.handle_key(key(KeyCode::PageUp));
+        s.handle_key(key(KeyCode::PageUp), None);
         assert_eq!(s.detail_scroll, DETAIL_PAGE);
-        s.handle_key(key(KeyCode::Char('k')));
+        s.handle_key(key(KeyCode::Char('k')), None);
         assert_eq!(s.detail_scroll, 0, "another row starts at its top");
     }
 }

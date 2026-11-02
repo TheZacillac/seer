@@ -121,9 +121,7 @@ impl TldState {
             }
             // Edit the filter (handled by App so the list filters live and a
             // fetch fires on commit).
-            KeyCode::Char('/') | KeyCode::Char('f') => {
-                Some(PaneOutcome::EditField(EditTarget::TldFilter))
-            }
+            KeyCode::Char('/') => Some(PaneOutcome::EditField(EditTarget::TldFilter)),
             // Load the selected TLD's registry details.
             KeyCode::Char('l') | KeyCode::Enter => {
                 let cur = self.current();
@@ -237,16 +235,13 @@ mod tests {
     }
 
     #[test]
-    fn slash_and_f_open_the_filter_field() {
+    fn slash_opens_the_filter_field() {
         let mut state = TldState::default();
         assert!(matches!(
             state.handle_key(press(KeyCode::Char('/'))),
             Some(PaneOutcome::EditField(EditTarget::TldFilter))
         ));
-        assert!(matches!(
-            state.handle_key(press(KeyCode::Char('f'))),
-            Some(PaneOutcome::EditField(EditTarget::TldFilter))
-        ));
+        assert!(state.handle_key(press(KeyCode::Char('f'))).is_none());
     }
 
     #[test]

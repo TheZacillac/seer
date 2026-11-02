@@ -13,6 +13,7 @@ use crate::tui::action::{
 use crate::tui::command::{self, CmdOutcome};
 use crate::tui::event::{self, KeyAction};
 use crate::tui::lenses;
+use crate::tui::options::{OptId, Options};
 use crate::tui::panes::{PaneOutcome, Panes};
 use crate::tui::theme::Theme;
 
@@ -42,7 +43,6 @@ enum Confirm {
 pub struct App {
     pub lens: usize,
     pub focus: Focus,
-    pub tab: usize,
     pub sel: usize,
     pub format: OutputFormat,
     pub domain: Option<String>,
@@ -52,6 +52,8 @@ pub struct App {
     pub spin: usize,
     pub toast: Option<Toast>,
     pub panes: Panes,
+    /// Every lens's option values; `default_req` turns them into requests.
+    pub options: Options,
     /// First line of the raw (non-human) view shown at the top of its panel.
     pub raw_scroll: u16,
     /// Active color theme (Frappé by default). Private so swaps go through
@@ -68,7 +70,7 @@ pub struct App {
     lens_filter: HashMap<LensKey, String>,
     /// The request each lens's cached state was last fetched for. The state
     /// cache is keyed by lens only, so this is what tells `fetch_current` that
-    /// a cached result belongs to another sub-tab or an ad-hoc target
+    /// a cached result belongs to another option value or an ad-hoc target
     /// (`:rdap AS15169`, `:compare other.com …`) and must not be re-served.
     last_req: HashMap<LensKey, FetchReq>,
     /// A destructive action armed by its first key press, with the ticks
@@ -86,7 +88,6 @@ impl App {
         let mut app = Self {
             lens: 0,
             focus: Focus::Nav,
-            tab: 0,
             sel: 0,
             format: OutputFormat::Human,
             domain: None,
@@ -96,6 +97,7 @@ impl App {
             spin: 0,
             toast: None,
             panes: Panes::default(),
+            options: Options::default(),
             raw_scroll: 0,
             theme: Theme::frappe(),
             states: HashMap::new(),
@@ -178,13 +180,11 @@ impl App {
         });
     }
 
-    /// Show lens `i`, on its first tab, with its first row selected and the
-    /// nav focused. Every lens change goes through here, so no path can
-    /// carry the previous lens's tab or selection over (a stale tab made the
-    /// cache check refetch — and an Overview refetch records history again).
+    /// Show lens `i` with its first row selected and the nav focused. Every
+    /// lens change goes through here, so no path can carry the previous
+    /// lens's selection over.
     fn goto_lens(&mut self, i: usize) {
         self.lens = i;
-        self.tab = 0;
         self.sel = 0;
         self.raw_scroll = 0;
         self.focus = Focus::Nav;
@@ -343,7 +343,7 @@ impl App {
             // A new target invalidates any per-lens filters too.
             self.lens_filter.clear();
             // The resolved IP is derived from the OLD domain's DNS/Status
-            // results; clearing it prevents the RDAP "IP" tab from looking up
+            // results; clearing it prevents the RDAP IP query from looking up
             // the previous domain's address under the new domain.
             self.panes.dns.resolved_ip = None;
             // The Follow lens tracks this domain; cancel any in-flight run —
@@ -384,23 +384,24 @@ impl App {
                 _ => None,
             },
         };
-        // Cached (or in flight) for the current domain → revisiting is instant,
-        // unless the cache was produced for another sub-tab or target: lens
-        // switches reset the tab to 0, so e.g. a cached DNSSEC (tab 1) or
-        // `:rdap AS…` (tab 2) result would otherwise render under tab 0.
+        // Cached (or in flight) for the current domain → revisiting is
+        // instant, unless the cache answers another request: an option
+        // changed since (Type, Server, RDAP Query…) or it came from an
+        // ad-hoc `:rdap AS…` / `:compare other.com …` target.
         if matches!(
             self.states.get(&key),
             Some(LensState::Loaded(_) | LensState::Loading)
         ) {
-            let stale = self.last_req.get(&key).is_some_and(|prev| {
-                prev.tab() != self.tab || want.as_ref().is_some_and(|w| w != prev)
-            });
+            let stale = self
+                .last_req
+                .get(&key)
+                .is_some_and(|prev| want.as_ref() != Some(prev));
             if !stale {
                 return None;
             }
             // Drop the mismatched state, and invalidate any in-flight fetch
-            // for it even when no replacement request follows (e.g. RDAP
-            // domain tab with no session domain).
+            // for it even when no replacement request follows (e.g. the RDAP
+            // domain query with no session domain).
             self.states.remove(&key);
             self.last_req.remove(&key);
             self.bump_fetch_gen(key);
@@ -411,36 +412,38 @@ impl App {
         want.map(|req| self.fetch_action(req))
     }
 
-    /// Default fetch request for a lens at `domain` (used by nav/number-jump).
-    /// Interactive lenses with no single-domain default return None.
+    /// The request lens `key` makes at `domain` with its current options —
+    /// the one place option values become a fetch. `None` when the lens has
+    /// nothing to fetch by itself (RDAP IP without a resolved address, ASN,
+    /// Diff without a second domain, the streaming Follow and Bulk).
     fn default_req(&self, key: LensKey, domain: &str) -> Option<FetchReq> {
         let d = domain.to_string();
+        let o = &self.options;
         Some(match key {
             LensKey::Overview => FetchReq::Overview(d),
             LensKey::Whois => FetchReq::Whois(d),
-            LensKey::Rdap => match self.tab {
+            LensKey::Rdap => match o.choice(key, OptId::RdapQuery)? {
                 0 => FetchReq::RdapDomain(d),
-                // IP tab: only auto-fetch when a real IP has been resolved (from
-                // a prior DNS/Status lookup). Without one, fall back to the idle
-                // hint rather than firing RdapIp against a domain string.
+                // Only an address a DNS/Status result resolved, never the
+                // domain string itself.
                 1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone()?),
-                _ => return None, // ASN needs explicit :rdap AS…
+                _ => return None, // ASN needs `:rdap AS…`
             },
             LensKey::Dns => FetchReq::Dns {
                 domain: d,
-                record_type: self.panes.dns.record_type,
-                nameserver: self.panes.dns.nameserver(),
+                record_type: o.record_type(key)?,
+                nameserver: o.server(key, OptId::Server)?,
             },
             LensKey::Dnssec => FetchReq::Dnssec(d),
             LensKey::Compare => FetchReq::Compare {
-                domain: self.panes.compare.domain.clone().unwrap_or(d),
+                domain: self.panes.compare.effective_domain(Some(domain))?,
                 record_type: RecordType::A,
-                a: self.panes.compare.a.clone(),
-                b: self.panes.compare.b.clone(),
+                a: o.server(key, OptId::ServerA)??,
+                b: o.server(key, OptId::ServerB)??,
             },
             LensKey::Trace => FetchReq::Trace {
                 domain: d,
-                record_type: self.panes.dns.record_type,
+                record_type: o.record_type(key)?,
             },
             LensKey::Ssl => FetchReq::Ssl(d),
             LensKey::Status => FetchReq::Status(d),
@@ -448,7 +451,16 @@ impl App {
             LensKey::Reverse => FetchReq::Reverse(d),
             LensKey::Avail => FetchReq::Avail(d),
             LensKey::Tld => FetchReq::Tld(self.panes.tld.current()),
-            LensKey::Diff => return None, // needs a second domain (DiffB field)
+            LensKey::Diff => {
+                let b = o.text(key, OptId::SecondDomain)?;
+                if b.is_empty() {
+                    return None;
+                }
+                FetchReq::Diff {
+                    a: self.panes.diff.effective_a(Some(domain))?,
+                    b,
+                }
+            }
             LensKey::Watch => FetchReq::Watch,
             LensKey::History => FetchReq::History,
             LensKey::Subdomains => FetchReq::Subdomains(d),
@@ -459,30 +471,8 @@ impl App {
         })
     }
 
-    /// After a sub-tab change, a tab-bearing lens needs the new tab's data
-    /// (the per-lens cache is keyed by lens, not tab), so drop the cached state
-    /// and re-fetch for the now-active tab.
-    fn refetch_for_tab(&mut self) -> Vec<Action> {
-        let lens = self.current_lens();
-        if lens.tabs.is_empty() {
-            return vec![];
-        }
-        let key = lens.key;
-        self.states.remove(&key);
-        self.raw_scroll = 0;
-        // A `/`-filter narrowed the previous tab's rows; the new tab lists
-        // other data, or none.
-        self.lens_filter.remove(&key);
-        // Invalidate any in-flight fetch for the previous tab even when the
-        // new tab has no default request (RDAP IP tab without a resolved IP,
-        // ASN tab): no fetch_action follows to bump the gen there, and the
-        // old tab's late result would otherwise render as this tab's data.
-        self.bump_fetch_gen(key);
-        self.fetch_with_current(false)
-    }
-
     /// Populate `panes.dns.resolved_ip` from DNS or Status results so the RDAP
-    /// IP tab can auto-fetch without an explicit `:rdap <ip>` command. A dig
+    /// IP query can auto-fetch without an explicit `:rdap <ip>` command. A dig
     /// answer's A records sit past any CNAME chain, under the chain's end.
     fn extract_resolved_ip_if_needed(&mut self, data: &LensData) {
         match data {
@@ -771,17 +761,6 @@ impl App {
                 self.sel = 0;
                 vec![]
             }
-            EditTarget::DiffB => {
-                self.panes.diff.b = value.to_lowercase();
-                match self.panes.diff.effective_a(self.domain.as_deref()) {
-                    Some(a) if !self.panes.diff.b.is_empty() => {
-                        let b = self.panes.diff.b.clone();
-                        let action = self.fetch_action(FetchReq::Diff { a, b });
-                        vec![action]
-                    }
-                    _ => vec![],
-                }
-            }
             EditTarget::WatchAdd => {
                 if value.is_empty() {
                     return vec![];
@@ -800,10 +779,6 @@ impl App {
                     vec![self.fetch_action(FetchReq::Tld(cur))]
                 }
             }
-            EditTarget::FollowInterval
-            | EditTarget::FollowCount
-            | EditTarget::BulkPath
-            | EditTarget::BulkDomains => self.panes.apply_field(target, value, self.domain.clone()),
         }
     }
 
@@ -829,7 +804,9 @@ impl App {
             _ => {}
         }
         let domain = self.domain.clone();
-        let outcome = self.panes.handle_key(lens_key, key, domain.as_deref())?;
+        let outcome = self
+            .panes
+            .handle_key(lens_key, key, domain.as_deref(), &self.options)?;
         Some(self.apply_pane_outcome(outcome))
     }
 
@@ -942,7 +919,10 @@ impl App {
             PaneOutcome::Fetch(req) => vec![self.fetch_action(req)],
             PaneOutcome::Action(a) => vec![a],
             PaneOutcome::EditField(target) => {
-                let cur = self.panes.field_value(target);
+                let cur = match target {
+                    EditTarget::TldFilter => self.panes.tld.filter.clone(),
+                    _ => String::new(),
+                };
                 self.input_mode = InputMode::Field {
                     target,
                     buf: cur.into(),
@@ -993,7 +973,7 @@ impl App {
                 vec![]
             }
             CmdOutcome::Lens { lens, target } => {
-                // Smart :rdap <target>: route to the right RDAP sub-tab based on target type.
+                // Smart :rdap <target>: route to the right RDAP query based on target type.
                 if lens == "rdap" {
                     if let Some(t) = target {
                         return self.rdap_command(&t);
@@ -1034,26 +1014,27 @@ impl App {
             }
             CmdOutcome::Diff { a, b } => {
                 self.goto_lens(LensKey::Diff.index());
-                // Keep A too: the pane's labels and its ↵ re-run must use the
-                // command's A, not the session domain.
+                // A is the command's until the session target changes.
                 self.panes.diff.a = a.clone();
-                self.panes.diff.b = b.clone();
-                let action = self.fetch_action(FetchReq::Diff { a, b });
-                vec![action]
+                self.options
+                    .set_text(LensKey::Diff, OptId::SecondDomain, b.clone());
+                vec![self.fetch_action(FetchReq::Diff { a, b })]
             }
             CmdOutcome::Compare { domain, a, b } => {
                 self.goto_lens(LensKey::Compare.index());
-                // Remember the domain (so `a`/`b` re-runs stay on it) and keep
-                // the cycling indices in sync with the given resolvers.
+                // The domain is the command's until the session target
+                // changes; the resolvers become the options.
                 self.panes.compare.domain = Some(domain.clone());
-                self.panes.compare.set_servers(a.clone(), b.clone());
-                let action = self.fetch_action(FetchReq::Compare {
+                self.options
+                    .set_server(LensKey::Compare, OptId::ServerA, Some(a.clone()));
+                self.options
+                    .set_server(LensKey::Compare, OptId::ServerB, Some(b.clone()));
+                vec![self.fetch_action(FetchReq::Compare {
                     domain,
                     record_type: RecordType::A,
                     a,
                     b,
-                });
-                vec![action]
+                })]
             }
             CmdOutcome::Dig {
                 domain,
@@ -1067,12 +1048,12 @@ impl App {
                 // `+trace` opens the Trace lens, anything else Records.
                 let lens = if trace { LensKey::Trace } else { LensKey::Dns };
                 self.goto_lens(lens.index());
-                // The Records and Trace lenses' default requests read the type
-                // and nameserver, so the cache check refetches when only
-                // those changed.
-                self.panes.dns.record_type = record_type;
+                // The lens's request reads its options, so the cache check
+                // refetches when only the type or server changed.
+                self.options.set_record_type(lens, record_type);
                 if let Some(server) = server {
-                    self.panes.dns.select_server(server);
+                    self.options
+                        .set_server(LensKey::Dns, OptId::Server, Some(server));
                 }
                 self.set_domain_and_fetch(target)
             }
@@ -1091,24 +1072,25 @@ impl App {
         }
     }
 
-    /// Handle `:rdap <target>` — routes to the correct RDAP sub-tab based on
+    /// Handle `:rdap <target>` — sets the RDAP Query option from
     /// whether the target looks like an IP address, an ASN, or a domain name.
     fn rdap_command(&mut self, target: &str) -> Vec<Action> {
         self.goto_lens(LensKey::Rdap.index());
 
         // IP address?
         if target.parse::<std::net::IpAddr>().is_ok() {
-            self.tab = 1;
+            self.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 1);
             return vec![self.fetch_action(FetchReq::RdapIp(target.to_string()))];
         }
 
         // ASN? Match AS15169, as15169, or bare 15169.
         if let Some(asn) = parse_asn(target) {
-            self.tab = 2;
+            self.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 2);
             return vec![self.fetch_action(FetchReq::RdapAsn(asn))];
         }
 
-        // Default: domain lookup on tab 0.
+        // Default: domain lookup.
+        self.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 0);
         vec![self.fetch_action(FetchReq::RdapDomain(target.to_string()))]
     }
 
@@ -1186,16 +1168,6 @@ impl App {
             KeyAction::ToggleFocus => {
                 self.focus = self.focus.toggled();
                 vec![]
-            }
-            KeyAction::NextTab => {
-                self.tab = lenses::cycle_tab(self.current_lens(), self.tab, true);
-                self.sel = 0;
-                self.refetch_for_tab()
-            }
-            KeyAction::PrevTab => {
-                self.tab = lenses::cycle_tab(self.current_lens(), self.tab, false);
-                self.sel = 0;
-                self.refetch_for_tab()
             }
             KeyAction::EnterPane => {
                 let lens = self.current_lens();
@@ -1385,6 +1357,9 @@ mod tests {
                     }
                     _ => {}
                 }
+                // Bulk's ↵ starts a run only once it has something to run.
+                app.options
+                    .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
                 let ev = KeyEvent::new(hint.code, KeyModifiers::NONE);
                 assert!(
                     app.handle_pane_key(ev, None).is_some(),
@@ -1426,7 +1401,6 @@ mod tests {
                 )),
                 "{key:?}: {actions:?}"
             );
-            assert_eq!(app.tab, 0);
         }
     }
 
@@ -1440,7 +1414,6 @@ mod tests {
         assert_eq!(app.current_lens().key, LensKey::Compare);
         app.exec_command("dig example.com");
         assert_eq!(app.current_lens().key, LensKey::Dns);
-        assert_eq!(app.tab, 0);
     }
 
     #[test]
@@ -1930,10 +1903,14 @@ mod tests {
     }
 
     #[test]
-    fn rdap_command_ip_routes_to_tab1() {
+    fn rdap_command_ip_routes_to_the_ip_query() {
         let mut app = App::new(None);
         let actions = app.rdap_command("8.8.8.8");
-        assert_eq!(app.tab, 1, ":rdap <ip> must switch to tab 1");
+        assert_eq!(
+            app.options.choice(LensKey::Rdap, OptId::RdapQuery),
+            Some(1),
+            ":rdap <ip> must select the IP query"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -1947,10 +1924,14 @@ mod tests {
     }
 
     #[test]
-    fn rdap_command_asn_routes_to_tab2() {
+    fn rdap_command_asn_routes_to_the_asn_query() {
         let mut app = App::new(None);
         let actions = app.rdap_command("AS15169");
-        assert_eq!(app.tab, 2, ":rdap AS<n> must switch to tab 2");
+        assert_eq!(
+            app.options.choice(LensKey::Rdap, OptId::RdapQuery),
+            Some(2),
+            ":rdap AS<n> must select the ASN query"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -1964,10 +1945,14 @@ mod tests {
     }
 
     #[test]
-    fn rdap_command_domain_routes_to_tab0() {
+    fn rdap_command_domain_routes_to_the_domain_query() {
         let mut app = App::new(None);
         let actions = app.rdap_command("example.com");
-        assert_eq!(app.tab, 0, ":rdap <domain> must stay on tab 0");
+        assert_eq!(
+            app.options.choice(LensKey::Rdap, OptId::RdapQuery),
+            Some(0),
+            ":rdap <domain> must select the domain query"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2267,7 +2252,7 @@ mod tests {
     fn paste_appends_into_active_field() {
         let mut app = App::new(None);
         app.input_mode = InputMode::Field {
-            target: EditTarget::DiffB,
+            target: EditTarget::WatchAdd,
             buf: "a.com ".into(),
         };
         app.update(Msg::Input(Event::Paste("b.com c.com".into())));
@@ -2351,39 +2336,6 @@ mod tests {
                 } if d == "beta.com"
             )),
             "expected Fetch(Overview(beta.com)), got {actions:?}",
-        );
-    }
-
-    #[test]
-    fn rdap_tab_switch_without_default_req_drops_inflight_result() {
-        let mut app = App::new(None);
-        app.domain = Some("example.com".into());
-        let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
-        let rdap_key = lenses::lenses()[idx].key;
-        app.lens = idx;
-        // Simulate an in-flight domain-tab fetch.
-        app.fetch_gen.insert(rdap_key, 1);
-        app.states.insert(rdap_key, LensState::Loading);
-        // Switch to the IP tab with no resolved IP: there is no default
-        // request, so no new fetch is issued...
-        app.tab = 1;
-        let actions = app.refetch_for_tab();
-        assert!(
-            actions.is_empty(),
-            "IP tab without a resolved IP must not fetch, got {actions:?}",
-        );
-        // ...and the stale domain-tab result landing late must be dropped, not
-        // rendered as the IP tab's data.
-        let rdap: seer_core::RdapResponse =
-            serde_json::from_str("{}").expect("empty RDAP object deserializes");
-        app.update(Msg::Data {
-            lens: LensKey::Rdap,
-            gen: 1,
-            result: Ok(LensData::Rdap(Box::new(rdap))),
-        });
-        assert!(
-            !matches!(app.state_of(idx), LensState::Loaded(_)),
-            "stale domain result must not render as the IP/ASN tab's data",
         );
     }
 
@@ -2487,11 +2439,12 @@ mod tests {
         let actions = chord(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(actions.is_empty(), "Ctrl-D on watch: {actions:?}");
 
-        // Bulk: Ctrl-R must not start a run, Alt-E must not overwrite the CSV.
+        // Bulk: Ctrl-↵ must not start a run, Alt-E must not overwrite the CSV.
         let mut app = app_on_lens(None, "bulk");
         app.focus = Focus::Pane;
-        app.panes.bulk.domains = "a.com".into();
-        let actions = chord(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.options
+            .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
+        let actions = chord(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
         assert!(actions.is_empty() && !app.panes.bulk.running, "{actions:?}");
         app.panes.bulk.rows.push(seer_core::bulk::BulkResult {
             operation: seer_core::bulk::BulkOperation::Lookup {
@@ -2505,10 +2458,10 @@ mod tests {
         let actions = chord(&mut app, KeyCode::Char('e'), KeyModifiers::ALT);
         assert!(actions.is_empty(), "Alt-E on bulk: {actions:?}");
 
-        // Follow: Ctrl-S must not start a run.
+        // Follow: Ctrl-↵ must not start a run.
         let mut app = app_on_lens(Some("example.com"), "follow");
         app.focus = Focus::Pane;
-        let actions = chord(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let actions = chord(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
         assert!(
             actions.is_empty() && !app.panes.follow.running,
             "{actions:?}"
@@ -2521,18 +2474,19 @@ mod tests {
         let mut app = App::new(None);
         chord(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(app.lens, lenses::lenses().len() - 1);
-        // `]` typed with AltGr (CONTROL|ALT on Windows) still switches tabs.
+        // `}` typed with AltGr (CONTROL|ALT on Windows) still jumps a group.
         let mut app = app_on_lens(None, "rdap");
+        let next = lenses::group_start(app.lens, true);
         chord(
             &mut app,
-            KeyCode::Char(']'),
+            KeyCode::Char('}'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
-        assert_eq!(app.tab, 1);
+        assert_eq!(app.lens, next);
     }
 
     #[test]
-    fn rdap_asn_cache_is_not_served_on_the_domain_tab() {
+    fn rdap_asn_cache_is_not_served_for_the_domain_query() {
         let rdap = |app: &mut App, gen| {
             let r: seer_core::RdapResponse = serde_json::from_str("{}").unwrap();
             app.update(Msg::Data {
@@ -2548,14 +2502,14 @@ mod tests {
             })
         };
 
-        // With a session domain: the revisit refetches the domain object.
+        // With a session domain: back on the Domain query the lens refetches
+        // the domain object.
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         let asn = app.exec_command("rdap AS15169");
         rdap(&mut app, gen_of(&asn).unwrap());
-        key(&mut app, KeyCode::Char('j'));
-        let back = key(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.tab, 0);
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 0);
+        let back = app.fetch_with_current(false);
         assert!(
             back.iter().any(|a| matches!(
                 a,
@@ -2565,35 +2519,16 @@ mod tests {
         );
 
         // Without one: nothing to refetch, but the ASN object must not render
-        // as the Domain tab's data.
+        // as the Domain query's data.
         let mut app = App::new(None);
         let asn = app.exec_command("rdap AS15169");
         rdap(&mut app, gen_of(&asn).unwrap());
-        key(&mut app, KeyCode::Char('j'));
-        key(&mut app, KeyCode::Char('k'));
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 0);
+        let _ = app.fetch_with_current(false);
         let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
         assert!(
             matches!(app.state_of(idx), LensState::Idle),
-            "stale ASN object served under the Domain tab"
-        );
-    }
-
-    #[test]
-    fn follow_interval_field_opens_empty_so_typing_replaces() {
-        let mut app = app_on_lens(Some("example.com"), "follow");
-        app.focus = Focus::Pane;
-        key(&mut app, KeyCode::Char('i'));
-        assert!(
-            matches!(&app.input_mode, InputMode::Field { target: EditTarget::FollowInterval, buf } if buf.as_str().is_empty()),
-            "got {:?}",
-            app.input_mode
-        );
-        key(&mut app, KeyCode::Char('6'));
-        key(&mut app, KeyCode::Char('0'));
-        key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            app.panes.follow.interval_secs, 60,
-            "was 3060 when prefilled"
+            "stale ASN object served for the Domain query"
         );
     }
 
@@ -2643,35 +2578,16 @@ mod tests {
         let _ = app.take_startup_actions();
         let _ = app.exec_command("diff a.com b.com");
         assert_eq!(app.panes.diff.a, "a.com");
-        app.focus = Focus::Pane;
-        let actions = key(&mut app, KeyCode::Enter);
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::Fetch { req: FetchReq::Diff { a, b }, .. } if a == "a.com" && b == "b.com"
-            )),
-            "↵ must re-run a.com ⇄ b.com, got {actions:?}"
+            matches!(
+                app.default_req(LensKey::Diff, "example.com"),
+                Some(FetchReq::Diff { a, b }) if a == "a.com" && b == "b.com"
+            ),
+            "the lens's request must be a.com ⇄ b.com"
         );
         // A new session target resets A to follow it again.
         let _ = app.set_domain_and_fetch("new.com".into());
         assert!(app.panes.diff.a.is_empty());
-    }
-
-    #[test]
-    fn compare_command_domain_drives_resolver_cycling() {
-        let mut app = App::new(Some("example.com".into()));
-        let _ = app.take_startup_actions();
-        let _ = app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
-        app.focus = Focus::Pane;
-        let actions = key(&mut app, KeyCode::Char('b'));
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::Fetch { req: FetchReq::Compare { domain, a, .. }, .. }
-                    if domain == "other.com" && a == "9.9.9.9"
-            )),
-            "`b` must re-run against other.com, got {actions:?}"
-        );
     }
 
     #[test]
@@ -2857,8 +2773,9 @@ mod tests {
         app.focus = Focus::Pane;
         key(&mut app, KeyCode::Char('G'));
         assert_eq!(app.sel, 4);
-        // `s` re-queries through another nameserver; its answer is shorter.
-        let actions = key(&mut app, KeyCode::Char('s'));
+        // Another nameserver re-queries the lens; its answer is shorter.
+        assert!(app.options.cycle(LensKey::Dns, OptId::Server, true));
+        let actions = app.fetch_with_current(false);
         let gen = fetch_gen_of(&actions);
         app.update(Msg::Data {
             lens: LensKey::Dns,
@@ -2898,18 +2815,14 @@ mod tests {
     }
 
     #[test]
-    fn the_trace_lens_fetches_a_trace_of_the_records_type() {
+    fn trace_results_load_with_one_row_per_hop() {
         let mut app = app_on_lens(Some("example.com"), "dns");
-        app.panes.dns.record_type = RecordType::MX;
         let actions = app.nav_to(LensKey::Trace.index());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 Action::Fetch {
-                    req: FetchReq::Trace {
-                        domain,
-                        record_type: RecordType::MX,
-                    },
+                    req: FetchReq::Trace { domain, .. },
                     ..
                 } if domain == "example.com"
             )),
@@ -2933,7 +2846,6 @@ mod tests {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         let actions = app.exec_command("dig @9.9.9.9 AAAA example.org");
-        assert_eq!(app.tab, 0);
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2947,10 +2859,6 @@ mod tests {
                 } if domain == "example.org" && ns == "9.9.9.9"
             )),
             "got {actions:?}"
-        );
-        assert_eq!(
-            app.panes.dns.slot_labels(),
-            ["system", "8.8.8.8", "1.1.1.1", "9.9.9.9"]
         );
 
         let actions = app.exec_command("dig example.org https +trace");
@@ -3085,7 +2993,7 @@ mod tests {
         assert!(has_fetch(&key(&mut app, KeyCode::Enter)));
     }
 
-    /// A new target, tab or request supersedes a lens's fetch: the cancel
+    /// A new target, option or request supersedes a lens's fetch: the cancel
     /// comes before any new fetch, so it cannot abort the replacement.
     #[test]
     fn superseded_fetches_are_cancelled_before_their_replacement() {
@@ -3111,9 +3019,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{lens:?} not cancelled: {actions:?}"));
             assert!(cancel < first_fetch, "{actions:?}");
         }
-        // A tab switch supersedes the old tab's fetch.
-        app.lens = LensKey::Rdap.index();
-        let actions = key(&mut app, KeyCode::Char(']'));
+        // An option change supersedes the old request's fetch.
+        key(&mut app, KeyCode::Char('3')); // RDAP, domain query in flight
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 2);
+        key(&mut app, KeyCode::Char('j'));
+        let actions = key(&mut app, KeyCode::Char('k'));
         assert!(matches!(
             actions.first(),
             Some(Action::CancelFetch(LensKey::Rdap))
@@ -3121,11 +3031,10 @@ mod tests {
     }
 
     /// `g`/`G` in the nav (and replaying a watch/history row, and the `/`
-    /// target) changed lens but kept the old tab, so the cache check saw a
-    /// tab mismatch and refetched — an Overview refetch records history
-    /// again.
+    /// target) land on the first row, and serve the cached Overview rather
+    /// than refetching it (an Overview refetch records history again).
     #[test]
-    fn every_lens_change_resets_tab_and_selection() {
+    fn every_lens_change_resets_selection() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         app.update(Msg::Data {
@@ -3134,26 +3043,24 @@ mod tests {
             result: Ok(empty_dig()),
         });
         assert!(matches!(app.state_of(0), LensState::Loaded(_)));
-        // Onto RDAP's ASN tab, then back with `g`.
+        // Onto RDAP with a stale selection, then back with `g`.
         app.lens = LensKey::Rdap.index();
-        app.tab = 2;
         app.sel = 4;
         let actions = key(&mut app, KeyCode::Char('g'));
-        assert_eq!((app.lens, app.tab, app.sel), (0, 0, 0));
+        assert_eq!((app.lens, app.sel), (0, 0));
         assert!(
             !has_fetch(&actions),
             "the cached Overview is served: {actions:?}"
         );
-        // `G` likewise lands on tab 0.
-        app.tab = 2;
+        // `G` likewise resets the selection.
+        app.sel = 4;
         key(&mut app, KeyCode::Char('G'));
-        assert_eq!((app.tab, app.sel), (0, 0));
-        // The `/` target from a tabbed lens: same domain, cached Overview.
+        assert_eq!(app.sel, 0);
+        // The `/` target from another lens: same domain, cached Overview.
         app.lens = LensKey::Rdap.index();
-        app.tab = 2;
         key(&mut app, KeyCode::Char('/'));
         let actions = key(&mut app, KeyCode::Enter);
-        assert_eq!((app.lens, app.tab), (0, 0));
+        assert_eq!(app.lens, 0);
         assert!(!has_fetch(&actions), "{actions:?}");
     }
 
@@ -3264,5 +3171,162 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char('j'));
         assert_eq!(app.raw_scroll, 0, "another lens starts at its top");
+    }
+
+    // ---- Options drive every request ----
+
+    /// Every declared option, changed from its default, changes what its
+    /// lens fetches or starts — so no field in the Options box is dead.
+    #[test]
+    fn every_option_changes_its_lens_request() {
+        use crate::tui::options::OptKind;
+        for lens in lenses::lenses() {
+            for spec in lens.options {
+                let mut app = App::new(Some("example.com".into()));
+                let _ = app.take_startup_actions();
+                app.panes.dns.resolved_ip = Some("192.0.2.1".into());
+                app.options
+                    .set_text(LensKey::Diff, OptId::SecondDomain, "example.org".into());
+                app.options
+                    .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com b.com".into());
+                app.options
+                    .set_text(LensKey::Bulk, OptId::BulkFile, "list.txt".into());
+                // File is read only when Source names it.
+                if spec.id == OptId::BulkFile {
+                    app.options.set_choice(LensKey::Bulk, OptId::BulkSource, 1);
+                }
+                let before = run_signature(&mut app, lens.key);
+                match spec.kind {
+                    OptKind::Text { .. } => {
+                        let alt = if spec.id == OptId::BulkDomains {
+                            "c.com"
+                        } else {
+                            "other.org"
+                        };
+                        app.options.commit_text(lens.key, spec.id, alt).unwrap();
+                    }
+                    _ => assert!(app.options.cycle(lens.key, spec.id, true)),
+                }
+                let after = run_signature(&mut app, lens.key);
+                assert_ne!(before, after, "{} option {:?} is dead", lens.label, spec.id);
+            }
+        }
+    }
+
+    /// What a lens would fetch or start now, as text, for comparison.
+    fn run_signature(app: &mut App, key: LensKey) -> String {
+        match key {
+            LensKey::Follow => format!("{:?}", app.options.follow_run()),
+            LensKey::Bulk => format!("{:?}", app.options.bulk_run()),
+            _ => format!("{:?}", app.default_req(key, "example.com")),
+        }
+    }
+
+    #[test]
+    fn records_and_trace_keep_their_own_record_type() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.options.set_record_type(LensKey::Dns, RecordType::MX);
+        let actions = app.nav_to(LensKey::Trace.index());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Trace {
+                        record_type: RecordType::A,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_rdap_query_change_drops_the_cached_result() {
+        let mut app = app_on_lens(Some("example.com"), "rdap");
+        // Any loaded payload stands in for the domain result: only the
+        // request it was fetched for matters to the cache check.
+        app.states
+            .insert(LensKey::Rdap, LensState::Loaded(empty_dig()));
+        app.last_req
+            .insert(LensKey::Rdap, FetchReq::RdapDomain("example.com".into()));
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 2); // ASN: no default req
+        let actions = app.fetch_with_current(false);
+        assert!(actions.is_empty());
+        assert!(
+            matches!(app.state_of(app.lens), LensState::Idle),
+            "domain result not re-served"
+        );
+    }
+
+    #[test]
+    fn commands_write_the_options() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.exec_command("dig @9.9.9.9 AAAA example.org");
+        assert_eq!(
+            app.options.record_type(LensKey::Dns),
+            Some(RecordType::AAAA)
+        );
+        assert_eq!(
+            app.options.server(LensKey::Dns, OptId::Server),
+            Some(Some("9.9.9.9".into()))
+        );
+        app.exec_command("dig example.org https +trace");
+        assert_eq!(
+            app.options.record_type(LensKey::Trace),
+            Some(RecordType::HTTPS)
+        );
+        app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
+        assert_eq!(
+            app.options.server(LensKey::Compare, OptId::ServerB),
+            Some(Some("8.8.4.4".into()))
+        );
+        app.exec_command("diff a.com b.com");
+        assert_eq!(
+            app.options.text(LensKey::Diff, OptId::SecondDomain),
+            Some("b.com".into())
+        );
+        app.exec_command("rdap AS15169");
+        assert_eq!(app.options.choice(LensKey::Rdap, OptId::RdapQuery), Some(2));
+    }
+
+    // Review Focus 5.
+    #[test]
+    fn a_new_domain_keeps_options_but_resets_command_overrides() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.options.set_record_type(LensKey::Dns, RecordType::MX);
+        app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
+        let _ = app.set_domain_and_fetch("new.com".into());
+        assert_eq!(app.options.record_type(LensKey::Dns), Some(RecordType::MX));
+        assert!(app.panes.compare.domain.is_none());
+        assert!(matches!(
+            app.default_req(LensKey::Compare, "new.com"),
+            Some(FetchReq::Compare { domain, .. }) if domain == "new.com"
+        ));
+    }
+
+    #[test]
+    fn follow_and_bulk_start_from_their_options() {
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.options
+            .commit_text(LensKey::Follow, OptId::Count, "5")
+            .unwrap();
+        let o = app.options.follow_run();
+        let out = app.panes.handle_key(
+            LensKey::Follow,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Some("example.com"),
+            &app.options,
+        );
+        assert!(
+            matches!(
+                out,
+                Some(PaneOutcome::Action(Action::StartFollow(p))) if p.iterations == 5 && p.interval_secs == 30
+            ),
+            "options {o:?}"
+        );
     }
 }

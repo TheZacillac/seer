@@ -24,11 +24,6 @@ impl Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditTarget {
     Target,
-    DiffB,
-    FollowInterval,
-    FollowCount,
-    BulkPath,
-    BulkDomains,
     WatchAdd,
     TldFilter,
     /// Live `/`-filter for a table lens (subdomains/history/propagation).
@@ -121,17 +116,6 @@ impl FetchReq {
         }
     }
 
-    /// The sub-tab of its lens this request's result renders under. Lens
-    /// state is cached per lens (not per tab), so `App` compares this against
-    /// the active tab to tell whether a cached result still belongs on screen.
-    pub fn tab(&self) -> usize {
-        match self {
-            FetchReq::RdapIp(_) => 1,
-            FetchReq::RdapAsn(_) => 2,
-            _ => 0,
-        }
-    }
-
     /// Human label for what this request queries (loading indicator text).
     pub fn target(&self) -> String {
         match self {
@@ -190,7 +174,7 @@ pub enum Action {
         gen: u64,
     },
     /// Abort the lens's in-flight fetch: its generation moved on (new
-    /// target, tab or request), so its result would be dropped anyway, and
+    /// target, option or request), so its result would be dropped anyway, and
     /// an active scan should not keep probing hosts for nothing.
     CancelFetch(LensKey),
     Copy {
@@ -302,23 +286,13 @@ mod tests {
             record_type: RecordType::A,
         };
         assert_eq!(trace.lens_key(), "trace");
-        assert_eq!(trace.tab(), 0, "a lens of its own");
         assert_eq!(trace.target(), "x");
         assert_eq!(FetchReq::Tld(".com".into()).lens_key(), "tld");
         assert_eq!(FetchReq::Headers("x".into()).lens_key(), "headers");
         assert_eq!(FetchReq::Audit("x".into()).lens_key(), "audit");
         assert_eq!(FetchReq::Audit("x".into()).target(), "x");
         assert_eq!(FetchReq::Takeover("x".into()).lens_key(), "takeover");
-    }
-
-    #[test]
-    fn fetch_req_tabs_match_the_lens_sub_tabs() {
-        assert_eq!(FetchReq::RdapDomain("x".into()).tab(), 0);
-        assert_eq!(FetchReq::RdapIp("1.2.3.4".into()).tab(), 1);
-        assert_eq!(FetchReq::RdapAsn(15169).tab(), 2);
-        assert_eq!(FetchReq::Dnssec("x".into()).tab(), 0);
         assert_eq!(FetchReq::Dnssec("x".into()).lens_key(), "dnssec");
-        assert_eq!(FetchReq::Whois("x".into()).tab(), 0);
         assert_eq!(FetchReq::RdapAsn(15169).target(), "AS15169");
     }
 

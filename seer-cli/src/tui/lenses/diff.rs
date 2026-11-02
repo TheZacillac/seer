@@ -1,4 +1,5 @@
-//! Diff lens — always-visible A⇄B input bar + 3-column comparison (FIELD|A|B).
+//! Diff lens — always-visible A⇄B bar + 3-column comparison (FIELD|A|B).
+//! Domain B is the lens's option (`options::DIFF`), edited in the Options box.
 use std::fmt::Display;
 
 use ratatui::layout::Constraint;
@@ -8,16 +9,14 @@ use ratatui::widgets::Row;
 use seer_core::output::sanitize_line;
 
 use crate::tui::action::{LensData, LensState};
-use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::or_dash;
 use crate::tui::widgets::page::{Block, Page, TableBlock};
 
 /// The Diff lens. Pure function of its inputs (no `App` coupling):
 /// - `domain`  domain A (the `:diff` override, else the session target)
-/// - `b`       committed second domain (B)
-/// - `editing` `Some(editor)` while the B field is being typed
-/// - `focused` whether the pane has focus
+/// - `b`       the second domain (B), from the Options box
+/// - `_focused` whether the pane has focus (the body has no focus-aware part)
 /// - `state`   the lens load state (drives the body)
 ///
 /// Once a comparison is loaded the input bar names the domains that result
@@ -26,8 +25,7 @@ pub fn page(
     theme: &Theme,
     domain: Option<&str>,
     b: &str,
-    editing: Option<&LineEditor>,
-    focused: bool,
+    _focused: bool,
     state: &LensState,
 ) -> Page {
     // ── input bar: A · <domain>   ⇄   B · <value> ────────────────────────────
@@ -40,10 +38,10 @@ pub fn page(
         .or(domain)
         .unwrap_or("(no target)");
     let b = loaded.map(|d| d.domain_b.as_str()).unwrap_or(b);
-    let (b_text, b_color) = match editing {
-        Some(buf) => (buf.with_caret("▏"), theme.text),
-        None if !b.is_empty() => (sanitize_line(b), theme.text),
-        None => ("[ press e ]".to_string(), theme.overlay0),
+    let (b_text, b_color) = if b.is_empty() {
+        ("set in Options (3)".to_string(), theme.overlay0)
+    } else {
+        (sanitize_line(b), theme.text)
     };
     let bar = Line::from(vec![
         Span::styled("A · ", Style::default().fg(theme.overlay0)),
@@ -52,16 +50,7 @@ pub fn page(
         Span::styled("B · ", Style::default().fg(theme.overlay0)),
         Span::styled(b_text, Style::default().fg(b_color)),
     ]);
-    // ── hint (focus-aware) ───────────────────────────────────────────────────
-    let hint = if focused {
-        "e edit B · ↵ compare"
-    } else {
-        "↵ focus pane"
-    };
-    let page = Page::new("Diff", theme.yellow).push(Block::Lines(vec![
-        bar,
-        Line::from(Span::styled(hint, Style::default().fg(theme.overlay0))),
-    ]));
+    let page = Page::new("Diff", theme.yellow).push(Block::Lines(vec![bar]));
 
     // ── body by state ────────────────────────────────────────────────────────
     let line =
@@ -79,11 +68,11 @@ pub fn page(
         _ => {
             let idle = if domain.is_some() {
                 format!(
-                    "set a second domain (e) to compare against {}",
+                    "set a second domain in Options (3) to compare against {}",
                     sanitize_line(a)
                 )
             } else {
-                "look up a domain first (/)".to_string()
+                "look up a domain first (1)".to_string()
             };
             page.push(line(
                 idle,
@@ -175,7 +164,6 @@ mod tests {
         theme: &Theme,
         domain: Option<&str>,
         b: &str,
-        editing: Option<&LineEditor>,
         focused: bool,
         state: &LensState,
     ) {
@@ -183,7 +171,7 @@ mod tests {
             f,
             area,
             theme,
-            page(theme, domain, b, editing, focused, state),
+            page(theme, domain, b, focused, state),
             focused,
         );
     }
@@ -223,16 +211,7 @@ mod tests {
         diff.errors = vec!["b.com: status check failed: HTTP request failed".into()];
         let state = LensState::Loaded(LensData::Diff(Box::new(diff)));
         let text = render_text(100, 24, |f| {
-            render(
-                f,
-                f.area(),
-                &theme,
-                Some("a.com"),
-                "b.com",
-                None,
-                false,
-                &state,
-            );
+            render(f, f.area(), &theme, Some("a.com"), "b.com", false, &state);
         });
         assert!(
             text.contains("b.com: status check failed"),
@@ -250,7 +229,6 @@ mod tests {
                 &theme,
                 Some("acme.io"),
                 "",
-                None,
                 false,
                 &LensState::Idle,
             );
@@ -258,47 +236,10 @@ mod tests {
         assert!(text.contains("A ·"), "input bar shows A");
         assert!(text.contains("B ·"), "input bar shows B");
         assert!(text.contains("acme.io"), "shows current domain as A");
-        assert!(text.contains("press e"), "prompts how to set B");
-    }
-
-    #[test]
-    fn editing_shows_live_buffer() {
-        let theme = Theme::frappe();
-        let text = render_text(90, 20, |f| {
-            render(
-                f,
-                f.area(),
-                &theme,
-                Some("acme.io"),
-                "",
-                Some(&LineEditor::from("typed.io")),
-                true,
-                &LensState::Idle,
-            );
-        });
-        assert!(text.contains("typed.io"), "live edit buffer should render");
-    }
-
-    #[test]
-    fn editing_caret_follows_the_cursor() {
-        let theme = Theme::frappe();
-        let mut editor = LineEditor::from("typed.io");
-        editor.home();
-        let text = render_text(90, 20, |f| {
-            render(
-                f,
-                f.area(),
-                &theme,
-                Some("acme.io"),
-                "",
-                Some(&editor),
-                true,
-                &LensState::Idle,
-            );
-        });
+        assert!(text.contains("set in Options (3)"), "prompts how to set B");
         assert!(
-            text.contains("B · ▏typed.io"),
-            "caret must render at the cursor (Home), not the end"
+            text.contains("set a second domain in Options (3) to compare against acme.io"),
+            "idle text names A: {text}"
         );
     }
 
@@ -315,7 +256,6 @@ mod tests {
                 &theme,
                 Some("session.com"),
                 "other.com",
-                None,
                 false,
                 &state,
             );
@@ -330,16 +270,7 @@ mod tests {
         let theme = Theme::frappe();
         let state = LensState::Loaded(LensData::Diff(Box::new(diff_fixture())));
         let text = render_text(90, 20, |f| {
-            render(
-                f,
-                f.area(),
-                &theme,
-                Some("a.com"),
-                "b.com",
-                None,
-                false,
-                &state,
-            );
+            render(f, f.area(), &theme, Some("a.com"), "b.com", false, &state);
         });
         assert!(text.contains("NameCheap"), "table renders registrar A");
         assert!(text.contains("GoDaddy"), "table renders registrar B");

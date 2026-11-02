@@ -25,8 +25,6 @@ pub enum KeyAction {
     PrevGroup,
     NextGroup,
     ToggleFocus,
-    NextTab,
-    PrevTab,
     EnterPane,
     Back,
     ToggleRaw,
@@ -46,8 +44,6 @@ pub fn map(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('G') => KeyAction::Bottom,
         KeyCode::Char(c @ '1'..='9') => KeyAction::JumpLens((c as usize) - ('1' as usize)),
         KeyCode::Tab => KeyAction::ToggleFocus,
-        KeyCode::Char(']') => KeyAction::NextTab,
-        KeyCode::Char('[') => KeyAction::PrevTab,
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => KeyAction::EnterPane,
         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => KeyAction::Back,
         KeyCode::Char('r') => KeyAction::ToggleRaw,
@@ -89,8 +85,6 @@ mod tests {
     #[test]
     fn mode_and_focus_keys() {
         assert_eq!(map(k(KeyCode::Tab)), Some(KeyAction::ToggleFocus));
-        assert_eq!(map(k(KeyCode::Char('['))), Some(KeyAction::PrevTab));
-        assert_eq!(map(k(KeyCode::Char(']'))), Some(KeyAction::NextTab));
         assert_eq!(map(k(KeyCode::Char('/'))), Some(KeyAction::EditDomain));
         assert_eq!(map(k(KeyCode::Char(':'))), Some(KeyAction::Command));
         assert_eq!(map(k(KeyCode::Char('?'))), Some(KeyAction::Help));

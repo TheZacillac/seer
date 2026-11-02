@@ -150,7 +150,6 @@ pub struct Lens {
     pub glyph: &'static str,
     pub cmd: &'static str,
     pub group: &'static str,
-    pub tabs: &'static [&'static str],
     /// The Options box's fields (see `options.rs`); empty collapses the box.
     pub options: &'static [OptSpec],
     /// ↵ focuses the pane even with no rows: its controls work without data.
@@ -165,7 +164,7 @@ pub struct Lens {
     pub keys: &'static [KeyHint],
 }
 
-/// A tab-less, non-interactive lens whose `:` command is its key; the
+/// A non-interactive lens whose `:` command is its key; the
 /// builder methods below override the rest.
 const fn lens(key: LensKey, label: &'static str, glyph: &'static str, group: &'static str) -> Lens {
     Lens {
@@ -174,7 +173,6 @@ const fn lens(key: LensKey, label: &'static str, glyph: &'static str, group: &'s
         glyph,
         cmd: key.as_str(),
         group,
-        tabs: &[],
         options: &[],
         interactive: false,
         filter: false,
@@ -187,11 +185,6 @@ impl Lens {
     /// `:` command alias, for lenses whose command differs from their key.
     const fn cmd(self, cmd: &'static str) -> Self {
         Self { cmd, ..self }
-    }
-
-    /// Sub-tabs, cycled with `[` / `]`.
-    const fn tabs(self, tabs: &'static [&'static str]) -> Self {
-        Self { tabs, ..self }
     }
 
     const fn options(self, options: &'static [OptSpec]) -> Self {
@@ -234,45 +227,27 @@ impl Lens {
 static LENSES: &[Lens] = &[
     lens(LensKey::Overview, "Overview", "◈", "LOOKUP").cmd("lookup"),
     lens(LensKey::Whois, "WHOIS", "▤", "LOOKUP"),
-    lens(LensKey::Rdap, "RDAP", "▦", "LOOKUP")
-        .tabs(&["Domain", "IP", "ASN"])
-        .options(options::RDAP)
-        .interactive(),
+    lens(LensKey::Rdap, "RDAP", "▦", "LOOKUP").options(options::RDAP),
     lens(LensKey::Reverse, "Reverse DNS", "↩", "LOOKUP"),
     lens(LensKey::Avail, "Availability", "◎", "LOOKUP"),
     lens(LensKey::Tld, "TLD Info", "⊞", "LOOKUP")
         .interactive()
-        .keys(&[
-            hint(KeyCode::Char('f'), "filter"),
-            hint(KeyCode::Enter, "load"),
-        ]),
-    // Interactive so `s` can change the nameserver of an empty answer.
+        .keys(&[hint(KeyCode::Enter, "load")]),
     lens(LensKey::Dns, "Records", "≣", "DNS")
         .cmd("dig")
-        .options(options::RECORDS)
-        .interactive()
         .filter()
-        .keys(&[hint(KeyCode::Char('s'), "nameserver")]),
+        .options(options::RECORDS),
     lens(LensKey::Dnssec, "DNSSEC", "◑", "DNS"),
-    // `a` / `b` cycle the resolvers even before a comparison has loaded.
-    lens(LensKey::Compare, "Compare", "≍", "DNS")
-        .options(options::COMPARE)
-        .interactive()
-        .keys(&[
-            hint(KeyCode::Char('a'), "resolver A"),
-            hint(KeyCode::Char('b'), "resolver B"),
-        ]),
+    lens(LensKey::Compare, "Compare", "≍", "DNS").options(options::COMPARE),
     lens(LensKey::Trace, "Trace", "⇶", "DNS").options(options::TRACE),
     lens(LensKey::Propagation, "Propagation", "◐", "DNS")
         .cmd("prop")
         .filter(),
     lens(LensKey::Follow, "Follow", "⟳", "DNS")
-        .options(options::FOLLOW)
         .interactive()
+        .options(options::FOLLOW)
         .keys(&[
-            hint(KeyCode::Char('s'), "start"),
-            hint(KeyCode::Char('i'), "interval"),
-            hint(KeyCode::Char('n'), "count"),
+            hint(KeyCode::Enter, "start"),
             hint(KeyCode::Char('x'), "stop"),
         ]),
     lens(LensKey::Ssl, "SSL / Cert", "⛨", "SECURITY"),
@@ -285,19 +260,12 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Takeover, "Takeover", "⚑", "SECURITY")
         .filter()
         .heavy(),
-    // `↵` diffs only once a second domain is set, so it is not hinted.
-    lens(LensKey::Diff, "Diff", "⇄", "POWER")
-        .options(options::DIFF)
-        .interactive()
-        .keys(&[hint(KeyCode::Char('e'), "2nd domain")]),
+    lens(LensKey::Diff, "Diff", "⇄", "POWER").options(options::DIFF),
     lens(LensKey::Bulk, "Bulk", "⧉", "POWER")
-        .options(options::BULK)
         .interactive()
+        .options(options::BULK)
         .keys(&[
-            hint(KeyCode::Char('o'), "op"),
-            hint(KeyCode::Char('d'), "domains"),
-            hint(KeyCode::Char('f'), "file"),
-            hint(KeyCode::Char('r'), "run"),
+            hint(KeyCode::Enter, "run · detail"),
             hint(KeyCode::Char('v'), "detail"),
             hint(KeyCode::Char('x'), "cancel"),
             hint(KeyCode::Char('e'), "export"),
@@ -400,29 +368,14 @@ pub fn find_by_cmd_or_key(token: &str) -> Option<usize> {
         .position(|l| l.cmd == token || l.key == token)
 }
 
-/// Next/previous sub-tab index for a lens, wrapping. `forward = true` advances.
-pub fn cycle_tab(lens: &Lens, current: usize, forward: bool) -> usize {
-    let n = lens.tabs.len();
-    if n == 0 {
-        return 0;
-    }
-    if forward {
-        (current + 1) % n
-    } else {
-        (current + n - 1) % n
-    }
-}
-
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use crate::tui::action::LensData;
-use crate::tui::panes::Panes;
 use crate::tui::theme::Theme;
 
 /// Dispatch human-view rendering to the lens's renderer.
-/// `panes` carries interactive component state; Phase-2 renderers may ignore it
-/// (param prefixed `_panes` in those signatures to suppress clippy).
+/// `rdap_query` is the RDAP lens's Query choice (its label only).
 /// `filter` is the active `/`-filter, for renderers that filter by reference
 /// (History, DNS Records); other row lenses receive already-filtered `data`.
 #[allow(clippy::too_many_arguments)]
@@ -431,17 +384,16 @@ pub fn render(
     area: Rect,
     theme: &Theme,
     key: LensKey,
-    tab: usize,
+    rdap_query: usize,
     data: &LensData,
     filter: &str,
     focused: bool,
     sel: usize,
-    panes: &Panes,
 ) {
     let page = match key {
         LensKey::Overview => overview::page(theme, data),
         LensKey::Whois => whois::page(theme, data),
-        LensKey::Rdap => Some(rdap::page(theme, tab, data)),
+        LensKey::Rdap => Some(rdap::page(theme, rdap_query, data)),
         LensKey::Ssl => ssl::page(theme, data),
         LensKey::Status => status::page(theme, data),
         LensKey::Reverse => reverse::page(theme, data),
@@ -453,7 +405,7 @@ pub fn render(
         LensKey::Headers => headers::page(theme, data, focused, sel),
         LensKey::Audit => audit::page(theme, data, focused, sel),
         LensKey::Takeover => takeover::page(theme, data, focused, sel),
-        LensKey::Dns => dns::page(theme, data, filter, focused, sel, &panes.dns),
+        LensKey::Dns => dns::page(theme, data, filter, focused, sel),
         LensKey::Dnssec => dnssec::page(theme, data),
         LensKey::Compare => compare::page(theme, data),
         LensKey::Trace => trace::page(theme, data, focused, sel),
@@ -616,7 +568,7 @@ mod tests {
         assert_eq!(flagged(|l| l.heavy), ["subdomains", "audit", "takeover"]);
         assert_eq!(
             flagged(|l| l.interactive),
-            ["rdap", "tld", "dns", "compare", "follow", "diff", "bulk", "watch"]
+            ["tld", "follow", "bulk", "watch"]
         );
         assert_eq!(
             flagged(|l| l.filterable()),
@@ -685,24 +637,15 @@ mod tests {
     }
 
     #[test]
-    fn cycle_tab_wraps_in_both_directions() {
-        let rdap = lenses().iter().position(|l| l.key == "rdap").unwrap();
-        assert_eq!(cycle_tab(&lenses()[rdap], 0, true), 1);
-        assert_eq!(cycle_tab(&lenses()[rdap], 2, true), 0);
-        assert_eq!(cycle_tab(&lenses()[rdap], 0, false), 2);
-    }
-
-    #[test]
     fn every_registered_lens_has_a_render_arm() {
         // Handed another lens's payload, a renderer skips it or draws its
         // empty state, so only a key missing from `render`'s match can panic
         // here, via its debug_assert.
         let theme = Theme::frappe();
         let data = LensData::History(vec![]);
-        let panes = Panes::default();
         for l in lenses() {
             crate::tui::test_util::render_buffer(80, 24, |f| {
-                render(f, f.area(), &theme, l.key, 0, &data, "", false, 0, &panes);
+                render(f, f.area(), &theme, l.key, 0, &data, "", false, 0);
             });
         }
     }

@@ -15,7 +15,6 @@ use seer_core::{DnsQueryResult, DnsRecord, DnsStatus};
 
 use crate::tui::action::LensData;
 use crate::tui::filter;
-use crate::tui::panes::DnsState;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::inspector::Field;
 use crate::tui::widgets::page::{Block, Detail, Page, TableBlock};
@@ -82,8 +81,7 @@ pub(super) fn record_table<'r>(
     )
 }
 
-/// The Records lens: the nameserver chips and their keys, dig's status line,
-/// then the response — the answers (and, while focused, the selected one's
+/// The Records lens: dig's status line, then the response — the answers (and, while focused, the selected one's
 /// full fields), the verdict when there are none, the authority records,
 /// and the local-answer or wildcard note. The verdict and notes are kept
 /// whole; the tables give rows up first.
@@ -93,7 +91,6 @@ pub fn page(
     filter: &str,
     focused: bool,
     sel: usize,
-    dns: &DnsState,
 ) -> Option<Page> {
     let LensData::Dig(result) = data else {
         return None;
@@ -104,30 +101,7 @@ pub fn page(
         sanitize_line(&result.name)
     );
 
-    // Nameserver chip row
-    let mut ns_spans: Vec<Span> = Vec::new();
-    for (i, label) in dns.slot_labels().into_iter().enumerate() {
-        if i > 0 {
-            ns_spans.push(Span::raw(" "));
-        }
-        let style = if i == dns.ns_idx {
-            Style::default().fg(theme.base).bg(theme.sky)
-        } else {
-            Style::default().fg(theme.subtext).bg(theme.surface0)
-        };
-        ns_spans.push(Span::styled(format!(" {label} "), style));
-    }
-    let hint = Line::from(vec![
-        Span::styled("s ", Style::default().fg(theme.overlay0)),
-        Span::styled("nameserver  ", Style::default().fg(theme.subtext)),
-        Span::styled("/ ", Style::default().fg(theme.overlay0)),
-        Span::styled("filter", Style::default().fg(theme.subtext)),
-    ]);
-    let mut page = Page::new(title, theme.sky).push(Block::Lines(vec![
-        Line::from(ns_spans),
-        hint,
-        status_line(theme, result),
-    ]));
+    let mut page = Page::new(title, theme.sky).push(Block::Lines(vec![status_line(theme, result)]));
 
     if !result.answers.is_empty() {
         let selected = focused.then_some(sel);
@@ -219,14 +193,12 @@ mod tests {
         filter: &str,
         focused: bool,
         sel: usize,
-        panes: &Panes,
     ) {
-        if let Some(p) = page(theme, data, filter, focused, sel, &panes.dns) {
+        if let Some(p) = page(theme, data, filter, focused, sel) {
             page::draw(f, area, theme, p, focused);
         }
     }
     use crate::payload::fixtures;
-    use crate::tui::panes::Panes;
     use crate::tui::test_util::{render_buffer, render_lines};
     use seer_core::dns::{RecordData, RecordType};
     use seer_core::WildcardProbe;
@@ -247,7 +219,7 @@ mod tests {
     #[test]
     fn a_long_detail_keeps_the_answer_table_in_view() {
         let data = txt_dig(&"x".repeat(2000));
-        let s = draw(&data, &Panes::default(), "", Some(0));
+        let s = draw(&data, "", Some(0));
         assert!(s.contains("ANSWER"), "the table header must stay: {s}");
         assert!(s.contains("more lines"), "the detail is cut short: {s}");
     }
@@ -256,16 +228,16 @@ mod tests {
     fn focused_record_shows_its_full_data_wrapped() {
         let long = format!("v=spf1 {}-all", "include:_spf.example.net ".repeat(12));
         let data = txt_dig(&long);
-        let s = draw(&data, &Panes::default(), "", Some(0));
+        let s = draw(&data, "", Some(0));
         assert!(
             s.contains("-all"),
             "the tail of a long TXT must be visible: {s}"
         );
-        let unfocused = draw(&data, &Panes::default(), "", None);
+        let unfocused = draw(&data, "", None);
         assert!(!unfocused.contains("-all"), "{unfocused}");
     }
 
-    fn draw(data: &LensData, panes: &Panes, filter: &str, sel: Option<usize>) -> String {
+    fn draw(data: &LensData, filter: &str, sel: Option<usize>) -> String {
         let theme = Theme::frappe();
         render_lines(100, 16, |f| {
             render(
@@ -276,7 +248,6 @@ mod tests {
                 filter,
                 sel.is_some(),
                 sel.unwrap_or(0),
-                panes,
             );
         })
     }
@@ -336,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_positive_answer_lists_the_chain_under_its_real_owners() {
-        let text = draw(&dig_data(chained()), &Panes::default(), "", None);
+        let text = draw(&dig_data(chained()), "", None);
         assert!(
             text.contains("dig · A records · www.seer.test"),
             "title names the type and name: {text}"
@@ -380,9 +351,8 @@ mod tests {
     fn answer_data_is_highlighted_but_chain_hops_are_not() {
         let theme = Theme::frappe();
         let data = dig_data(chained());
-        let panes = Panes::default();
         let buffer = render_buffer(100, 16, |f| {
-            render(f, f.area(), &theme, &data, "", false, 0, &panes);
+            render(f, f.area(), &theme, &data, "", false, 0);
         });
         let fg_of = |needle: &str| {
             let area = buffer.area();
@@ -409,7 +379,7 @@ mod tests {
             authority: vec![soa("seer.test")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)
         };
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         // A negative answer carries its header like any response.
         assert!(
             text.contains("● NXDOMAIN  flags qr rd ra  server default  time 12 ms"),
@@ -431,7 +401,7 @@ mod tests {
             authority: vec![soa("seer.test")],
             ..fixtures::dig(RecordType::AAAA, vec![])
         };
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         assert!(text.contains("● NOERROR"), "{text}");
         assert!(
             text.contains("No AAAA records (NODATA — the name exists)"),
@@ -451,7 +421,7 @@ mod tests {
             authority: vec![soa("cdn.test")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NxDomain)
         };
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         assert!(text.contains("ANSWER"), "{text}");
         assert!(
             row_with(&text, "gone.cdn.test.").contains("CNAME"),
@@ -478,13 +448,12 @@ mod tests {
             ),
         ] {
             let data = dig_data(fixtures::dig_status(RecordType::A, status));
-            let panes = Panes::default();
-            let text = draw(&data, &panes, "", None);
+            let text = draw(&data, "", None);
             assert!(text.contains(verdict), "{text}");
             assert!(!text.contains("AUTHORITY"), "{text}");
             // The status is drawn in the failure color.
             let buffer = render_buffer(100, 16, |f| {
-                render(f, f.area(), &theme, &data, "", false, 0, &panes);
+                render(f, f.area(), &theme, &data, "", false, 0);
             });
             let status_row = (0..16u16)
                 .find(|&y| {
@@ -519,7 +488,7 @@ mod tests {
             authority: vec![ns("ns1.child.seer.test."), ns("ns2.child.seer.test.")],
             ..fixtures::dig_status(RecordType::A, DnsStatus::NoError)
         };
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         assert!(text.contains("● NOERROR  flags qr rd  server"), "{text}");
         assert!(
             flat(&text).contains(
@@ -546,7 +515,7 @@ mod tests {
                 vec![fixtures::a("foo.localhost", "127.0.0.1")],
             )
         };
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         assert!(
             text.contains("● NOERROR  server none  time 12 ms"),
             "{text}"
@@ -565,7 +534,7 @@ mod tests {
             present: true,
             matches_answer: true,
         });
-        let text = draw(&dig_data(result.clone()), &Panes::default(), "", None);
+        let text = draw(&dig_data(result.clone()), "", None);
         // Wrapped to the pane: the words run across a line break.
         assert!(
             flat(&text).contains(
@@ -582,7 +551,7 @@ mod tests {
 
         let probe = result.wildcard.as_mut().unwrap();
         probe.matches_answer = false;
-        let text = draw(&dig_data(result.clone()), &Panes::default(), "", None);
+        let text = draw(&dig_data(result.clone()), "", None);
         assert!(
             flat(&text).contains("resolves too, but with different data"),
             "{text}"
@@ -590,19 +559,19 @@ mod tests {
 
         // A probe that found no wildcard says nothing.
         result.wildcard.as_mut().unwrap().present = false;
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         assert!(!text.contains("Wildcard"), "{text}");
     }
 
     #[test]
     fn the_filter_narrows_the_answer_rows_but_not_the_verdict() {
         let data = dig_data(chained());
-        let text = draw(&data, &Panes::default(), "192.0.2.8", None);
+        let text = draw(&data, "192.0.2.8", None);
         assert!(text.contains("192.0.2.8"), "{text}");
         assert!(!text.contains("192.0.2.7"), "{text}");
         assert!(!text.contains("shop.seer.test."), "{text}");
         // Nothing matching is an empty table, not a "no records" verdict.
-        let text = draw(&data, &Panes::default(), "zzz", None);
+        let text = draw(&data, "zzz", None);
         assert!(text.contains("ANSWER"), "{text}");
         assert!(!text.contains("NODATA"), "{text}");
     }
@@ -618,7 +587,7 @@ mod tests {
                 data: RecordData::txt(vec!["v=spf1\x1b[2J -all\n203.0.113.66".into()]),
             }],
         );
-        let text = draw(&dig_data(result), &Panes::default(), "", None);
+        let text = draw(&dig_data(result), "", None);
         let row = row_with(&text, "v=spf1");
         assert!(row.contains("\"v=spf1 -all 203.0.113.66\""), "{row}");
         assert!(!text.contains("[2J"), "escape sequence removed: {text}");
@@ -630,18 +599,7 @@ mod tests {
             .map(|i| fixtures::a("www.seer.test", &format!("192.0.2.{i}")))
             .collect();
         let data = dig_data(fixtures::dig(RecordType::A, answers));
-        let text = draw(&data, &Panes::default(), "", Some(29));
+        let text = draw(&data, "", Some(29));
         assert!(text.contains("192.0.2.30"), "{text}");
-    }
-
-    #[test]
-    fn renders_nameserver_chip_row() {
-        let data = dig_data(chained());
-        let mut panes = Panes::default();
-        let text = draw(&data, &panes, "", None);
-        assert!(text.contains(" system   8.8.8.8   1.1.1.1 "), "{text}");
-        panes.dns.select_server("9.9.9.9".into());
-        let text = draw(&data, &panes, "", None);
-        assert!(text.contains(" 1.1.1.1   9.9.9.9 "), "custom slot: {text}");
     }
 }
