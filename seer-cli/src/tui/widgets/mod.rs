@@ -26,6 +26,31 @@ pub fn or_dash<T: ToString>(value: Option<T>) -> String {
     value.map_or_else(|| "—".to_string(), |v| v.to_string())
 }
 
+/// `text` cut to at most `width` display columns, keeping the tail behind a
+/// leading `…` — a typed value's end (the registrable part of a domain, the
+/// caret) is what matters. Fits as-is when it already does.
+pub fn fit_tail(text: &str, width: usize) -> String {
+    if Span::raw(text).width() <= width {
+        return text.to_string();
+    }
+    // Room for the `…` (one column) before the kept tail.
+    let budget = width.saturating_sub(1);
+    let mut kept = 0;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let w = Span::raw(c.to_string()).width();
+        if kept + w > budget {
+            break;
+        }
+        kept += w;
+        start = i;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("…{}", &text[start..])
+}
+
 /// Style for one row of a selectable list: body text, on the `surface0`
 /// selection band when `selected`.
 ///
@@ -130,6 +155,20 @@ pub fn wrap_hard(text: &str, width: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_tail_keeps_the_end_within_the_width() {
+        assert_eq!(fit_tail("example.com", 11), "example.com");
+        assert_eq!(fit_tail("abcdefghij", 5), "…ghij");
+        assert_eq!(fit_tail("abc", 0), "");
+        assert_eq!(fit_tail("abc", 1), "…");
+        // A wide character is never split and the result never overflows:
+        // 4 columns = `…` + one 2-column char (a second would need 5).
+        let s = fit_tail("日本語", 4);
+        assert_eq!(s, "…語");
+        assert!(Span::raw(s.as_str()).width() <= 4);
+        assert_eq!(fit_tail("日本語", 5), "…本語");
+    }
 
     #[test]
     fn wrap_hard_splits_words_wider_than_the_line() {

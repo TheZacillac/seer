@@ -60,8 +60,8 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
         area.width.saturating_sub(layout::LEFT_W)
     }
     .saturating_sub(2);
-    let opt_lines =
-        widgets::options::lines(theme, &fields, inner_w, app.section == Section::Options);
+    let (opt_lines, cursor_row) =
+        widgets::options::rows(theme, &fields, inner_w, app.section == Section::Options);
     let rows = if fields.is_empty() {
         0
     } else {
@@ -82,16 +82,19 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
         );
     }
     if let Some(r) = a.options {
-        let title = section_title(Section::Options, "Options");
+        let title = Section::Options.title("Options");
         let inner = panel::render(
             f,
             r,
             theme,
             &title,
-            theme.peach,
+            theme.mauve,
             app.section == Section::Options,
         );
-        f.render_widget(Paragraph::new(opt_lines), inner);
+        // A capped box scrolls to keep the cursor field's row in view.
+        let top = (cursor_row + 1).saturating_sub(usize::from(inner.height));
+        let top = u16::try_from(top).unwrap_or(u16::MAX);
+        f.render_widget(Paragraph::new(opt_lines).scroll((top, 0)), inner);
     }
     main_pane(f, a.details, app, theme);
     status_or_command(f, a.status, app, theme);
@@ -111,11 +114,6 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     if app.help {
         help_overlay(f, area, app, theme);
     }
-}
-
-/// A section box's title: its number, then `name`.
-fn section_title(section: Section, name: &str) -> String {
-    format!("{} {name}", section.number())
 }
 
 /// The current lens's visible options as Options-box fields.
@@ -139,7 +137,7 @@ fn option_fields(app: &App) -> Vec<widgets::options::Field<'_>> {
 }
 
 fn domain_box(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let title = section_title(Section::Domain, "Domain");
+    let title = Section::Domain.title("Domain");
     let inner = panel::render(
         f,
         area,
@@ -158,9 +156,11 @@ fn domain_box(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ),
         },
     };
+    // A domain wider than the box shows its tail (and the caret).
+    let room = usize::from(inner.width).saturating_sub(2);
     let line = Line::from(vec![
         Span::styled("⌕ ", Style::default().fg(theme.overlay)),
-        Span::styled(sanitize_line(&text), style),
+        Span::styled(widgets::fit_tail(&sanitize_line(&text), room), style),
     ]);
     f.render_widget(Paragraph::new(line), inner);
 }
@@ -185,7 +185,7 @@ fn function_line(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 /// The Details section's title: `4 <title>`, with the spinner while loading.
 fn details_title(app: &App, title: &str) -> String {
-    let t = section_title(Section::Details, title);
+    let t = Section::Details.title(title);
     match app.state_of(app.lens) {
         LensState::Loading => format!("{t}  {} resolving…", SPIN[app.spin]),
         _ => t,
@@ -257,13 +257,13 @@ fn main_pane(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 Style::default().fg(theme.overlay),
             ));
             let title = details_title(app, lens.label);
-            let inner = panel::render(f, area, theme, &title, theme.overlay, false);
+            let inner = panel::render(f, area, theme, &title, theme.overlay, focused);
             f.render_widget(Paragraph::new(line), inner);
             return;
         }
         LensState::Error(e) => {
             let title = details_title(app, lens.label);
-            let inner = panel::render(f, area, theme, &title, theme.red, false);
+            let inner = panel::render(f, area, theme, &title, theme.red, focused);
             // Errors quote remote servers: one sanitized line, wrapped to
             // the panel rather than clipped at its edge.
             f.render_widget(
@@ -418,12 +418,16 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
     let lens = app.current_lens();
-    let mut spans = vec![Span::styled(
-        "🔮 seer  ",
-        Style::default()
-            .fg(theme.mauve)
-            .add_modifier(Modifier::BOLD),
-    )];
+    // Narrow frames drop the brand so the hints (and `? help`) fit.
+    let mut spans = Vec::new();
+    if area.width >= layout::NARROW_W {
+        spans.push(Span::styled(
+            "🔮 seer  ",
+            Style::default()
+                .fg(theme.mauve)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.format != seer_core::output::OutputFormat::Human {
         spans.push(Span::styled(
             format!("--format {:?}  ", app.format).to_lowercase(),
@@ -481,6 +485,21 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .map(|(k, t)| (k.to_string(), t))
         .collect(),
     };
+    // Too many hints for the row: drop from the end, keeping the closing
+    // `? help` (when the section has one), so the most local keys stay.
+    let used: usize = spans.iter().map(Span::width).sum();
+    let hint_w =
+        |(k, t): &(String, &str)| Span::raw(k.as_str()).width() + 1 + Span::raw(*t).width() + 2;
+    let mut keys = keys;
+    while keys.len() > 1 && used + keys.iter().map(hint_w).sum::<usize>() > usize::from(area.width)
+    {
+        let drop = if keys.last().is_some_and(|(k, _)| k == "?") {
+            keys.len() - 2
+        } else {
+            keys.len() - 1
+        };
+        keys.remove(drop);
+    }
     for (k, t) in keys {
         spans.push(Span::styled(
             format!(" {k}"),
@@ -627,11 +646,73 @@ mod tests {
         let _ = app.take_startup_actions();
         app.lens = LensKey::Dns.index();
         let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
-        for title in ["1 Domain", "2 Function", "3 Options", "4 "] {
+        for title in ["1 Domain", "2 Function", "3 Options", "4 Records"] {
             assert!(s.contains(title), "missing {title}:\n{s}");
         }
         assert!(s.contains("example.com"));
         assert!(s.contains("Type ‹A›"), "{s}");
+    }
+
+    const LONG_DOMAIN: &str = "aaaaaaaaaabbbbbbbbbbcccccccccc.example.com";
+
+    #[test]
+    fn a_long_domain_shows_its_tail_and_the_caret_at_80x24() {
+        let mut app = App::new(Some(LONG_DOMAIN.into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Dns.index();
+        // Idle: the tail of the domain behind a `…`.
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        let row = s.lines().nth(1).unwrap_or_default();
+        assert!(row.contains("⌕ …") && row.contains("example.com│"), "{row}");
+        // Editing: the caret at the end stays visible.
+        app.set_section(Section::Domain);
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        let row = s.lines().nth(1).unwrap_or_default();
+        assert!(row.contains("…") && row.contains("example.com▏"), "{row}");
+    }
+
+    #[test]
+    fn a_long_bulk_domains_editor_keeps_its_caret_in_the_options_box() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Bulk.index();
+        app.set_section(Section::Options);
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Option(OptId::BulkDomains),
+            buf: "one.example.com two.example.com three.example.com four.example.com".into(),
+        };
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        assert!(s.contains("four.example.com▏›"), "{s}");
+    }
+
+    /// Details keeps its rows when the Options box is capped, and the box
+    /// scrolls to the cursor field.
+    #[test]
+    fn a_capped_options_box_scrolls_to_the_cursor_field() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Bulk.index();
+        app.set_section(Section::Options);
+        app.opt_cursor = app.visible_options().len() - 1;
+        // 40×11: one Options row fits, but Bulk's fields wrap onto two.
+        let s = render_lines(40, 11, |f| view(f, &app, app.theme()));
+        assert!(s.contains("Domains"), "the last field is in view:\n{s}");
+        assert!(!s.contains("Source"), "the row above scrolled away:\n{s}");
+        assert!(s.contains("4 Bulk"), "Details keeps its box:\n{s}");
+    }
+
+    #[test]
+    fn narrow_status_rows_drop_the_brand_to_fit_the_help_hint() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Dns.index();
+        for section in [Section::Function, Section::Options, Section::Details] {
+            app.set_section(section);
+            let s = render_lines(60, 24, |f| view(f, &app, app.theme()));
+            let status = s.lines().last().unwrap_or_default().trim_end();
+            assert!(status.ends_with("help"), "{section:?}: {status}");
+            assert!(!status.contains("seer"), "{section:?}: {status}");
+        }
     }
 
     #[test]
@@ -652,7 +733,7 @@ mod tests {
         for (w, h) in [(40, 12), (69, 20), (80, 24), (20, 5)] {
             let s = render_lines(w, h, |f| view(f, &app, app.theme()));
             assert!(
-                s.lines().last().unwrap().contains("seer"),
+                s.lines().last().unwrap().contains("help"),
                 "{w}×{h} status row:\n{s}"
             );
         }

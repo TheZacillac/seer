@@ -23,6 +23,11 @@ impl Section {
         Section::Details,
     ];
 
+    /// A box title: the section's number, then `name`.
+    pub fn title(self, name: &str) -> String {
+        format!("{} {name}", self.number())
+    }
+
     /// Its number in the box titles and the `1`–`4` keys.
     pub fn number(self) -> u8 {
         match self {

@@ -1,13 +1,16 @@
 //! Splits the frame into the four sections and the status row. Wide
 //! frames put 1 Domain over 2 Function in a fixed left column and 3 Options
 //! over 4 Details on the right; under `NARROW_W` columns everything stacks
-//! and Function is one row (focusing it opens the list as a popup).
+//! and Function is one row (focusing it opens the list as a popup). The
+//! Options box is capped so Details always keeps `MIN_DETAILS` rows.
 use ratatui::layout::{Constraint, Layout, Rect};
 
 /// The left column's width: the widest label plus glyph, cursor and border.
 pub const LEFT_W: u16 = 24;
 /// Below this many columns the sections stack.
 pub const NARROW_W: u16 = 70;
+/// Rows Details keeps however tall the Options box wants to be.
+pub const MIN_DETAILS: u16 = 3;
 
 /// Where each section and the status row sit.
 pub struct Areas {
@@ -21,15 +24,24 @@ pub struct Areas {
 }
 
 /// The sections of `area` for an Options box `options_rows` rows tall
-/// (0 collapses it).
+/// (0 collapses it). A taller box is capped to leave Details `MIN_DETAILS`
+/// rows, and one left with no room for a row collapses.
 pub fn split(area: Rect, options_rows: u16) -> Areas {
     let [body, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let narrow = area.width < NARROW_W;
+    // Rows the body keeps for Options and Details together.
+    let room = if narrow {
+        body.height.saturating_sub(3 + 1)
+    } else {
+        body.height
+    };
     let opt_h = if options_rows == 0 {
         0
     } else {
-        options_rows + 2
+        (options_rows + 2).min(room.saturating_sub(MIN_DETAILS))
     };
-    let narrow = area.width < NARROW_W;
+    // Borders alone leave no row for a field.
+    let opt_h = if opt_h < 3 { 0 } else { opt_h };
     let (domain, function, options, details) = if narrow {
         let [domain, function, options, details] = Layout::vertical([
             Constraint::Length(3),
@@ -88,5 +100,23 @@ mod tests {
         assert_eq!(a.function, Rect::new(0, 3, 60, 1));
         assert_eq!(a.options, Some(Rect::new(0, 4, 60, 4)));
         assert_eq!(a.details.y, 8);
+    }
+
+    #[test]
+    fn a_tall_options_box_leaves_details_three_rows() {
+        for (w, h) in [(100, 20), (60, 20), (100, 11), (60, 11)] {
+            let a = split(Rect::new(0, 0, w, h), 500);
+            assert!(a.details.height >= MIN_DETAILS, "{w}x{h}: {:?}", a.details);
+            let o = a.options.expect("room for at least one row");
+            assert!(o.height >= 3, "{w}x{h}: {o:?}");
+            assert_eq!(o.bottom(), a.details.y, "{w}x{h}: boxes touch");
+        }
+    }
+
+    #[test]
+    fn options_collapse_when_no_row_fits() {
+        // 5 rows: status 1, body 4 -> nothing left beside 3 rows of Details.
+        assert_eq!(split(Rect::new(0, 0, 100, 5), 2).options, None);
+        assert_eq!(split(Rect::new(0, 0, 60, 8), 2).options, None);
     }
 }

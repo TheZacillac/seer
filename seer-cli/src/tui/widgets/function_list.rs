@@ -45,7 +45,7 @@ pub fn rows(theme: &Theme, selected: usize) -> (Vec<Line<'static>>, usize) {
 
 /// Draw the bordered list over `area`.
 pub fn draw(f: &mut Frame, area: Rect, theme: &Theme, selected: usize, focused: bool) {
-    let title = format!("{} Function", Section::Function.number());
+    let title = Section::Function.title("Function");
     let inner = panel::render(f, area, theme, &title, theme.mauve, focused);
     let (lines, sel_row) = rows(theme, selected);
     let h = usize::from(inner.height.max(1));
@@ -69,6 +69,20 @@ mod tests {
             rows.len(),
             lenses().len() + 4,
             "22 functions + 4 group headers"
+        );
+    }
+
+    #[test]
+    fn groups_appear_in_nav_order() {
+        let t = Theme::frappe();
+        let (rows, _) = rows(&t, 0);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let at = |g: &str| text.iter().position(|r| r == g).expect(g);
+        assert!(
+            at("LOOKUP") < at("DNS") && at("DNS") < at("SECURITY") && at("SECURITY") < at("POWER")
         );
     }
 
