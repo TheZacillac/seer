@@ -30,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file) and the domains or file it takes, and RDAP's Domain / IP / ASN query
   (formerly sub-tabs). Changing an option re-runs the function; Audit,
   Subdomains, Takeover, Bulk and Follow still wait for `↵` in Function
-  (which also retries a failed lookup). `Tab` /
+  (which also retries a failed lookup, and never restarts a run in
+  progress — `x` in Details stops one). `Tab` /
   `Shift-Tab` move between sections and `1`–`4` jump to one; frames under 70
   columns stack the sections, with Function as a popup; the old
   single-key option shortcuts (`s`, `a`/`b`, `i`/`n`, `o`/`d`/`f`/`r` in

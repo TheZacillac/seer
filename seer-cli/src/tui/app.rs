@@ -159,11 +159,16 @@ impl App {
     fn animating(&self) -> bool {
         self.refetch_in.is_some()
             || matches!(self.state_of(self.lens), LensState::Loading)
-            || match self.current_lens().key {
-                LensKey::Follow => self.panes.follow.running,
-                LensKey::Bulk => self.panes.bulk.running,
-                _ => false,
-            }
+            || self.stream_running(self.current_lens().key)
+    }
+
+    /// Whether `key`'s streaming run (Follow or Bulk) is in progress.
+    fn stream_running(&self, key: LensKey) -> bool {
+        match key {
+            LensKey::Follow => self.panes.follow.running,
+            LensKey::Bulk => self.panes.bulk.running,
+            _ => false,
+        }
     }
 
     /// The active theme — `mod.rs` passes this to `render::view` each frame.
@@ -1478,10 +1483,15 @@ impl App {
                     }
                 }
                 // Follow and Bulk start from here; if they cannot (no
-                // domain, no inputs), Options is where to supply them.
+                // domain, no inputs), Options is where to supply them. A run
+                // in progress is refused where focus is.
                 if matches!(lens.key, LensKey::Follow | LensKey::Bulk) {
+                    let running = self.stream_running(lens.key);
                     return match self.start_run(lens.key) {
                         Some(PaneOutcome::Action(a)) => vec![a],
+                        refused if running => {
+                            refused.map_or_else(Vec::new, |o| self.apply_pane_outcome(o))
+                        }
                         refused => {
                             self.set_section(Section::Options);
                             refused.map_or_else(Vec::new, |o| self.apply_pane_outcome(o))
@@ -1613,9 +1623,7 @@ impl App {
                     });
                 };
                 let (count, secs) = self.options.follow_run()?;
-                Some(PaneOutcome::Action(
-                    self.panes.follow.start(&domain, count, secs),
-                ))
+                Some(self.panes.follow.start(&domain, count, secs))
             }
             LensKey::Bulk => {
                 let (op, input) = self.options.bulk_run()?;
@@ -1932,6 +1940,53 @@ mod tests {
             "the run is watched in Details"
         );
         assert!(app.panes.follow.running);
+    }
+
+    #[test]
+    fn enter_never_restarts_a_running_follow_or_bulk() {
+        // A stray ↵ must not wipe a long run's results, from any section.
+        for section in [Section::Function, Section::Options, Section::Details] {
+            let mut app = app_on_lens(Some("example.com"), "follow");
+            key(&mut app, KeyCode::Enter);
+            let gen = app.panes.follow.gen;
+            app.set_section(section);
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::StartFollow(_))),
+                "follow restarted from {section:?}: {actions:?}"
+            );
+            assert_eq!(app.panes.follow.gen, gen, "{section:?}");
+            assert!(app.panes.follow.running, "{section:?}");
+            assert_eq!(app.section, section, "a refusal keeps focus");
+            // In Options, ↵ on Follow's numeric fields opens their editor.
+            if section != Section::Options {
+                assert!(
+                    matches!(&app.toast, Some(t) if t.msg.contains("running")),
+                    "{section:?}: {:?}",
+                    app.toast
+                );
+            }
+
+            let mut app = app_on_lens(None, "bulk");
+            app.options
+                .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
+            key(&mut app, KeyCode::Enter);
+            assert!(app.panes.bulk.running);
+            let gen = app.panes.bulk.gen;
+            app.set_section(section);
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::StartBulk(_))),
+                "bulk restarted from {section:?}: {actions:?}"
+            );
+            assert_eq!(app.panes.bulk.gen, gen, "{section:?}");
+            assert_eq!(app.section, section, "a refusal keeps focus");
+            assert!(
+                matches!(&app.toast, Some(t) if t.msg.contains("running")),
+                "{section:?}: {:?}",
+                app.toast
+            );
+        }
     }
 
     #[test]

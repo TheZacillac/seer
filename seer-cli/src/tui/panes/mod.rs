@@ -19,6 +19,15 @@ use crossterm::event::KeyEvent;
 use crate::tui::action::{Action, EditTarget, FetchReq, LensKey};
 use crate::tui::options::Options;
 
+/// Why `↵` did not start a Follow or Bulk run: one is in progress, and
+/// restarting would clear its results.
+pub(crate) fn already_running() -> PaneOutcome {
+    PaneOutcome::Toast {
+        tone: "info",
+        msg: "already running — x in Details stops it".to_string(),
+    }
+}
+
 #[derive(Debug)]
 pub enum PaneOutcome {
     None,

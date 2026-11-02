@@ -5,7 +5,7 @@ use seer_core::bulk::BulkResult;
 use crate::ops::BULK_OPS;
 use crate::tui::action::{Action, BulkParams};
 use crate::tui::options::BulkInput;
-use crate::tui::panes::PaneOutcome;
+use crate::tui::panes::{already_running, PaneOutcome};
 
 /// Runtime state for the Bulk lens — rows and run status. What to run
 /// (op, domains, file) is in the options (`options::BULK`).
@@ -60,8 +60,11 @@ impl BulkState {
 
     /// Start a run of `op` over `input` (the options' Op and Source), or say
     /// what is missing. An empty file path or domain list never clears the
-    /// current results.
+    /// current results, and neither does `↵` during a run.
     pub fn start(&mut self, op: &'static str, input: BulkInput) -> PaneOutcome {
+        if self.running {
+            return already_running();
+        }
         match input {
             BulkInput::File(path) => {
                 if path.is_empty() {
@@ -289,6 +292,15 @@ mod tests {
         let out = s.start("lookup", BulkInput::Domains(String::new()));
         assert!(!s.running, "empty run must not start");
         assert!(matches!(out, PaneOutcome::Toast { .. }));
+    }
+
+    #[test]
+    fn start_is_refused_while_running() {
+        let mut s = BulkState::default();
+        s.start("lookup", BulkInput::Domains("a.com".into()));
+        let out = s.start("status", BulkInput::Domains("b.com".into()));
+        assert!(matches!(out, PaneOutcome::Toast { .. }), "{out:?}");
+        assert_eq!((s.gen, s.run_op), (1, Some("lookup")), "the run survives");
     }
 
     #[test]

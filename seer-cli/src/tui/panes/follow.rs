@@ -2,7 +2,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::tui::action::{Action, FollowParams};
-use crate::tui::panes::PaneOutcome;
+use crate::tui::panes::{already_running, PaneOutcome};
 
 /// Per-run state for the Follow (live DNS monitor) lens.
 #[derive(Default)]
@@ -47,18 +47,22 @@ impl FollowState {
             .unwrap_or(next)
     }
 
-    /// Begin a run with the options' `count` and `interval_secs`.
-    pub fn start(&mut self, domain: &str, count: usize, interval_secs: u64) -> Action {
+    /// Begin a run with the options' `count` and `interval_secs`; refused
+    /// while one is in progress.
+    pub fn start(&mut self, domain: &str, count: usize, interval_secs: u64) -> PaneOutcome {
+        if self.running {
+            return already_running();
+        }
         self.log.clear();
         self.running = true;
         self.gen += 1;
         self.last_run = Some((count, interval_secs));
-        Action::StartFollow(FollowParams {
+        PaneOutcome::Action(Action::StartFollow(FollowParams {
             domain: domain.to_string(),
             iterations: count,
             interval_secs,
             gen: self.gen,
-        })
+        }))
     }
 
     /// `↵` starts a run (with a domain), `x` stops one. Never swallows `Esc`.
@@ -70,9 +74,7 @@ impl FollowState {
     ) -> Option<PaneOutcome> {
         match key.code {
             KeyCode::Enter => match (domain, run) {
-                (Some(d), Some((count, secs))) => {
-                    Some(PaneOutcome::Action(self.start(d, count, secs)))
-                }
+                (Some(d), Some((count, secs))) => Some(self.start(d, count, secs)),
                 _ => Some(PaneOutcome::None),
             },
             // Also cancels the in-flight background DNS loop.
@@ -114,6 +116,25 @@ mod tests {
             if p.domain == "x.com" && p.iterations == 5 && p.interval_secs == 10 && p.gen == 1
         ));
         assert_eq!(s.last_run, Some((5, 10)));
+    }
+
+    #[test]
+    fn start_is_refused_while_running() {
+        let mut s = FollowState::default();
+        s.start("x.com", 5, 10);
+        s.push(seer_core::dns::FollowIteration {
+            iteration: 1,
+            total_iterations: 5,
+            timestamp: chrono::Utc::now(),
+            records: vec![],
+            changed: false,
+            added: vec![],
+            removed: vec![],
+            error: None,
+        });
+        let outcome = s.handle_key(key(KeyCode::Enter), Some("x.com"), Some((5, 10)));
+        assert!(matches!(outcome, Some(PaneOutcome::Toast { .. })));
+        assert_eq!((s.gen, s.log.len()), (1, 1), "the run and its log survive");
     }
 
     #[test]
