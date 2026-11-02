@@ -44,6 +44,15 @@ pub fn page(theme: &Theme, follow: &FollowState, next: Option<(usize, u64)>, spi
         }),
     )]);
 
+    // An idle Follow has nothing on screen to say how a run begins.
+    let mut head = vec![gauge_line, status_line];
+    if !follow.running && follow.log.is_empty() {
+        head.push(Line::from(Span::styled(
+            "  ↵ to start",
+            Style::default().fg(theme.overlay0),
+        )));
+    }
+
     let log = Page::new("Change Log", theme.teal);
     let log = if follow.log.is_empty() {
         log.push(Block::Lines(vec![Line::from(vec![Span::styled(
@@ -99,7 +108,7 @@ pub fn page(theme: &Theme, follow: &FollowState, next: Option<(usize, u64)>, spi
         ))
     };
     Page::new(title, theme.teal)
-        .push(Block::Lines(vec![gauge_line, status_line]))
+        .push(Block::Lines(head))
         .push(Block::Gap)
         .push(Block::Panel(log))
 }
@@ -245,6 +254,20 @@ mod tests {
         assert!(text.contains("20/20 done"), "got: {text}");
         assert!(!text.contains("20/5"), "got: {text}");
         assert!(text.contains("20 checks"), "title shows the run's count");
+    }
+
+    #[test]
+    fn an_idle_follow_says_how_to_start() {
+        let theme = Theme::frappe();
+        let idle = FollowState::default();
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &idle, 0));
+        assert!(text.contains("↵ to start"), "got: {text}");
+        let running = FollowState {
+            running: true,
+            ..Default::default()
+        };
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &running, 0));
+        assert!(!text.contains("↵ to start"), "got: {text}");
     }
 
     #[test]

@@ -3,14 +3,15 @@
 //! highlighted while the section is focused, an open editor shows its
 //! caret, and a refused value is red. Values are sanitized (Diff's and
 //! Bulk's are typed or pasted) and a value wider than the box shows its
-//! tail, so the caret stays visible.
+//! tail — or, in an open editor, the stretch around the caret, so it
+//! stays visible.
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use seer_core::output::sanitize_line;
 
 use crate::tui::line_editor::LineEditor;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::fit_tail;
+use crate::tui::widgets::{fit_caret, fit_tail};
 
 /// One option as the box shows it.
 pub struct Field<'a> {
@@ -45,12 +46,16 @@ pub fn rows(
     for f in fields {
         let label = format!("{} ", f.label);
         let label_w = Span::raw(label.as_str()).width();
-        let value = match f.editing {
-            Some(buf) => sanitize_line(&buf.with_caret("▏")),
-            None => sanitize_line(&f.value),
-        };
         // One field never outgrows the box: label, `‹` and `›` stay.
-        let value = fit_tail(&value, width.saturating_sub(label_w + 2).max(1));
+        let room = width.saturating_sub(label_w + 2).max(1);
+        let value = match f.editing {
+            // An open editor keeps its caret in view, wherever it is.
+            Some(buf) => {
+                let (before, after) = buf.split_at_cursor();
+                fit_caret(&sanitize_line(before), &sanitize_line(after), "▏", room)
+            }
+            None => fit_tail(&sanitize_line(&f.value), room),
+        };
         let value_style = if f.invalid {
             Style::default().fg(theme.red)
         } else if f.placeholder && f.editing.is_none() {

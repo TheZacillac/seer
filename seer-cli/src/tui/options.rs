@@ -320,13 +320,15 @@ impl Options {
     }
 
     // Setters write the right variant by construction, so a getter never
-    // meets a mismatched one. `:` commands use them; keys use `cycle` /
-    // `commit_text`.
+    // meets a mismatched one. `:rdap` and `:dig` use the record-type and
+    // choice setters; typed text goes through `commit_text`.
     pub fn set_record_type(&mut self, key: LensKey, t: RecordType) {
         self.values
             .insert((key, OptId::RecordType), OptValue::Record(t));
     }
 
+    /// Test fixtures only: `:` commands go through `commit_text`.
+    #[cfg(test)]
     pub fn set_server(&mut self, key: LensKey, id: OptId, server: Option<String>) {
         self.values.insert((key, id), OptValue::Server(server));
     }
@@ -335,6 +337,7 @@ impl Options {
         self.values.insert((key, id), OptValue::Choice(i));
     }
 
+    #[cfg(test)]
     pub fn set_text(&mut self, key: LensKey, id: OptId, text: String) {
         self.values.insert((key, id), OptValue::Text(text));
     }

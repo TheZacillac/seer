@@ -51,6 +51,63 @@ pub fn fit_tail(text: &str, width: usize) -> String {
     format!("…{}", &text[start..])
 }
 
+/// An editor's text (`before` and `after` the cursor) with `caret` between
+/// them, cut to at most `width` display columns with the caret always in
+/// view. It shows the tail behind a leading `…` — as [`fit_tail`] does —
+/// until the caret is left of that window; then the window starts at the
+/// caret instead and a `…` marks the cut on the right. Fits as-is when it
+/// already does. Both parts must be sanitized by the caller.
+pub fn fit_caret(before: &str, after: &str, caret: &str, width: usize) -> String {
+    let col = |s: &str| Span::raw(s).width();
+    // One unit per char, the caret among them.
+    let mut units: Vec<(String, usize)> = Vec::new();
+    for c in before.chars() {
+        let s = c.to_string();
+        units.push((s.clone(), col(&s)));
+    }
+    let caret_at = units.len();
+    units.push((caret.to_string(), col(caret)));
+    for c in after.chars() {
+        let s = c.to_string();
+        units.push((s.clone(), col(&s)));
+    }
+    let joined =
+        |range: &[(String, usize)]| range.iter().map(|(s, _)| s.as_str()).collect::<String>();
+    if units.iter().map(|(_, w)| w).sum::<usize>() <= width {
+        return joined(&units);
+    }
+    // Too narrow for a window with its cuts: the caret alone.
+    if width < 3 {
+        return if col(caret) <= width {
+            caret.to_string()
+        } else {
+            String::new()
+        };
+    }
+    // The tail window: as many trailing units as fit beside a leading `…`.
+    let mut kept = 0;
+    let mut tail = units.len();
+    while tail > 0 && kept + units[tail - 1].1 < width {
+        tail -= 1;
+        kept += units[tail].1;
+    }
+    if caret_at >= tail {
+        return format!("…{}", joined(&units[tail..]));
+    }
+    // The caret is left of the tail: start at it. A cut on the right is
+    // certain here (everything from the caret on is wider than the window).
+    let lead = usize::from(caret_at > 0);
+    let budget = width.saturating_sub(lead + 1);
+    let mut used = 0;
+    let mut end = caret_at;
+    while end < units.len() && used + units[end].1 <= budget {
+        used += units[end].1;
+        end += 1;
+    }
+    let head = if lead == 1 { "…" } else { "" };
+    format!("{head}{}…", joined(&units[caret_at..end]))
+}
+
 /// Style for one row of a selectable list: body text, on the `surface0`
 /// selection band when `selected`.
 ///
@@ -168,6 +225,54 @@ mod tests {
         assert_eq!(s, "…語");
         assert!(Span::raw(s.as_str()).width() <= 4);
         assert_eq!(fit_tail("日本語", 5), "…本語");
+    }
+
+    /// Width of the rendered window, and the caret still in it.
+    fn caret_view(before: &str, after: &str, width: usize) -> String {
+        let out = fit_caret(before, after, "▏", width);
+        assert!(
+            Span::raw(out.as_str()).width() <= width,
+            "{out:?} > {width}"
+        );
+        assert!(out.contains('▏'), "caret out of view: {out:?}");
+        out
+    }
+
+    #[test]
+    fn fit_caret_shows_the_tail_while_the_caret_is_at_the_end() {
+        assert_eq!(caret_view("example.com", "", 20), "example.com▏");
+        // Same window `fit_tail` gives.
+        assert_eq!(caret_view("abcdefghij", "", 6), "…ghij▏");
+    }
+
+    #[test]
+    fn fit_caret_slides_to_keep_a_caret_left_of_the_tail_in_view() {
+        // Home: the window starts at the caret, cut marked on the right.
+        assert_eq!(caret_view("", "abcdefghij", 6), "▏abcd…");
+        // In the middle: a cut on both sides.
+        assert_eq!(caret_view("abcdef", "ghijkl", 6), "…▏ghi…");
+        // Right of the tail's start it is the tail window again.
+        assert_eq!(caret_view("abcdefghij", "kl", 8), "…ghij▏kl");
+    }
+
+    #[test]
+    fn fit_caret_measures_display_width() {
+        // Wide chars are never split and the window never overflows.
+        assert_eq!(caret_view("日本語", "", 5), "…語▏");
+        let home = caret_view("", "日本語日本語", 6);
+        assert_eq!(home, "▏日本…");
+        let mid = caret_view("日本語", "日本語", 7);
+        assert!(mid.starts_with('…') && mid.ends_with('…'), "{mid:?}");
+    }
+
+    #[test]
+    fn fit_caret_fits_as_is_and_survives_tiny_widths() {
+        assert_eq!(fit_caret("ab", "cd", "▏", 5), "ab▏cd");
+        assert_eq!(fit_caret("ab", "cd", "▏", 0), "");
+        for w in 1..6 {
+            let out = fit_caret("abc", "def", "▏", w);
+            assert!(Span::raw(out.as_str()).width() <= w, "{out:?} at {w}");
+        }
     }
 
     #[test]

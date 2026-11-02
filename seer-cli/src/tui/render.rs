@@ -147,21 +147,27 @@ fn domain_box(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         theme.mauve,
         app.section == Section::Domain,
     );
+    // A domain wider than the box shows its tail — or, while editing, the
+    // stretch around the caret, so Home / ← never move it out of view.
+    let room = usize::from(inner.width).saturating_sub(2);
+    let text_style = Style::default().fg(theme.text);
     let (text, style) = match field_buf(&app.input_mode, EditTarget::Target) {
-        Some(buf) => (buf.with_caret("▏"), Style::default().fg(theme.text)),
+        Some(buf) => {
+            let (before, after) = buf.split_at_cursor();
+            let text = widgets::fit_caret(&sanitize_line(before), &sanitize_line(after), "▏", room);
+            (text, text_style)
+        }
         None => match app.domain.as_deref() {
-            Some(d) => (d.to_string(), Style::default().fg(theme.text)),
+            Some(d) => (widgets::fit_tail(&sanitize_line(d), room), text_style),
             None => (
-                "type a domain".to_string(),
+                widgets::fit_tail("type a domain", room),
                 Style::default().fg(theme.overlay0),
             ),
         },
     };
-    // A domain wider than the box shows its tail (and the caret).
-    let room = usize::from(inner.width).saturating_sub(2);
     let line = Line::from(vec![
         Span::styled("⌕ ", Style::default().fg(theme.overlay)),
-        Span::styled(widgets::fit_tail(&sanitize_line(&text), room), style),
+        Span::styled(text, style),
     ]);
     f.render_widget(Paragraph::new(line), inner);
 }
@@ -474,6 +480,7 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             keys
         }
         Section::Function => [
+            ("↵", "run"),
             ("j/k", "move"),
             ("tab", "section"),
             ("␣", "go to"),
@@ -636,6 +643,7 @@ mod tests {
     use super::*;
     use crate::tui::app::App;
     use crate::tui::test_util::{render_buffer, render_lines, render_text};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn full_buf(app: &App, theme: &Theme) -> String {
         render_text(100, 30, |f| view(f, app, theme))
@@ -670,6 +678,53 @@ mod tests {
         let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
         let row = s.lines().nth(1).unwrap_or_default();
         assert!(row.contains("…") && row.contains("example.com▏"), "{row}");
+    }
+
+    /// Home / ← move the caret left of the tail window: the field slides to
+    /// keep it in view instead of drawing the tail without it.
+    #[test]
+    fn the_domain_caret_stays_in_view_after_home() {
+        let mut app = App::new(Some(LONG_DOMAIN.into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Dns.index();
+        app.set_section(Section::Domain);
+        let row_of = |app: &App| {
+            render_lines(80, 24, |f| view(f, app, app.theme()))
+                .lines()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+        app.update(crate::tui::action::Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Home,
+            KeyModifiers::NONE,
+        ))));
+        let row = row_of(&app);
+        assert!(row.contains("⌕ ▏aaaa") && row.contains('…'), "{row}");
+        // One step right: the window follows the caret, a `…` for what it left.
+        app.update(crate::tui::action::Msg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        ))));
+        let row = row_of(&app);
+        assert!(row.contains("⌕ …▏aaaa"), "{row}");
+    }
+
+    #[test]
+    fn an_option_editor_keeps_its_caret_in_view_after_home() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.lens = LensKey::Bulk.index();
+        app.set_section(Section::Options);
+        let mut buf: LineEditor =
+            "one.example.com two.example.com three.example.com four.example.com".into();
+        buf.home();
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Option(OptId::BulkDomains),
+            buf,
+        };
+        let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
+        assert!(s.contains("‹▏one.example.com"), "{s}");
     }
 
     #[test]
@@ -787,6 +842,25 @@ mod tests {
         let status = s.lines().last().unwrap_or_default();
         assert!(status.contains("? help"), "{status}");
         assert!(!status.contains("[ ]"), "no sub-tab hint remains: {status}");
+    }
+
+    /// The Function section's hints lead with `↵ run`, and at 60 columns the
+    /// trimming may drop it but `? help` stays.
+    #[test]
+    fn function_hints_lead_with_enter_run() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Audit.index();
+        app.set_section(Section::Function);
+        let last = |w| {
+            render_lines(w, 24, |f| view(f, &app, app.theme()))
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(last(100).contains("↵ run"), "{}", last(100));
+        assert!(last(80).contains("↵ run"), "{}", last(80));
+        assert!(last(60).contains("? help"), "{}", last(60));
     }
 
     #[test]
