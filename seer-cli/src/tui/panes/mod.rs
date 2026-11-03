@@ -1,4 +1,5 @@
-//! Interactive lens components: per-lens state + key routing.
+//! Interactive lens components: per-lens runtime state + key routing.
+//! Settings live in `options`.
 pub mod bulk;
 pub mod compare;
 pub mod diff;
@@ -16,6 +17,16 @@ pub use tld::TldState;
 use crossterm::event::KeyEvent;
 
 use crate::tui::action::{Action, EditTarget, FetchReq, LensKey};
+use crate::tui::options::Options;
+
+/// Why `↵` did not start a Follow or Bulk run: one is in progress, and
+/// restarting would clear its results.
+pub(crate) fn already_running() -> PaneOutcome {
+    PaneOutcome::Toast {
+        tone: "info",
+        msg: "already running — x in Details stops it".to_string(),
+    }
+}
 
 #[derive(Debug)]
 pub enum PaneOutcome {
@@ -41,129 +52,21 @@ pub struct Panes {
 }
 
 impl Panes {
-    /// Route a key to the right pane component. Returns `Some(outcome)` if the
-    /// component consumed the key, `None` otherwise (App handles it normally).
+    /// Route a key to the lens's runtime component. `opts` supplies the run
+    /// parameters Follow and Bulk start with. `Some(outcome)` if consumed.
     /// CRITICAL: never swallow `Esc` — components must return `None` for it.
     pub fn handle_key(
         &mut self,
         lens_key: LensKey,
         key: KeyEvent,
         domain: Option<&str>,
+        opts: &Options,
     ) -> Option<PaneOutcome> {
         match lens_key {
             LensKey::Tld => self.tld.handle_key(key),
-            LensKey::Dns => self.dns.handle_key(key, domain),
-            LensKey::Compare => self.compare.handle_key(key, domain),
-            LensKey::Diff => self.diff.handle_key(key, domain),
-            LensKey::Follow => self.follow.handle_key(key, domain),
-            LensKey::Bulk => self.bulk.handle_key(key),
+            LensKey::Follow => self.follow.handle_key(key, domain, opts.follow_run()),
+            LensKey::Bulk => self.bulk.handle_key(key, opts.bulk_run()),
             _ => None,
         }
-    }
-
-    pub fn apply_field(
-        &mut self,
-        t: EditTarget,
-        v: String,
-        _domain: Option<String>,
-    ) -> Vec<Action> {
-        match t {
-            EditTarget::FollowInterval => {
-                if let Ok(val) = v.parse::<u64>() {
-                    // Clamp to the same range core enforces so a valid-looking
-                    // over-range value can't fail FollowConfig::new and silently
-                    // no-op the run.
-                    self.follow.interval_secs = val.clamp(1, seer_core::MAX_FOLLOW_INTERVAL_SECS);
-                }
-                vec![]
-            }
-            EditTarget::FollowCount => {
-                if let Ok(val) = v.parse::<usize>() {
-                    self.follow.count = val.clamp(1, seer_core::MAX_FOLLOW_ITERATIONS);
-                }
-                vec![]
-            }
-            EditTarget::BulkPath => self.bulk.start_file_run(v).into_iter().collect(),
-            EditTarget::BulkDomains => {
-                self.bulk.domains = v;
-                vec![]
-            }
-            _ => vec![],
-        }
-    }
-
-    /// Initial buffer when a field opens. The numeric Follow fields open EMPTY
-    /// (the current value is shown in the prompt label): prefilling "30" with
-    /// the caret at the end turned typing "60" into 3060.
-    pub fn field_value(&self, t: EditTarget) -> String {
-        match t {
-            EditTarget::DiffB => self.diff.b.clone(),
-            EditTarget::FollowInterval | EditTarget::FollowCount | EditTarget::BulkPath => {
-                String::new()
-            }
-            EditTarget::BulkDomains => self.bulk.domains.clone(),
-            EditTarget::TldFilter => self.tld.filter.clone(),
-            _ => String::new(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Follow interval/count edits must be clamped to the SAME upper bound
-    /// `seer_core::FollowConfig::new` enforces. Otherwise an in-range-looking
-    /// value (e.g. 3601s / 10001 iterations) passes the field-level check but is
-    /// later rejected by core, and the run silently no-ops with no feedback.
-    #[test]
-    fn follow_interval_is_clamped_to_core_max() {
-        let mut panes = Panes::default();
-        panes.apply_field(EditTarget::FollowInterval, "3601".to_string(), None);
-        assert_eq!(
-            panes.follow.interval_secs,
-            seer_core::MAX_FOLLOW_INTERVAL_SECS,
-            "over-range interval must be clamped to the core maximum"
-        );
-    }
-
-    #[test]
-    fn follow_count_is_clamped_to_core_max() {
-        let mut panes = Panes::default();
-        panes.apply_field(EditTarget::FollowCount, "10001".to_string(), None);
-        assert_eq!(
-            panes.follow.count,
-            seer_core::MAX_FOLLOW_ITERATIONS,
-            "over-range count must be clamped to the core maximum"
-        );
-    }
-
-    #[test]
-    fn follow_fields_open_empty_so_typing_replaces_the_value() {
-        let panes = Panes::default();
-        assert_eq!(panes.field_value(EditTarget::FollowInterval), "");
-        assert_eq!(panes.field_value(EditTarget::FollowCount), "");
-        // Submitting the empty buffer leaves the setting unchanged.
-        let mut panes = Panes::default();
-        panes.apply_field(EditTarget::FollowInterval, String::new(), None);
-        assert_eq!(panes.follow.interval_secs, 30);
-    }
-
-    #[test]
-    fn empty_bulk_path_is_ignored() {
-        let mut panes = Panes::default();
-        let actions = panes.apply_field(EditTarget::BulkPath, String::new(), None);
-        assert!(actions.is_empty(), "no StartBulkFromFile for an empty path");
-        assert!(!panes.bulk.running);
-        assert_eq!(panes.bulk.gen, 0, "run counter must not advance");
-    }
-
-    #[test]
-    fn follow_fields_keep_lower_bound_of_one() {
-        let mut panes = Panes::default();
-        panes.apply_field(EditTarget::FollowInterval, "0".to_string(), None);
-        panes.apply_field(EditTarget::FollowCount, "0".to_string(), None);
-        assert_eq!(panes.follow.interval_secs, 1);
-        assert_eq!(panes.follow.count, 1);
     }
 }

@@ -176,16 +176,16 @@ seer tui                  # start on the target prompt
 seer tui example.com      # look up a domain on launch
 ```
 
-The **lens** strip across the top covers every Seer capability, grouped, each pulling live data from the same `seer-core` engine as the CLI with full in-pane controls:
+The screen has four sections: **1 Domain** (the target, typed in place), **2 Function** (every capability, grouped), **3 Options** (the selected function's settings — hidden when it has none) and **4 Details** (the result). Each function pulls live data from the same `seer-core` engine as the CLI:
 
 - **LOOKUP** — Overview · WHOIS · RDAP (Domain · IP · ASN) · Reverse DNS · Availability · TLD Info
-- **DNS** — Records (+ custom nameserver) · DNSSEC · Compare (two resolvers) · Trace (from the root servers) · Propagation · Follow (live monitor)
+- **DNS** — Records (type + nameserver) · DNSSEC · Compare (two resolvers) · Trace (from the root servers) · Propagation · Follow (live monitor)
 - **SECURITY** — SSL / Cert · Status · Subdomains · HTTP Headers · Takeover · Audit
 - **POWER** — Diff · Bulk (streaming + CSV export) · Watchlist · History
 
-**Keys:** `j`/`k` move · `1`–`9` pick a lens in the current group · `{` `}` previous / next group · `Space` go to any lens by name · `Tab` focus nav⇄pane · `[` `]` RDAP sub-tabs · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` look up a domain · `:` command · `?` help · `:q` quit. In-pane: switchers (TLD, nameserver, Compare resolvers, Bulk op) and editable fields (Diff's 2nd domain, Follow interval/count, Bulk file path). In a focused pane the status bar lists that lens's own keys, and `?` shows them too. Audit, DNS records, HTTP Headers, Takeover and History show the selected row's full detail beneath the table while focused.
+**Keys:** `Tab` / `Shift-Tab` next / previous section · `1`–`4` jump to a section · `j`/`k` move · `{` `}` previous / next group · `Space` go to any function by name · in Options `h`/`l` (or `←` `→`) change a value and `↵` edits a typed value · `r` raw output (json/yaml/markdown; `PgUp`/`PgDn` scroll) · `y` copy · `/` edit the domain · `:` command · `?` help · `:q` quit. Changing an option re-runs the function. In Details the status bar lists that function's own keys, and `?` shows them too. Audit, DNS records, HTTP Headers, Takeover and History show the selected row's full detail beneath the table there.
 
-Subdomains, Takeover and Audit query CT logs and probe hosts, so they run only when you press `↵` on them (or use their `:` command), never just by moving onto them. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
+Subdomains, Takeover, Audit, Bulk and Follow query CT logs, probe hosts or live streams, so they run only when you press `↵` on them in Function (a failed lookup retries the same way), or use their `:` command where one exists, never just by moving onto them. Follow and Bulk take their inputs from Options (3), then start with `↵` in Function or Details. Removing a watched domain (`d`) and clearing history (`c`) ask for a second press.
 
 **Commands (`:`):** `lookup`, `whois`, `rdap <domain|ip|AS####>`, `dig [@server] <name> [type] [+trace]`, `ssl`, `status`, `headers`, `takeover`, `audit`, `reverse <ip>`, `tld <.tld>`, `compare <domain> <nsA> <nsB>`, `diff <a> <b>`, `set output <human|json|yaml|markdown>`, `theme <frappe|latte>`, `copy`, `q`.
 

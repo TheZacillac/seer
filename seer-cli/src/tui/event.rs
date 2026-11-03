@@ -21,12 +21,11 @@ pub enum KeyAction {
     Down,
     Top,
     Bottom,
-    JumpLens(usize),
     PrevGroup,
     NextGroup,
-    ToggleFocus,
-    NextTab,
-    PrevTab,
+    NextSection,
+    PrevSection,
+    JumpSection(usize),
     EnterPane,
     Back,
     ToggleRaw,
@@ -44,10 +43,9 @@ pub fn map(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Up,
         KeyCode::Char('g') => KeyAction::Top,
         KeyCode::Char('G') => KeyAction::Bottom,
-        KeyCode::Char(c @ '1'..='9') => KeyAction::JumpLens((c as usize) - ('1' as usize)),
-        KeyCode::Tab => KeyAction::ToggleFocus,
-        KeyCode::Char(']') => KeyAction::NextTab,
-        KeyCode::Char('[') => KeyAction::PrevTab,
+        KeyCode::Char(c @ '1'..='4') => KeyAction::JumpSection((c as usize) - ('1' as usize)),
+        KeyCode::Tab => KeyAction::NextSection,
+        KeyCode::BackTab => KeyAction::PrevSection,
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => KeyAction::EnterPane,
         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => KeyAction::Back,
         KeyCode::Char('r') => KeyAction::ToggleRaw,
@@ -82,15 +80,15 @@ mod tests {
 
     #[test]
     fn number_jump() {
-        assert_eq!(map(k(KeyCode::Char('3'))), Some(KeyAction::JumpLens(2)));
-        assert_eq!(map(k(KeyCode::Char('1'))), Some(KeyAction::JumpLens(0)));
+        assert_eq!(map(k(KeyCode::Char('3'))), Some(KeyAction::JumpSection(2)));
+        assert_eq!(map(k(KeyCode::Char('1'))), Some(KeyAction::JumpSection(0)));
+        assert_eq!(map(k(KeyCode::Char('5'))), None);
     }
 
     #[test]
     fn mode_and_focus_keys() {
-        assert_eq!(map(k(KeyCode::Tab)), Some(KeyAction::ToggleFocus));
-        assert_eq!(map(k(KeyCode::Char('['))), Some(KeyAction::PrevTab));
-        assert_eq!(map(k(KeyCode::Char(']'))), Some(KeyAction::NextTab));
+        assert_eq!(map(k(KeyCode::Tab)), Some(KeyAction::NextSection));
+        assert_eq!(map(k(KeyCode::BackTab)), Some(KeyAction::PrevSection));
         assert_eq!(map(k(KeyCode::Char('/'))), Some(KeyAction::EditDomain));
         assert_eq!(map(k(KeyCode::Char(':'))), Some(KeyAction::Command));
         assert_eq!(map(k(KeyCode::Char('?'))), Some(KeyAction::Help));

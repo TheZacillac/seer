@@ -1,4 +1,4 @@
-//! RDAP lens — Domain, IP, and ASN tabs.
+//! RDAP lens — Domain, IP and ASN results, by the Options Query.
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -7,21 +7,21 @@ use crate::tui::theme::Theme;
 use crate::tui::widgets::or_dash;
 use crate::tui::widgets::page::{Block, Page};
 
-/// The tab's object kind: its title and accent.
-fn kind(theme: &Theme, tab: usize) -> (&'static str, ratatui::style::Color) {
-    match tab {
+/// The query's object kind: its title and accent.
+fn kind(theme: &Theme, query: usize) -> (&'static str, ratatui::style::Color) {
+    match query {
         2 => ("RDAP Object · ASN", theme.lavender),
         1 => ("RDAP Object · IP", theme.blue),
         _ => ("RDAP Object · domain", theme.mauve),
     }
 }
 
-pub fn page(theme: &Theme, tab: usize, data: &LensData) -> Page {
-    let (title, accent) = kind(theme, tab);
+pub fn page(theme: &Theme, query: usize, data: &LensData) -> Page {
+    let (title, accent) = kind(theme, query);
     let page = Page::new(title, accent);
-    // No data: show a tab-appropriate hint so the pane isn't just blank.
+    // No data: show a query-appropriate hint so the pane isn't just blank.
     let LensData::Rdap(r) = data else {
-        let hint = match tab {
+        let hint = match query {
             2 => "use :rdap AS<number>  (e.g. :rdap AS15169)",
             1 => "use :rdap <ip>  (e.g. :rdap 8.8.8.8)",
             _ => "enter a domain to look up",
@@ -31,7 +31,7 @@ pub fn page(theme: &Theme, tab: usize, data: &LensData) -> Page {
             Style::default().fg(theme.subtext),
         ))]));
     };
-    let rows = match tab {
+    let rows = match query {
         0 => {
             let delegation = r.secure_dns.as_ref().and_then(|s| s.delegation_signed);
             vec![
@@ -79,10 +79,10 @@ mod tests {
         f: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
         theme: &Theme,
-        tab: usize,
+        query: usize,
         data: &LensData,
     ) {
-        page::draw(f, area, theme, page(theme, tab, data), false);
+        page::draw(f, area, theme, page(theme, query, data), false);
     }
     use crate::tui::test_util::render_text;
 
@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_asn_tab_with_name() {
+    fn renders_asn_query_with_name() {
         let theme = Theme::frappe();
         let data = LensData::Rdap(Box::new(rdap_fixture("AS15169", "GOOGLE")));
         let text = render_text(70, 10, |f| render(f, f.area(), &theme, 2, &data));
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_ip_tab() {
+    fn renders_ip_query() {
         let theme = Theme::frappe();
         let r: seer_core::RdapResponse = serde_json::from_value(serde_json::json!({
             "handle": "NET-8-8-8-0-1",

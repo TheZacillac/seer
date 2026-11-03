@@ -56,7 +56,9 @@ in `seer-core`. The other three parse input, call core and present results.
   help and usage errors.
 - `tui/` — `app.rs` is pure state + `update()` (no I/O, no ratatui);
   `mod.rs` owns the event loop and I/O; `lenses/` holds the `LENSES`
-  registry + renderers; `panes/` the interactive lens components.
+  registry + renderers; `options.rs` the per-lens option specs and values
+  (`App::default_req` turns them into requests); `layout.rs` the four
+  sections; `panes/` the lenses' runtime state.
 
 ### seer-py and seer-api
 
@@ -224,6 +226,7 @@ step). The tables:
 | REPL commands | `repl/catalog.rs` |
 | dig / compare / follow grammar | `dig_args.rs`, `dns_args.rs` |
 | TUI lenses | `LENSES` |
+| TUI lens options | `options.rs` consts on each `LENSES` row |
 | MCP tools | `_TOOLS` in `seer-api/seer_api/mcp/server.py` |
 | Bulk / API limits | `seer-api/seer_api/_contract.py` |
 
@@ -277,8 +280,11 @@ step). The tables:
   `exit_code` + its table test.
 - **`--format` goes before the subcommand**; `--fields` implies `-q`;
   `+short` is a usage error with `-q`/`--fields`.
-- **TUI:** every lens change goes through `App::goto_lens`; async results
-  are dropped by a per-lens generation guard; `~/.seer` store edits hold
+- **TUI:** every lens change goes through `App::goto_lens`; focus is a
+  `Section` (Domain is a live field: an unchanged value only moves focus, an
+  invalid one keeps its editor open); option changes re-run through
+  `fetch_current`, cycled ones after a 300 ms debounce; async results are
+  dropped by a per-lens generation guard; `~/.seer` store edits hold
   `ops::STORE_LOCK`.
 - **seer-api is secure by default:** binds loopback, hard-fails on a
   non-loopback `SEER_HOST` without `SEER_API_KEY` or on multiple workers with

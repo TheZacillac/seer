@@ -1,5 +1,10 @@
 //! Pure application state for the TUI. No ratatui imports — `render.rs` reads
-//! this. `update(Msg) -> Vec<Action>` is the single state transition.
+//! this. `update(Msg) -> Vec<Action>` is the single state transition. Focus is
+//! one of four `Section`s; option values live in `options`, and `default_req`
+//! is the only place they become a request. `↵` in Function runs what waits
+//! for it (heavy lenses, Follow, Bulk) and retries a failed lookup; a cycled
+//! option supersedes the lens's stale result at once and fetches after the
+//! `REFETCH_TICKS` debounce.
 
 use std::collections::HashMap;
 
@@ -8,11 +13,12 @@ use seer_core::output::OutputFormat;
 use seer_core::RecordType;
 
 use crate::tui::action::{
-    Action, EditTarget, FetchReq, Focus, InputMode, LensData, LensKey, LensState, Msg,
+    Action, EditTarget, FetchReq, InputMode, LensData, LensKey, LensState, Msg, Section,
 };
 use crate::tui::command::{self, CmdOutcome};
 use crate::tui::event::{self, KeyAction};
 use crate::tui::lenses;
+use crate::tui::options::{OptId, OptSpec, Options};
 use crate::tui::panes::{PaneOutcome, Panes};
 use crate::tui::theme::Theme;
 
@@ -20,6 +26,9 @@ use crate::tui::theme::Theme;
 const TOAST_TICKS: u32 = 22;
 /// Rows a PgUp/PgDn moves the raw view.
 const PAGE_ROWS: u16 = 10;
+/// Ticks a cycled option waits before re-running (300 ms), so holding ← →
+/// fetches only the settled value.
+const REFETCH_TICKS: u32 = 3;
 /// Spinner frames (braille), matching the mockup.
 pub const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -41,8 +50,12 @@ enum Confirm {
 
 pub struct App {
     pub lens: usize,
-    pub focus: Focus,
-    pub tab: usize,
+    pub section: Section,
+    /// The Options section's selected field, an index into `visible_options`.
+    pub opt_cursor: usize,
+    /// The option whose last typed value was refused, drawn marked until a
+    /// value commits or the lens changes.
+    pub opt_error: Option<OptId>,
     pub sel: usize,
     pub format: OutputFormat,
     pub domain: Option<String>,
@@ -52,6 +65,8 @@ pub struct App {
     pub spin: usize,
     pub toast: Option<Toast>,
     pub panes: Panes,
+    /// Every lens's option values; `default_req` turns them into requests.
+    pub options: Options,
     /// First line of the raw (non-human) view shown at the top of its panel.
     pub raw_scroll: u16,
     /// Active color theme (Frappé by default). Private so swaps go through
@@ -68,7 +83,7 @@ pub struct App {
     lens_filter: HashMap<LensKey, String>,
     /// The request each lens's cached state was last fetched for. The state
     /// cache is keyed by lens only, so this is what tells `fetch_current` that
-    /// a cached result belongs to another sub-tab or an ad-hoc target
+    /// a cached result belongs to another option value or an ad-hoc target
     /// (`:rdap AS15169`, `:compare other.com …`) and must not be re-served.
     last_req: HashMap<LensKey, FetchReq>,
     /// A destructive action armed by its first key press, with the ticks
@@ -77,6 +92,8 @@ pub struct App {
     confirm: Option<(Confirm, u32)>,
     /// Whether the frame changed since it was last drawn (see `take_redraw`).
     redraw: bool,
+    /// Ticks left before a cycled option re-runs the lens (debounce).
+    refetch_in: Option<u32>,
 }
 
 impl App {
@@ -85,8 +102,9 @@ impl App {
     pub fn new(domain: Option<String>) -> Self {
         let mut app = Self {
             lens: 0,
-            focus: Focus::Nav,
-            tab: 0,
+            section: Section::Function,
+            opt_cursor: 0,
+            opt_error: None,
             sel: 0,
             format: OutputFormat::Human,
             domain: None,
@@ -96,6 +114,7 @@ impl App {
             spin: 0,
             toast: None,
             panes: Panes::default(),
+            options: Options::default(),
             raw_scroll: 0,
             theme: Theme::frappe(),
             states: HashMap::new(),
@@ -106,6 +125,7 @@ impl App {
             last_req: HashMap::new(),
             confirm: None,
             redraw: true,
+            refetch_in: None,
         };
         if let Some(d) = domain {
             let actions = match app.target_or_toast(&d) {
@@ -113,6 +133,9 @@ impl App {
                 None => vec![],
             };
             app.startup.extend(actions);
+        }
+        if app.domain.is_none() {
+            app.set_section(Section::Domain);
         }
         app
     }
@@ -131,14 +154,21 @@ impl App {
         std::mem::take(&mut self.redraw)
     }
 
-    /// Whether the current frame animates with the tick (a spinner).
+    /// Whether the current frame animates with the tick (a spinner, or a
+    /// debounced re-run about to start one).
     fn animating(&self) -> bool {
-        matches!(self.state_of(self.lens), LensState::Loading)
-            || match self.current_lens().key {
-                LensKey::Follow => self.panes.follow.running,
-                LensKey::Bulk => self.panes.bulk.running,
-                _ => false,
-            }
+        self.refetch_in.is_some()
+            || matches!(self.state_of(self.lens), LensState::Loading)
+            || self.stream_running(self.current_lens().key)
+    }
+
+    /// Whether `key`'s streaming run (Follow or Bulk) is in progress.
+    fn stream_running(&self, key: LensKey) -> bool {
+        match key {
+            LensKey::Follow => self.panes.follow.running,
+            LensKey::Bulk => self.panes.bulk.running,
+            _ => false,
+        }
     }
 
     /// The active theme — `mod.rs` passes this to `render::view` each frame.
@@ -178,16 +208,143 @@ impl App {
         });
     }
 
-    /// Show lens `i`, on its first tab, with its first row selected and the
-    /// nav focused. Every lens change goes through here, so no path can
-    /// carry the previous lens's tab or selection over (a stale tab made the
-    /// cache check refetch — and an Overview refetch records history again).
+    /// Show lens `i` with its first row selected and the Function section
+    /// focused. Every lens change goes through here, so no path can carry
+    /// the previous lens's selection, option cursor or pending debounce over.
     fn goto_lens(&mut self, i: usize) {
+        self.drop_debounce_placeholder();
         self.lens = i;
-        self.tab = 0;
         self.sel = 0;
         self.raw_scroll = 0;
-        self.focus = Focus::Nav;
+        self.section = Section::Function;
+        self.opt_cursor = 0;
+        self.opt_error = None;
+        self.refetch_in = None;
+    }
+
+    /// The current lens's option fields that show now.
+    pub fn visible_options(&self) -> Vec<&'static OptSpec> {
+        self.options.visible(self.current_lens().key)
+    }
+
+    /// Focus `section`. Domain is a live text field, so focusing it opens
+    /// the target editor on the current domain.
+    pub fn set_section(&mut self, section: Section) {
+        // Leaving Domain any way but a commit closes its editor unapplied.
+        if section != Section::Domain
+            && matches!(
+                self.input_mode,
+                InputMode::Field {
+                    target: EditTarget::Target,
+                    ..
+                }
+            )
+        {
+            self.input_mode = InputMode::Normal;
+        }
+        if section == Section::Domain {
+            self.input_mode = InputMode::Field {
+                target: EditTarget::Target,
+                buf: self.domain.clone().unwrap_or_default().into(),
+            };
+        }
+        if section == Section::Options {
+            let last = self.visible_options().len().saturating_sub(1);
+            self.opt_cursor = self.opt_cursor.min(last);
+        }
+        self.section = section;
+    }
+
+    /// The section one step away in Tab order, skipping Options when the
+    /// lens has none.
+    fn next_section(&self, forward: bool) -> Section {
+        let all = Section::ALL;
+        let mut i = all.iter().position(|s| *s == self.section).unwrap_or(1);
+        loop {
+            i = if forward {
+                (i + 1) % all.len()
+            } else {
+                (i + all.len() - 1) % all.len()
+            };
+            if all[i] != Section::Options || !self.visible_options().is_empty() {
+                return all[i];
+            }
+        }
+    }
+
+    /// An option changed: re-run the lens now (`debounce` false: a typed
+    /// commit) or after `REFETCH_TICKS` (`debounce` true: a cycled value,
+    /// so holding ← → fetches only the settled one). Heavy and streaming
+    /// lenses only drop their stale result; they run on `↵`.
+    fn option_changed(&mut self, debounce: bool) -> Vec<Action> {
+        self.opt_error = None;
+        if debounce {
+            self.supersede_stale_result();
+            self.refetch_in = Some(REFETCH_TICKS);
+            return vec![];
+        }
+        self.refetch_in = None;
+        self.clear_debounce_placeholder(self.current_lens().key);
+        self.fetch_with_current(false)
+    }
+
+    /// A cycled option no longer matches the request the current lens's
+    /// result (or in-flight fetch) belongs to: supersede it now, so that
+    /// result cannot land under the new label while the debounce waits.
+    /// The lens shows Loading until the settled value's fetch goes out
+    /// (`expire_debounce`); a lens with no request for the new value just
+    /// drops the old result. Heavy lenses keep their staging.
+    fn supersede_stale_result(&mut self) {
+        let lens = self.current_lens();
+        let key = lens.key;
+        let (Some(domain), false) = (self.domain.clone(), lens.heavy) else {
+            return;
+        };
+        let Some(prev) = self.last_req.get(&key) else {
+            return;
+        };
+        let want = self.default_req(key, &domain);
+        let stale = match &want {
+            Some(w) => w != prev,
+            None => !self.cache_fits_options(prev),
+        };
+        if !stale {
+            return;
+        }
+        self.bump_fetch_gen(key);
+        self.last_req.remove(&key);
+        if want.is_some() {
+            // The placeholder `expire_debounce` replaces with the fetch.
+            self.states.insert(key, LensState::Loading);
+        } else {
+            self.states.remove(&key);
+        }
+    }
+
+    /// Drop `key`'s Loading state when it is the debounce placeholder:
+    /// nothing is in flight for it (its request was superseded and has not
+    /// been re-issued), so it would never be replaced.
+    fn clear_debounce_placeholder(&mut self, key: LensKey) {
+        if matches!(self.states.get(&key), Some(LensState::Loading))
+            && !self.last_req.contains_key(&key)
+        {
+            self.states.remove(&key);
+        }
+    }
+
+    /// The debounce ran out: fetch the settled value.
+    fn expire_debounce(&mut self) -> Vec<Action> {
+        self.refetch_in = None;
+        self.clear_debounce_placeholder(self.current_lens().key);
+        self.fetch_with_current(false)
+    }
+
+    /// Leaving the lens mid-debounce: its placeholder would never be
+    /// replaced, so drop it (a revisit fetches afresh).
+    fn drop_debounce_placeholder(&mut self) {
+        if self.refetch_in.take().is_some() {
+            self.clear_debounce_placeholder(self.current_lens().key);
+        }
     }
 
     /// Increment and return the generation counter for a lens, superseding
@@ -322,11 +479,18 @@ impl App {
     /// that exact name, as the CLI does, while WHOIS, RDAP, availability and
     /// the other registration lookups drop `www.` in core themselves.
     fn set_domain_and_fetch(&mut self, target: String) -> Vec<Action> {
+        self.set_domain_and_fetch_with(target, true)
+    }
+
+    /// `set_domain_and_fetch`, where `explicit` false lets a heavy lens
+    /// wait for ↵ (a domain edit re-runs the function it sits on).
+    fn set_domain_and_fetch_with(&mut self, target: String, explicit: bool) -> Vec<Action> {
         let mut actions = Vec::new();
         // A new target invalidates every cached lens.
         if self.domain.as_deref() != Some(target.as_str()) {
             self.states.clear();
             self.last_req.clear();
+            self.refetch_in = None;
             // `:diff a b` / `:compare d …` overrides follow the session target
             // only until it changes; the new target becomes domain A again.
             self.panes.diff.a.clear();
@@ -343,7 +507,7 @@ impl App {
             // A new target invalidates any per-lens filters too.
             self.lens_filter.clear();
             // The resolved IP is derived from the OLD domain's DNS/Status
-            // results; clearing it prevents the RDAP "IP" tab from looking up
+            // results; clearing it prevents the RDAP IP query from looking up
             // the previous domain's address under the new domain.
             self.panes.dns.resolved_ip = None;
             // The Follow lens tracks this domain; cancel any in-flight run —
@@ -359,7 +523,7 @@ impl App {
         }
         self.domain = Some(target);
         self.sel = 0;
-        actions.extend(self.fetch_current(true));
+        actions.extend(self.fetch_current(explicit));
         actions
     }
 
@@ -384,23 +548,26 @@ impl App {
                 _ => None,
             },
         };
-        // Cached (or in flight) for the current domain → revisiting is instant,
-        // unless the cache was produced for another sub-tab or target: lens
-        // switches reset the tab to 0, so e.g. a cached DNSSEC (tab 1) or
-        // `:rdap AS…` (tab 2) result would otherwise render under tab 0.
+        // Cached (or in flight) for the current domain → revisiting is
+        // instant, unless the cache answers another request than the one
+        // the options now make (Type, Server… changed; `:rdap other.org`
+        // or `:compare other.com …` while a session domain is set). With
+        // no default request (`want` is None) an ad-hoc result stays,
+        // unless it contradicts an option (the RDAP Query).
         if matches!(
             self.states.get(&key),
             Some(LensState::Loaded(_) | LensState::Loading)
         ) {
-            let stale = self.last_req.get(&key).is_some_and(|prev| {
-                prev.tab() != self.tab || want.as_ref().is_some_and(|w| w != prev)
+            let stale = self.last_req.get(&key).is_some_and(|prev| match &want {
+                Some(w) => w != prev,
+                None => !self.cache_fits_options(prev),
             });
             if !stale {
                 return None;
             }
             // Drop the mismatched state, and invalidate any in-flight fetch
-            // for it even when no replacement request follows (e.g. RDAP
-            // domain tab with no session domain).
+            // for it even when no replacement request follows (e.g. the RDAP
+            // domain query with no session domain).
             self.states.remove(&key);
             self.last_req.remove(&key);
             self.bump_fetch_gen(key);
@@ -411,36 +578,50 @@ impl App {
         want.map(|req| self.fetch_action(req))
     }
 
-    /// Default fetch request for a lens at `domain` (used by nav/number-jump).
-    /// Interactive lenses with no single-domain default return None.
+    /// Whether a cached request still matches the options that pick what a
+    /// lens shows: only the RDAP Query (Domain / IP / ASN) does today.
+    fn cache_fits_options(&self, prev: &FetchReq) -> bool {
+        let kind = match prev {
+            FetchReq::RdapDomain(_) => 0,
+            FetchReq::RdapIp(_) => 1,
+            FetchReq::RdapAsn(_) => 2,
+            _ => return true,
+        };
+        self.options.choice(LensKey::Rdap, OptId::RdapQuery) == Some(kind)
+    }
+
+    /// The request lens `key` makes at `domain` with its current options —
+    /// the one place option values become a fetch. `None` when the lens has
+    /// nothing to fetch by itself (RDAP IP without a resolved address, ASN,
+    /// Diff without a second domain, the streaming Follow and Bulk).
     fn default_req(&self, key: LensKey, domain: &str) -> Option<FetchReq> {
         let d = domain.to_string();
+        let o = &self.options;
         Some(match key {
             LensKey::Overview => FetchReq::Overview(d),
             LensKey::Whois => FetchReq::Whois(d),
-            LensKey::Rdap => match self.tab {
+            LensKey::Rdap => match o.choice(key, OptId::RdapQuery)? {
                 0 => FetchReq::RdapDomain(d),
-                // IP tab: only auto-fetch when a real IP has been resolved (from
-                // a prior DNS/Status lookup). Without one, fall back to the idle
-                // hint rather than firing RdapIp against a domain string.
+                // Only an address a DNS/Status result resolved, never the
+                // domain string itself.
                 1 => FetchReq::RdapIp(self.panes.dns.resolved_ip.clone()?),
-                _ => return None, // ASN needs explicit :rdap AS…
+                _ => return None, // ASN needs `:rdap AS…`
             },
             LensKey::Dns => FetchReq::Dns {
                 domain: d,
-                record_type: self.panes.dns.record_type,
-                nameserver: self.panes.dns.nameserver(),
+                record_type: o.record_type(key)?,
+                nameserver: o.server(key, OptId::Server)?,
             },
             LensKey::Dnssec => FetchReq::Dnssec(d),
             LensKey::Compare => FetchReq::Compare {
-                domain: self.panes.compare.domain.clone().unwrap_or(d),
+                domain: self.panes.compare.effective_domain(Some(domain))?,
                 record_type: RecordType::A,
-                a: self.panes.compare.a.clone(),
-                b: self.panes.compare.b.clone(),
+                a: o.server(key, OptId::ServerA)??,
+                b: o.server(key, OptId::ServerB)??,
             },
             LensKey::Trace => FetchReq::Trace {
                 domain: d,
-                record_type: self.panes.dns.record_type,
+                record_type: o.record_type(key)?,
             },
             LensKey::Ssl => FetchReq::Ssl(d),
             LensKey::Status => FetchReq::Status(d),
@@ -448,7 +629,16 @@ impl App {
             LensKey::Reverse => FetchReq::Reverse(d),
             LensKey::Avail => FetchReq::Avail(d),
             LensKey::Tld => FetchReq::Tld(self.panes.tld.current()),
-            LensKey::Diff => return None, // needs a second domain (DiffB field)
+            LensKey::Diff => {
+                let b = o.text(key, OptId::SecondDomain)?;
+                if b.is_empty() {
+                    return None;
+                }
+                FetchReq::Diff {
+                    a: self.panes.diff.effective_a(Some(domain))?,
+                    b,
+                }
+            }
             LensKey::Watch => FetchReq::Watch,
             LensKey::History => FetchReq::History,
             LensKey::Subdomains => FetchReq::Subdomains(d),
@@ -459,30 +649,8 @@ impl App {
         })
     }
 
-    /// After a sub-tab change, a tab-bearing lens needs the new tab's data
-    /// (the per-lens cache is keyed by lens, not tab), so drop the cached state
-    /// and re-fetch for the now-active tab.
-    fn refetch_for_tab(&mut self) -> Vec<Action> {
-        let lens = self.current_lens();
-        if lens.tabs.is_empty() {
-            return vec![];
-        }
-        let key = lens.key;
-        self.states.remove(&key);
-        self.raw_scroll = 0;
-        // A `/`-filter narrowed the previous tab's rows; the new tab lists
-        // other data, or none.
-        self.lens_filter.remove(&key);
-        // Invalidate any in-flight fetch for the previous tab even when the
-        // new tab has no default request (RDAP IP tab without a resolved IP,
-        // ASN tab): no fetch_action follows to bump the gen there, and the
-        // old tab's late result would otherwise render as this tab's data.
-        self.bump_fetch_gen(key);
-        self.fetch_with_current(false)
-    }
-
     /// Populate `panes.dns.resolved_ip` from DNS or Status results so the RDAP
-    /// IP tab can auto-fetch without an explicit `:rdap <ip>` command. A dig
+    /// IP query can auto-fetch without an explicit `:rdap <ip>` command. A dig
     /// answer's A records sit past any CNAME chain, under the chain's end.
     fn extract_resolved_ip_if_needed(&mut self, data: &LensData) {
         match data {
@@ -541,6 +709,12 @@ impl App {
                     *ticks = ticks.saturating_sub(1);
                     if *ticks == 0 {
                         self.confirm = None;
+                    }
+                }
+                if let Some(ticks) = &mut self.refetch_in {
+                    *ticks = ticks.saturating_sub(1);
+                    if *ticks == 0 {
+                        return self.expire_debounce();
                     }
                 }
                 vec![]
@@ -667,14 +841,14 @@ impl App {
             }
             return vec![];
         }
-        // The raw view scrolls: PgUp/PgDn anywhere, j/k/↑/↓ once focused.
+        // The raw view scrolls: PgUp/PgDn anywhere, j/k/↑/↓ in Details.
         if self.raw_view() {
-            let pane = self.focus == Focus::Pane;
+            let details = self.section == Section::Details;
             let delta = match key.code {
                 KeyCode::PageDown => Some(i32::from(PAGE_ROWS)),
                 KeyCode::PageUp => Some(-i32::from(PAGE_ROWS)),
-                KeyCode::Char('j') | KeyCode::Down if pane => Some(1),
-                KeyCode::Char('k') | KeyCode::Up if pane => Some(-1),
+                KeyCode::Char('j') | KeyCode::Down if details => Some(1),
+                KeyCode::Char('k') | KeyCode::Up if details => Some(-1),
                 _ => None,
             };
             if let Some(delta) = delta {
@@ -682,15 +856,20 @@ impl App {
                 return vec![];
             }
         }
-        // Delegate to pane component when pane-focused.
+        if self.section == Section::Options {
+            if let Some(actions) = self.on_options_key(key) {
+                return actions;
+            }
+        }
+        // Delegate to pane component when Details is focused.
         if let Some(actions) = self.handle_pane_key(key, confirm) {
             return actions;
         }
-        // `/` opens the in-lens filter when a filterable result lens is
-        // pane-focused; when nav-focused it stays the domain-edit shortcut.
+        // `/` opens the in-lens filter when a filterable result lens is in
+        // Details; elsewhere it stays the domain-edit shortcut.
         let lens = self.current_lens();
         if key.code == KeyCode::Char('/')
-            && self.focus == Focus::Pane
+            && self.section == Section::Details
             && lens.filterable()
             && matches!(self.state_of(self.lens), LensState::Loaded(_))
         {
@@ -730,8 +909,27 @@ impl App {
         mut buf: crate::tui::line_editor::LineEditor,
     ) -> Vec<Action> {
         use crate::tui::line_editor::EditOutcome;
+        // The Domain section is a field: Tab / Shift-Tab commit it and move on.
+        if target == EditTarget::Target && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            // Pick the next section while still on Domain: committing moves
+            // focus to Function, which would shift the step by one.
+            let next = self.next_section(key.code == KeyCode::Tab);
+            let actions = self.apply_field(target, buf.as_str().trim().to_string());
+            // A refused domain keeps the editor open: stay on Domain.
+            if self.section != Section::Domain {
+                self.set_section(next);
+            }
+            return actions;
+        }
         match buf.handle_key(key) {
-            EditOutcome::Cancel => vec![],
+            EditOutcome::Cancel => {
+                match target {
+                    EditTarget::Target => self.section = Section::Function,
+                    EditTarget::Option(_) => self.opt_error = None,
+                    _ => {}
+                }
+                vec![]
+            }
             EditOutcome::Submit => self.apply_field(target, buf.as_str().trim().to_string()),
             EditOutcome::Continue => {
                 self.input_mode = InputMode::Field { target, buf };
@@ -744,13 +942,53 @@ impl App {
         match target {
             EditTarget::Target => {
                 if value.is_empty() {
+                    self.section = Section::Function;
                     return vec![];
                 }
                 let Some(target) = self.target_or_toast(&value) else {
+                    // Refused: keep the editor open on the typed text, as a
+                    // refused option value stays.
+                    self.section = Section::Domain;
+                    self.input_mode = InputMode::Field {
+                        target: EditTarget::Target,
+                        buf: value.into(),
+                    };
                     return vec![];
                 };
-                self.goto_lens(0);
-                self.set_domain_and_fetch(target)
+                self.section = Section::Function;
+                // An unchanged domain only moves focus: no re-run, and the
+                // selection stays.
+                if self.domain.as_deref() == Some(target.as_str()) {
+                    // …unless the function failed: committing retries it.
+                    if matches!(self.state_of(self.lens), LensState::Error(_)) {
+                        return self.fetch_with_current(false);
+                    }
+                    return vec![];
+                }
+                // Re-run the current function, not Overview. Not explicit:
+                // a heavy lens still waits for ↵.
+                self.set_domain_and_fetch_with(target, false)
+            }
+            EditTarget::Option(id) => {
+                let key = self.current_lens().key;
+                match self.options.commit_text(key, id, &value) {
+                    Ok(true) => self.option_changed(false),
+                    Ok(false) => {
+                        self.opt_error = None;
+                        vec![]
+                    }
+                    Err(msg) => {
+                        // Refused: keep the editor open on the typed text,
+                        // as Domain does, so it can be corrected.
+                        self.opt_error = Some(id);
+                        self.set_toast("fail", &msg);
+                        self.input_mode = InputMode::Field {
+                            target,
+                            buf: value.into(),
+                        };
+                        vec![]
+                    }
+                }
             }
             EditTarget::Switcher => match lenses::switch_matches(&value).first() {
                 Some(&i) => self.nav_to(i),
@@ -771,17 +1009,6 @@ impl App {
                 self.sel = 0;
                 vec![]
             }
-            EditTarget::DiffB => {
-                self.panes.diff.b = value.to_lowercase();
-                match self.panes.diff.effective_a(self.domain.as_deref()) {
-                    Some(a) if !self.panes.diff.b.is_empty() => {
-                        let b = self.panes.diff.b.clone();
-                        let action = self.fetch_action(FetchReq::Diff { a, b });
-                        vec![action]
-                    }
-                    _ => vec![],
-                }
-            }
             EditTarget::WatchAdd => {
                 if value.is_empty() {
                     return vec![];
@@ -800,10 +1027,6 @@ impl App {
                     vec![self.fetch_action(FetchReq::Tld(cur))]
                 }
             }
-            EditTarget::FollowInterval
-            | EditTarget::FollowCount
-            | EditTarget::BulkPath
-            | EditTarget::BulkDomains => self.panes.apply_field(target, value, self.domain.clone()),
         }
     }
 
@@ -816,7 +1039,7 @@ impl App {
     }
 
     fn handle_pane_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) -> Option<Vec<Action>> {
-        if self.focus != Focus::Pane {
+        if self.section != Section::Details {
             return None;
         }
         let lens_key = self.current_lens().key;
@@ -829,7 +1052,9 @@ impl App {
             _ => {}
         }
         let domain = self.domain.clone();
-        let outcome = self.panes.handle_key(lens_key, key, domain.as_deref())?;
+        let outcome = self
+            .panes
+            .handle_key(lens_key, key, domain.as_deref(), &self.options)?;
         Some(self.apply_pane_outcome(outcome))
     }
 
@@ -942,7 +1167,10 @@ impl App {
             PaneOutcome::Fetch(req) => vec![self.fetch_action(req)],
             PaneOutcome::Action(a) => vec![a],
             PaneOutcome::EditField(target) => {
-                let cur = self.panes.field_value(target);
+                let cur = match target {
+                    EditTarget::TldFilter => self.panes.tld.filter.clone(),
+                    _ => String::new(),
+                };
                 self.input_mode = InputMode::Field {
                     target,
                     buf: cur.into(),
@@ -993,7 +1221,7 @@ impl App {
                 vec![]
             }
             CmdOutcome::Lens { lens, target } => {
-                // Smart :rdap <target>: route to the right RDAP sub-tab based on target type.
+                // Smart :rdap <target>: route to the right RDAP query based on target type.
                 if lens == "rdap" {
                     if let Some(t) = target {
                         return self.rdap_command(&t);
@@ -1033,27 +1261,37 @@ impl App {
                 self.set_domain_and_fetch(target)
             }
             CmdOutcome::Diff { a, b } => {
+                // The options' commit-time checks come first: a refused B
+                // leaves the view and the stored options unchanged.
+                if !self.commit_command_options(LensKey::Diff, &[(OptId::SecondDomain, &b)]) {
+                    return vec![];
+                }
+                let b = self
+                    .options
+                    .text(LensKey::Diff, OptId::SecondDomain)
+                    .unwrap_or(b);
                 self.goto_lens(LensKey::Diff.index());
-                // Keep A too: the pane's labels and its ↵ re-run must use the
-                // command's A, not the session domain.
+                // A is the command's until the session target changes.
                 self.panes.diff.a = a.clone();
-                self.panes.diff.b = b.clone();
-                let action = self.fetch_action(FetchReq::Diff { a, b });
-                vec![action]
+                vec![self.fetch_action(FetchReq::Diff { a, b })]
             }
             CmdOutcome::Compare { domain, a, b } => {
+                if !self.commit_command_options(
+                    LensKey::Compare,
+                    &[(OptId::ServerA, &a), (OptId::ServerB, &b)],
+                ) {
+                    return vec![];
+                }
                 self.goto_lens(LensKey::Compare.index());
-                // Remember the domain (so `a`/`b` re-runs stay on it) and keep
-                // the cycling indices in sync with the given resolvers.
+                // The domain is the command's until the session target
+                // changes; the resolvers are the options just committed.
                 self.panes.compare.domain = Some(domain.clone());
-                self.panes.compare.set_servers(a.clone(), b.clone());
-                let action = self.fetch_action(FetchReq::Compare {
+                vec![self.fetch_action(FetchReq::Compare {
                     domain,
                     record_type: RecordType::A,
                     a,
                     b,
-                });
-                vec![action]
+                })]
             }
             CmdOutcome::Dig {
                 domain,
@@ -1064,16 +1302,17 @@ impl App {
                 let Some(target) = self.target_or_toast(&domain) else {
                     return vec![];
                 };
+                if let Some(server) = &server {
+                    if !self.commit_command_options(LensKey::Dns, &[(OptId::Server, server)]) {
+                        return vec![];
+                    }
+                }
                 // `+trace` opens the Trace lens, anything else Records.
                 let lens = if trace { LensKey::Trace } else { LensKey::Dns };
                 self.goto_lens(lens.index());
-                // The Records and Trace lenses' default requests read the type
-                // and nameserver, so the cache check refetches when only
-                // those changed.
-                self.panes.dns.record_type = record_type;
-                if let Some(server) = server {
-                    self.panes.dns.select_server(server);
-                }
+                // The lens's request reads its options, so the cache check
+                // refetches when only the type or server changed.
+                self.options.set_record_type(lens, record_type);
                 self.set_domain_and_fetch(target)
             }
             CmdOutcome::WatchMutate { add, remove } => {
@@ -1091,24 +1330,43 @@ impl App {
         }
     }
 
-    /// Handle `:rdap <target>` — routes to the correct RDAP sub-tab based on
+    /// Write a `:` command's option values through the same commit-time
+    /// checks the Options box applies. All of them are checked before any
+    /// is stored; on a refusal it toasts, changes nothing and returns false.
+    fn commit_command_options(&mut self, key: LensKey, values: &[(OptId, &str)]) -> bool {
+        let mut scratch = Options::default();
+        for &(id, raw) in values {
+            if let Err(msg) = scratch.commit_text(key, id, raw) {
+                self.set_toast("fail", &msg);
+                return false;
+            }
+        }
+        for &(id, raw) in values {
+            // Checked above, so this only stores.
+            let _ = self.options.commit_text(key, id, raw);
+        }
+        true
+    }
+
+    /// Handle `:rdap <target>` — sets the RDAP Query option from
     /// whether the target looks like an IP address, an ASN, or a domain name.
     fn rdap_command(&mut self, target: &str) -> Vec<Action> {
         self.goto_lens(LensKey::Rdap.index());
 
         // IP address?
         if target.parse::<std::net::IpAddr>().is_ok() {
-            self.tab = 1;
+            self.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 1);
             return vec![self.fetch_action(FetchReq::RdapIp(target.to_string()))];
         }
 
         // ASN? Match AS15169, as15169, or bare 15169.
         if let Some(asn) = parse_asn(target) {
-            self.tab = 2;
+            self.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 2);
             return vec![self.fetch_action(FetchReq::RdapAsn(asn))];
         }
 
-        // Default: domain lookup on tab 0.
+        // Default: domain lookup.
+        self.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 0);
         vec![self.fetch_action(FetchReq::RdapDomain(target.to_string()))]
     }
 
@@ -1148,7 +1406,7 @@ impl App {
         let n_lenses = lenses::lenses().len();
         match ka {
             KeyAction::Down => {
-                if self.focus == Focus::Nav {
+                if self.section == Section::Function {
                     return self.nav_to((self.lens + 1) % n_lenses);
                 }
                 let max = self.row_count().saturating_sub(1);
@@ -1156,46 +1414,49 @@ impl App {
                 vec![]
             }
             KeyAction::Up => {
-                if self.focus == Focus::Nav {
+                if self.section == Section::Function {
                     return self.nav_to((self.lens + n_lenses - 1) % n_lenses);
                 }
                 self.sel = self.sel.saturating_sub(1);
                 vec![]
             }
             KeyAction::Top => {
-                if self.focus == Focus::Nav {
+                if self.section == Section::Function {
                     return self.nav_to(0);
                 }
                 self.sel = 0;
                 vec![]
             }
             KeyAction::Bottom => {
-                if self.focus == Focus::Nav {
+                if self.section == Section::Function {
                     return self.nav_to(n_lenses - 1);
                 }
                 self.sel = self.row_count().saturating_sub(1);
                 vec![]
             }
-            // Numbers count within the current group, as the strip shows.
-            KeyAction::JumpLens(i) => match lenses::nth_in_group(self.lens, i) {
-                Some(target) => self.nav_to(target),
-                None => vec![],
-            },
             KeyAction::NextGroup => self.nav_to(lenses::group_start(self.lens, true)),
             KeyAction::PrevGroup => self.nav_to(lenses::group_start(self.lens, false)),
-            KeyAction::ToggleFocus => {
-                self.focus = self.focus.toggled();
+            KeyAction::NextSection => {
+                let next = self.next_section(true);
+                self.set_section(next);
                 vec![]
             }
-            KeyAction::NextTab => {
-                self.tab = lenses::cycle_tab(self.current_lens(), self.tab, true);
-                self.sel = 0;
-                self.refetch_for_tab()
+            KeyAction::PrevSection => {
+                let next = self.next_section(false);
+                self.set_section(next);
+                vec![]
             }
-            KeyAction::PrevTab => {
-                self.tab = lenses::cycle_tab(self.current_lens(), self.tab, false);
-                self.sel = 0;
-                self.refetch_for_tab()
+            KeyAction::JumpSection(i) => {
+                let Some(&section) = Section::ALL.get(i) else {
+                    return vec![];
+                };
+                if section == Section::Options && self.visible_options().is_empty() {
+                    let msg = format!("no options for {}", self.current_lens().label);
+                    self.set_toast("info", &msg);
+                    return vec![];
+                }
+                self.set_section(section);
+                vec![]
             }
             KeyAction::EnterPane => {
                 let lens = self.current_lens();
@@ -1211,16 +1472,44 @@ impl App {
                     self.states.remove(&lens.key);
                     return self.fetch_with_current(true);
                 }
-                // Interactive lenses focus even with no rows: their in-pane
-                // controls work without loaded data. The raw view focuses to
-                // scroll with j/k.
-                if self.row_count() > 0 || lens.interactive || self.raw_view() {
-                    self.focus = Focus::Pane;
+                if self.section != Section::Function {
+                    return vec![];
+                }
+                // ↵ retries a failed lookup, whatever the lens.
+                if matches!(self.state_of(self.lens), LensState::Error(_)) {
+                    let actions = self.fetch_with_current(true);
+                    if !actions.is_empty() {
+                        return actions;
+                    }
+                }
+                // Follow and Bulk start from here; if they cannot (no
+                // domain, no inputs), Options is where to supply them. A run
+                // in progress is refused where focus is.
+                if matches!(lens.key, LensKey::Follow | LensKey::Bulk) {
+                    let running = self.stream_running(lens.key);
+                    return match self.start_run(lens.key) {
+                        Some(PaneOutcome::Action(a)) => vec![a],
+                        refused if running => {
+                            refused.map_or_else(Vec::new, |o| self.apply_pane_outcome(o))
+                        }
+                        refused => {
+                            self.set_section(Section::Options);
+                            refused.map_or_else(Vec::new, |o| self.apply_pane_outcome(o))
+                        }
+                    };
+                }
+                // Options first; else Details. Interactive lenses focus even
+                // with no rows: their in-pane controls work without loaded
+                // data. The raw view focuses to scroll with j/k.
+                if !self.visible_options().is_empty() {
+                    self.set_section(Section::Options);
+                } else if self.row_count() > 0 || lens.interactive || self.raw_view() {
+                    self.set_section(Section::Details);
                 }
                 vec![]
             }
             KeyAction::Back => {
-                self.focus = Focus::Nav;
+                self.section = Section::Function;
                 vec![]
             }
             KeyAction::ToggleRaw => {
@@ -1236,11 +1525,7 @@ impl App {
             }
             KeyAction::Copy => self.copy_action(),
             KeyAction::EditDomain => {
-                let cur = self.domain.clone().unwrap_or_default();
-                self.input_mode = InputMode::Field {
-                    target: EditTarget::Target,
-                    buf: cur.into(),
-                };
+                self.set_section(Section::Domain);
                 vec![]
             }
             KeyAction::Command => {
@@ -1262,6 +1547,89 @@ impl App {
                 self.set_toast("info", "type :q to quit");
                 vec![]
             }
+        }
+    }
+
+    /// Options-section keys: move between fields, step a value, or `↵` to
+    /// type one (Text / Number / Nameserver) or run (Follow, Bulk, heavy
+    /// lenses) / go to Details. `None` lets global keys through.
+    fn on_options_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        let specs = self.visible_options();
+        let spec = *specs.get(self.opt_cursor)?;
+        let lens = self.current_lens();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.opt_cursor = (self.opt_cursor + 1).min(specs.len() - 1);
+                Some(vec![])
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.opt_cursor = self.opt_cursor.saturating_sub(1);
+                Some(vec![])
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('h') | KeyCode::Left => {
+                let forward = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
+                if self.options.cycle(lens.key, spec.id, forward) {
+                    // A Source change can hide the field under the cursor.
+                    let last = self.visible_options().len().saturating_sub(1);
+                    self.opt_cursor = self.opt_cursor.min(last);
+                    return Some(self.option_changed(true));
+                }
+                Some(vec![])
+            }
+            KeyCode::Enter if spec.is_typed() => {
+                let (value, placeholder) = self.options.display(lens.key, spec);
+                let buf = if placeholder || value == "system" {
+                    String::new()
+                } else {
+                    value
+                };
+                self.input_mode = InputMode::Field {
+                    target: EditTarget::Option(spec.id),
+                    buf: buf.into(),
+                };
+                Some(vec![])
+            }
+            KeyCode::Enter => Some(self.submit_options()),
+            _ => None,
+        }
+    }
+
+    /// `↵` on a chosen (not typed) field: start Follow / Bulk, run a heavy
+    /// lens, else look at the result.
+    fn submit_options(&mut self) -> Vec<Action> {
+        let key = self.current_lens().key;
+        if let Some(outcome) = self.start_run(key) {
+            return self.apply_pane_outcome(outcome);
+        }
+        if self.current_lens().heavy {
+            self.states.remove(&key);
+            return self.fetch_with_current(true);
+        }
+        self.set_section(Section::Details);
+        vec![]
+    }
+
+    /// Start the streaming run for `key` from its options: the one path
+    /// `↵` takes from Function and from Options. `None` for a lens that
+    /// does not stream; a refusal (no domain, nothing to run over) comes
+    /// back as a toast outcome.
+    fn start_run(&mut self, key: LensKey) -> Option<PaneOutcome> {
+        match key {
+            LensKey::Follow => {
+                let Some(domain) = self.domain.clone() else {
+                    return Some(PaneOutcome::Toast {
+                        tone: "info",
+                        msg: "enter a domain first (1)".to_string(),
+                    });
+                };
+                let (count, secs) = self.options.follow_run()?;
+                Some(self.panes.follow.start(&domain, count, secs))
+            }
+            LensKey::Bulk => {
+                let (op, input) = self.options.bulk_run()?;
+                Some(self.panes.bulk.start(op, input))
+            }
+            _ => None,
         }
     }
 
@@ -1333,9 +1701,779 @@ mod tests {
         )))
     }
 
+    /// A session with no target that is already past the Domain field, for
+    /// tests about other sections (a fresh no-domain app starts typing).
+    fn idle_app() -> App {
+        let mut app = App::new(None);
+        app.set_section(Section::Function);
+        app
+    }
+
+    #[test]
+    fn startup_section_depends_on_the_target() {
+        let app = App::new(None);
+        assert_eq!(app.section, Section::Domain);
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::Target,
+                ..
+            }
+        ));
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        assert_eq!(app.section, Section::Function);
+    }
+
+    #[test]
+    fn tab_cycles_sections_and_skips_empty_options() {
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        app.set_section(Section::Function);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.section, Section::Details, "WHOIS has no options");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.section, Section::Domain);
+        key(&mut app, KeyCode::Tab); // commits the unchanged domain
+        assert_eq!(app.section, Section::Function);
+        app.lens = LensKey::Dns.index();
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.section, Section::Options);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.section, Section::Function);
+    }
+
+    #[test]
+    fn digits_jump_to_sections() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Function);
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.section, Section::Details);
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.section, Section::Options);
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.section, Section::Function);
+        app.lens = LensKey::Whois.index();
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.section, Section::Function, "no options to go to");
+        assert!(matches!(&app.toast, Some(t) if t.msg.contains("no options")));
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.section, Section::Domain);
+    }
+
+    // Review Focus 1.
+    #[test]
+    fn domain_field_keeps_section_and_letter_keys_as_text() {
+        let mut app = App::new(None);
+        for c in "123.rj/q".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.section, Section::Domain);
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Field { target: EditTarget::Target, buf } if buf.as_str() == "123.rj/q"
+        ));
+        assert_eq!(app.format, OutputFormat::Human, "r did not toggle raw");
+    }
+
+    #[test]
+    fn committing_the_domain_reruns_the_current_function() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Dns.index();
+        for c in "example.com".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.section, Section::Function);
+        assert_eq!(app.current_lens().key, LensKey::Dns, "stays on Records");
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Fetch {
+                req: FetchReq::Dns { .. },
+                ..
+            }
+        )));
+        // Esc reverts an edit.
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.domain.as_deref(), Some("example.com"));
+        assert_eq!(app.section, Section::Function);
+    }
+
+    #[test]
+    fn cycling_an_option_reruns_after_the_debounce() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        assert!(key(&mut app, KeyCode::Right)
+            .iter()
+            .all(|a| !matches!(a, Action::Fetch { .. })));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.options.record_type(LensKey::Dns),
+            Some(RecordType::CNAME)
+        );
+        let mut fetches = vec![];
+        for _ in 0..REFETCH_TICKS {
+            fetches.extend(app.update(Msg::Tick));
+        }
+        let reqs: Vec<_> = fetches
+            .iter()
+            .filter_map(|a| match a {
+                Action::Fetch { req, .. } => Some(req.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reqs.len(), 1, "one fetch for the burst: {reqs:?}");
+        assert!(matches!(
+            &reqs[0],
+            FetchReq::Dns {
+                record_type: RecordType::CNAME,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn typed_options_commit_now_or_are_refused() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Down); // Server
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::Option(OptId::Server),
+                ..
+            }
+        ));
+        for c in "9.9.9.9".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Dns { nameserver: Some(ns), .. }, .. } if ns == "9.9.9.9"
+            )),
+            "got {actions:?}"
+        );
+        key(&mut app, KeyCode::Enter);
+        for c in " bad!".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        assert_eq!(app.opt_error, Some(OptId::Server));
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+    }
+
+    #[test]
+    fn bulk_options_never_start_a_run_until_enter() {
+        // Bulk: editing options never starts a run; ↵ on a choice does.
+        let mut app = app_on_lens(Some("example.com"), "bulk");
+        app.set_section(Section::Options);
+        app.options
+            .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
+        assert!(key(&mut app, KeyCode::Right).is_empty()); // Op → status
+        for _ in 0..REFETCH_TICKS {
+            assert!(app
+                .update(Msg::Tick)
+                .iter()
+                .all(|a| !matches!(a, Action::StartBulk(_))));
+        }
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::StartBulk(p) if p.op == "status")));
+    }
+
+    #[test]
+    fn follow_options_never_start_a_run_until_enter() {
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.set_section(Section::Options);
+        let is_run = |a: &Action| matches!(a, Action::StartFollow(_) | Action::Fetch { .. });
+        assert!(key(&mut app, KeyCode::Right).is_empty()); // Interval 30 → 35
+        for _ in 0..REFETCH_TICKS * 2 {
+            assert!(!app.update(Msg::Tick).iter().any(is_run), "ticks never run");
+        }
+        // ↵ on a typed Options field edits it; it does not start a run.
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(actions.is_empty());
+        assert!(matches!(
+            app.input_mode,
+            InputMode::Field {
+                target: EditTarget::Option(OptId::Interval),
+                ..
+            }
+        ));
+        key(&mut app, KeyCode::Esc);
+        // ↵ from Details starts it, as does ↵ from Function (below).
+        let actions = key(&mut app, KeyCode::Char('4'));
+        assert!(actions.is_empty());
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartFollow(p) if p.interval_secs == 35 && p.iterations == 20
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn enter_in_function_starts_follow_with_the_options() {
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.options
+            .commit_text(LensKey::Follow, OptId::Count, "5")
+            .unwrap();
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartFollow(p) if p.iterations == 5 && p.interval_secs == 30
+            )),
+            "got {actions:?}"
+        );
+        assert_eq!(
+            app.section,
+            Section::Function,
+            "the run is watched in Details"
+        );
+        assert!(app.panes.follow.running);
+    }
+
+    #[test]
+    fn enter_never_restarts_a_running_follow_or_bulk() {
+        // A stray ↵ must not wipe a long run's results, from any section.
+        for section in [Section::Function, Section::Options, Section::Details] {
+            let mut app = app_on_lens(Some("example.com"), "follow");
+            key(&mut app, KeyCode::Enter);
+            let gen = app.panes.follow.gen;
+            app.set_section(section);
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::StartFollow(_))),
+                "follow restarted from {section:?}: {actions:?}"
+            );
+            assert_eq!(app.panes.follow.gen, gen, "{section:?}");
+            assert!(app.panes.follow.running, "{section:?}");
+            assert_eq!(app.section, section, "a refusal keeps focus");
+            // In Options, ↵ on Follow's numeric fields opens their editor.
+            if section != Section::Options {
+                assert!(
+                    matches!(&app.toast, Some(t) if t.msg.contains("running")),
+                    "{section:?}: {:?}",
+                    app.toast
+                );
+            }
+
+            let mut app = app_on_lens(None, "bulk");
+            app.options
+                .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
+            key(&mut app, KeyCode::Enter);
+            assert!(app.panes.bulk.running);
+            let gen = app.panes.bulk.gen;
+            app.set_section(section);
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::StartBulk(_))),
+                "bulk restarted from {section:?}: {actions:?}"
+            );
+            assert_eq!(app.panes.bulk.gen, gen, "{section:?}");
+            assert_eq!(app.section, section, "a refusal keeps focus");
+            assert!(
+                matches!(&app.toast, Some(t) if t.msg.contains("running")),
+                "{section:?}: {:?}",
+                app.toast
+            );
+        }
+    }
+
+    #[test]
+    fn enter_in_function_on_follow_without_a_domain_lands_in_options() {
+        let mut app = app_on_lens(None, "follow");
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(!actions.iter().any(|a| matches!(a, Action::StartFollow(_))));
+        assert_eq!(app.section, Section::Options);
+        assert!(
+            matches!(&app.toast, Some(t) if t.msg.contains("domain")),
+            "{:?}",
+            app.toast
+        );
+        assert!(!app.panes.follow.running);
+    }
+
+    #[test]
+    fn enter_in_function_starts_bulk_or_lands_in_options_with_the_toast() {
+        let mut app = app_on_lens(Some("example.com"), "bulk");
+        // Nothing to run over yet: refused, Options gets the focus.
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(!actions.iter().any(|a| matches!(a, Action::StartBulk(_))));
+        assert_eq!(app.section, Section::Options);
+        assert!(
+            matches!(&app.toast, Some(t) if t.msg.contains("Options")),
+            "{:?}",
+            app.toast
+        );
+        // With a Source input set, ↵ in Function runs it.
+        app.options
+            .commit_text(LensKey::Bulk, OptId::BulkDomains, "a.com b.com")
+            .unwrap();
+        app.set_section(Section::Function);
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartBulk(p) if p.domains == ["a.com", "b.com"])),
+            "got {actions:?}"
+        );
+        assert_eq!(app.section, Section::Function);
+    }
+
+    #[test]
+    fn enter_in_function_retries_any_failed_lookup() {
+        for lens in ["whois", "dns", "ssl"] {
+            let mut app = app_on_lens(Some("example.com"), lens);
+            let key_ = app.current_lens().key;
+            app.states
+                .insert(key_, LensState::Error("timed out".into()));
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Fetch { .. })),
+                "{lens}: {actions:?}"
+            );
+            assert!(
+                matches!(app.state_of(app.lens), LensState::Loading),
+                "{lens}"
+            );
+            assert_eq!(app.section, Section::Function, "{lens}: stays put");
+        }
+    }
+
+    #[test]
+    fn committing_an_unchanged_domain_retries_a_failed_lookup() {
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        app.states
+            .insert(LensKey::Whois, LensState::Error("timed out".into()));
+        key(&mut app, KeyCode::Char('1'));
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Whois(d), .. } if d == "example.com"
+            )),
+            "got {actions:?}"
+        );
+        assert_eq!(app.section, Section::Function);
+        // A healthy lens still only moves focus.
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        app.states.insert(LensKey::Whois, LensState::Loading);
+        key(&mut app, KeyCode::Char('1'));
+        assert!(key(&mut app, KeyCode::Enter).is_empty());
+    }
+
+    #[test]
+    fn heavy_lenses_stage_on_navigation_and_run_on_enter() {
+        for lens in ["subdomains", "audit", "takeover"] {
+            let mut app = app_on_lens(Some("example.com"), lens);
+            assert!(app.current_lens().heavy);
+            // Staging rule: a non-explicit fetch (domain commit, option
+            // change) leaves the lens waiting.
+            assert!(app.fetch_with_current(false).is_empty(), "{lens}");
+            assert!(matches!(app.state_of(app.lens), LensState::Idle));
+            // ↵ in Function runs it.
+            let actions = key(&mut app, KeyCode::Enter);
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Fetch { .. })),
+                "{lens}: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn committing_a_domain_does_not_run_a_heavy_lens() {
+        let mut app = app_on_lens(Some("example.com"), "subdomains");
+        app.set_section(Section::Domain);
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Target,
+            buf: "other.com".into(),
+        };
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.domain.as_deref(), Some("other.com"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        assert!(matches!(app.state_of(app.lens), LensState::Idle));
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Subdomains(d), .. } if d == "other.com"
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_domain_keeps_the_editor_open_with_the_typed_text() {
+        for leave in [KeyCode::Enter, KeyCode::Tab] {
+            let mut app = app_on_lens(Some("example.com"), "whois");
+            key(&mut app, KeyCode::Char('/'));
+            for c in " bad!".chars() {
+                key(&mut app, KeyCode::Char(c));
+            }
+            let actions = key(&mut app, leave);
+            assert!(actions.is_empty(), "{actions:?}");
+            assert_eq!(app.section, Section::Domain, "{leave:?}");
+            assert!(matches!(
+                &app.input_mode,
+                InputMode::Field { target: EditTarget::Target, buf } if buf.as_str() == "example.com bad!"
+            ));
+            assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+            assert_eq!(app.domain.as_deref(), Some("example.com"));
+        }
+    }
+
+    #[test]
+    fn an_unchanged_domain_only_moves_focus() {
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        app.set_section(Section::Details);
+        app.sel = 3;
+        key(&mut app, KeyCode::Tab); // Domain
+        assert_eq!(app.section, Section::Domain);
+        let actions = key(&mut app, KeyCode::Tab); // commits the same domain
+        assert_eq!(app.section, Section::Function);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        assert_eq!(app.sel, 3, "selection survives");
+        // ↵ on the unchanged domain likewise.
+        key(&mut app, KeyCode::Char('1'));
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!((app.section, app.sel), (Section::Function, 3));
+    }
+
+    #[test]
+    fn a_refused_option_keeps_its_editor_open_and_marked_until_fixed_or_esc() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Down); // Server
+        key(&mut app, KeyCode::Enter);
+        for c in "9.9.9.9 bad!".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let actions = key(&mut app, KeyCode::Enter);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        assert_eq!(app.opt_error, Some(OptId::Server));
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+        // The editor is still open on what was typed, as Domain's is.
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Field { target: EditTarget::Option(OptId::Server), buf }
+                if buf.as_str() == "9.9.9.9 bad!"
+        ));
+        assert_eq!(app.options.server(LensKey::Dns, OptId::Server), Some(None));
+        // Fixing the text and committing applies it and clears the mark.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Backspace); // " bad!"
+        }
+        let actions = key(&mut app, KeyCode::Enter);
+        assert_eq!(app.opt_error, None);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Dns { nameserver: Some(ns), .. }, .. } if ns == "9.9.9.9"
+            )),
+            "got {actions:?}"
+        );
+        // Esc on a refused editor closes it and clears the mark.
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char(' ')); // whitespace is refused
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.opt_error, Some(OptId::Server));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.opt_error, None);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        // Committing an unchanged value clears a stale mark too.
+        app.opt_error = Some(OptId::Server);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.opt_error, None);
+    }
+
+    #[test]
+    fn a_source_change_keeps_the_option_cursor_on_a_visible_field() {
+        let mut app = app_on_lens(None, "bulk");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Down); // Source
+        key(&mut app, KeyCode::Right); // → file: Domains gives way to File
+        let specs = app.visible_options();
+        assert_eq!(specs[2].id, OptId::BulkFile);
+        assert!(app.opt_cursor < specs.len());
+        // Entering Options clamps a cursor left past the end.
+        app.opt_cursor = 9;
+        app.set_section(Section::Function);
+        app.set_section(Section::Options);
+        assert_eq!(app.opt_cursor, 2);
+    }
+
+    #[test]
+    fn a_lens_change_cancels_a_pending_debounce() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('j')); // another lens
+        assert_ne!(app.current_lens().key, LensKey::Dns);
+        for _ in 0..REFETCH_TICKS * 2 {
+            let actions = app.update(Msg::Tick);
+            assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        }
+    }
+
+    #[test]
+    fn a_second_cycle_restarts_the_debounce_countdown() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        let fetches = |app: &mut App| {
+            app.update(Msg::Tick)
+                .iter()
+                .filter(|a| matches!(a, Action::Fetch { .. }))
+                .count()
+        };
+        key(&mut app, KeyCode::Right);
+        assert_eq!(fetches(&mut app), 0);
+        assert_eq!(fetches(&mut app), 0);
+        key(&mut app, KeyCode::Right); // restarts at 3
+        assert_eq!(fetches(&mut app), 0, "the first press's deadline passed");
+        assert_eq!(fetches(&mut app), 0);
+        assert_eq!(fetches(&mut app), 1);
+        assert_eq!(fetches(&mut app), 0, "once");
+    }
+
+    #[test]
+    fn a_domain_change_drops_a_pending_debounce() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right);
+        let actions = app.set_domain_and_fetch_with("other.com".into(), false);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::Fetch { .. }))
+                .count(),
+            1
+        );
+        for _ in 0..REFETCH_TICKS * 2 {
+            let actions = app.update(Msg::Tick);
+            assert!(!actions.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        }
+    }
+
+    // Review Focus 2.
+    #[test]
+    fn paste_goes_into_the_open_option_editor() {
+        let mut app = app_on_lens(Some("example.com"), "diff");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Enter);
+        app.update(Msg::Input(Event::Paste("other\n.org".into())));
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Field { target: EditTarget::Option(OptId::SecondDomain), buf } if buf.as_str() == "other .org"
+        ));
+        assert_eq!(app.domain.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn a_cycled_option_drops_the_old_result_at_once_and_fetches_after_the_debounce() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        let first = app.fetch_with_current(true);
+        let old_gen = fetch_gen_of(&first);
+        app.set_section(Section::Options);
+        let actions = key(&mut app, KeyCode::Right); // A → AAAA
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CancelFetch(LensKey::Dns))),
+            "the in-flight fetch is cancelled now: {actions:?}"
+        );
+        assert!(!has_fetch(&actions), "the new fetch waits for the debounce");
+        assert!(matches!(app.state_of(app.lens), LensState::Loading));
+        // The old value's result lands inside the debounce window.
+        app.update(Msg::Data {
+            lens: LensKey::Dns,
+            gen: old_gen,
+            result: Ok(empty_dig()),
+        });
+        assert!(
+            matches!(app.state_of(app.lens), LensState::Loading),
+            "the A result must not show under the new Type"
+        );
+        // Exactly one fetch goes out once the value has settled.
+        let mut fetches = vec![];
+        for _ in 0..REFETCH_TICKS * 2 {
+            fetches.extend(
+                app.update(Msg::Tick)
+                    .into_iter()
+                    .filter(|a| matches!(a, Action::Fetch { .. })),
+            );
+        }
+        assert_eq!(fetches.len(), 1, "{fetches:?}");
+        assert!(matches!(
+            &fetches[0],
+            Action::Fetch {
+                req: FetchReq::Dns {
+                    record_type: RecordType::AAAA,
+                    ..
+                },
+                ..
+            }
+        ));
+        answer(&mut app, &fetches, LensKey::Dns, empty_dig());
+        assert!(matches!(app.state_of(app.lens), LensState::Loaded(_)));
+    }
+
+    #[test]
+    fn cycling_back_to_the_original_value_still_refetches() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        let first = app.fetch_with_current(true);
+        answer(&mut app, &first, LensKey::Dns, empty_dig());
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right); // → AAAA: result dropped, Loading
+        key(&mut app, KeyCode::Left); // → A again, inside the debounce
+        let mut fetches = 0;
+        for _ in 0..REFETCH_TICKS * 2 {
+            fetches += app
+                .update(Msg::Tick)
+                .iter()
+                .filter(|a| matches!(a, Action::Fetch { .. }))
+                .count();
+        }
+        assert_eq!(
+            fetches, 1,
+            "no lens is left on a spinner with nothing in flight"
+        );
+    }
+
+    #[test]
+    fn leaving_a_lens_mid_debounce_leaves_no_stuck_spinner() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        let first = app.fetch_with_current(true);
+        answer(&mut app, &first, LensKey::Dns, empty_dig());
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right);
+        let _ = app.nav_to(LensKey::Whois.index());
+        let back = app.nav_to(LensKey::Dns.index());
+        assert!(has_fetch(&back), "a revisit fetches afresh: {back:?}");
+    }
+
+    #[test]
+    fn a_refused_compare_server_changes_nothing() {
+        // (A bare word like `junk` is a valid hostname to core, so the
+        // refusal here is an unsupported scheme.)
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        let actions = app.exec_command("compare other.com ftp://ns.example 1.1.1.1");
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+        assert_eq!(app.current_lens().key, LensKey::Whois, "no lens switch");
+        assert_eq!(
+            app.options.server(LensKey::Compare, OptId::ServerA),
+            Some(Some("8.8.8.8".into())),
+            "neither server was stored"
+        );
+        assert!(app.panes.compare.domain.is_none());
+        // Valid servers are stored and queried.
+        let actions = app.exec_command("compare other.com 9.9.9.9 1.1.1.1");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Compare { a, .. }, .. } if a == "9.9.9.9"
+            )),
+            "got {actions:?}"
+        );
+        assert_eq!(
+            app.options.server(LensKey::Compare, OptId::ServerA),
+            Some(Some("9.9.9.9".into()))
+        );
+    }
+
+    #[test]
+    fn a_refused_dig_server_changes_nothing() {
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        let actions = app.exec_command("dig @ftp://ns.example example.com MX");
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+        assert_eq!(app.current_lens().key, LensKey::Whois);
+        assert_eq!(app.options.record_type(LensKey::Dns), Some(RecordType::A));
+    }
+
+    #[test]
+    fn diff_command_normalizes_its_second_domain_like_the_option() {
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        let actions = app.exec_command("diff a.com B.COM");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch { req: FetchReq::Diff { b, .. }, .. } if b == "b.com"
+            )),
+            "got {actions:?}"
+        );
+        assert_eq!(
+            app.options
+                .text(LensKey::Diff, OptId::SecondDomain)
+                .as_deref(),
+            Some("b.com")
+        );
+        // A refused B leaves the view alone.
+        let mut app = app_on_lens(Some("example.com"), "whois");
+        let actions = app.exec_command("diff a.com b!d");
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(app.current_lens().key, LensKey::Whois);
+        assert!(matches!(&app.toast, Some(t) if t.tone == "fail"));
+    }
+
+    // Review Focus 3.
+    #[test]
+    fn an_option_change_supersedes_the_inflight_fetch() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        let first = app.fetch_with_current(true);
+        let old_gen = fetch_gen_of(&first);
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Right);
+        for _ in 0..REFETCH_TICKS {
+            app.update(Msg::Tick);
+        }
+        app.update(Msg::Data {
+            lens: LensKey::Dns,
+            gen: old_gen,
+            result: Ok(empty_dig()),
+        });
+        assert!(
+            matches!(app.state_of(app.lens), LensState::Loading),
+            "stale A result dropped"
+        );
+    }
+
+    #[test]
+    fn the_option_cursor_stays_on_a_visible_field() {
+        let mut app = app_on_lens(None, "bulk");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down); // Domains (3rd field)
+        assert_eq!(app.opt_cursor, 2);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.opt_cursor, 2, "clamped to the last field");
+    }
+
+    #[test]
+    fn esc_leaves_options_for_function() {
+        let mut app = app_on_lens(Some("example.com"), "rdap");
+        app.set_section(Section::Options);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.section, Section::Function);
+    }
+
     #[test]
     fn headers_rows_are_selectable() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.lens = LensKey::Headers.index();
         let finding = |header: &str| seer_core::HeaderFinding {
             header: header.into(),
@@ -1373,7 +2511,7 @@ mod tests {
             for hint in lens.keys {
                 let mut app = App::new(Some("example.com".into()));
                 app.lens = lens.key.index();
-                app.focus = Focus::Pane;
+                app.set_section(Section::Details);
                 match lens.key {
                     LensKey::Watch => {
                         app.states
@@ -1385,6 +2523,9 @@ mod tests {
                     }
                     _ => {}
                 }
+                // Bulk's ↵ starts a run only once it has something to run.
+                app.options
+                    .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
                 let ev = KeyEvent::new(hint.code, KeyModifiers::NONE);
                 assert!(
                     app.handle_pane_key(ev, None).is_some(),
@@ -1401,10 +2542,10 @@ mod tests {
     fn brace_jumps_to_the_next_group_through_nav_to() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         key(&mut app, KeyCode::Char('}'));
         assert_eq!(app.lens, LensKey::Dns.index());
-        assert_eq!(app.focus, Focus::Nav);
+        assert_eq!(app.section, Section::Function);
         key(&mut app, KeyCode::Char('{'));
         assert_eq!(app.lens, 0);
     }
@@ -1426,7 +2567,6 @@ mod tests {
                 )),
                 "{key:?}: {actions:?}"
             );
-            assert_eq!(app.tab, 0);
         }
     }
 
@@ -1440,14 +2580,13 @@ mod tests {
         assert_eq!(app.current_lens().key, LensKey::Compare);
         app.exec_command("dig example.com");
         assert_eq!(app.current_lens().key, LensKey::Dns);
-        assert_eq!(app.tab, 0);
     }
 
     #[test]
-    fn new_starts_on_overview_nav_focus() {
+    fn new_starts_on_overview_in_the_domain_field() {
         let app = App::new(None);
         assert_eq!(app.lens, 0);
-        assert_eq!(app.focus, Focus::Nav);
+        assert_eq!(app.section, Section::Domain);
         assert!(!app.should_quit);
     }
 
@@ -1466,8 +2605,8 @@ mod tests {
 
     #[test]
     fn space_opens_the_switcher_and_enter_goes_to_the_best_match() {
-        let mut app = App::new(None);
-        app.focus = Focus::Pane;
+        let mut app = idle_app();
+        app.set_section(Section::Details);
         key(&mut app, KeyCode::Char(' '));
         for c in "j1{/".chars() {
             key(&mut app, KeyCode::Char(c));
@@ -1492,60 +2631,8 @@ mod tests {
     }
 
     #[test]
-    fn number_keys_pick_within_the_current_group() {
-        let mut app = App::new(None);
-        app.lens = LensKey::Ssl.index();
-        key(&mut app, KeyCode::Char('2'));
-        assert_eq!(app.current_lens().key, LensKey::Status);
-        // Past the group's end, nothing happens.
-        app.lens = LensKey::Diff.index();
-        key(&mut app, KeyCode::Char('9'));
-        assert_eq!(app.current_lens().key, LensKey::Diff);
-    }
-
-    #[test]
-    fn number_jump_to_whois_fetches_whois() {
-        let mut app = App::new(Some("example.com".into()));
-        let _ = app.take_startup_actions();
-        let actions = key(&mut app, KeyCode::Char('2'));
-        assert_eq!(app.lens, 1);
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::Fetch {
-                req: FetchReq::Whois(_),
-                ..
-            }
-        )));
-    }
-
-    #[test]
-    fn editing_target_field_enter_fetches() {
-        let mut app = App::new(None);
-        key(&mut app, KeyCode::Char('/'));
-        assert!(matches!(
-            app.input_mode,
-            InputMode::Field {
-                target: EditTarget::Target,
-                ..
-            }
-        ));
-        for c in "acme.io".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        let actions = key(&mut app, KeyCode::Enter);
-        assert_eq!(app.domain.as_deref(), Some("acme.io"));
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::Fetch {
-                req: FetchReq::Overview(_),
-                ..
-            }
-        )));
-    }
-
-    #[test]
     fn data_message_keyed_by_lens_string_stores_state() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         // gen 0 matches the initial fetch_gen (entry absent → 0), so result is stored.
         app.update(Msg::Data {
             lens: LensKey::Dns,
@@ -1558,7 +2645,7 @@ mod tests {
 
     #[test]
     fn r_toggles_raw_format() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         assert_eq!(app.format, OutputFormat::Human);
         key(&mut app, KeyCode::Char('r'));
         assert_eq!(app.format, OutputFormat::Json);
@@ -1566,7 +2653,7 @@ mod tests {
 
     #[test]
     fn tick_clears_expired_toast() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.set_toast("ok", "hi");
         for _ in 0..40 {
             app.update(Msg::Tick);
@@ -1632,10 +2719,10 @@ mod tests {
     }
 
     fn app_on_watch_with_domain(domain: &str) -> App {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let idx = watch_lens_idx();
         app.lens = idx;
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         app.sel = 0;
         app.states
             .insert(lenses::lenses()[idx].key, make_watch_state(domain));
@@ -1686,7 +2773,7 @@ mod tests {
         let mut app = app_on_watch_with_domain("example.com");
         let actions = key(&mut app, KeyCode::Enter);
         assert_eq!(app.lens, 0, "should switch to overview lens");
-        assert_eq!(app.focus, Focus::Nav);
+        assert_eq!(app.section, Section::Function);
         // Should emit a fetch for the selected domain
         assert!(
             actions.iter().any(|a| matches!(
@@ -1704,10 +2791,10 @@ mod tests {
 
     #[test]
     fn history_c_emits_history_clear() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let idx = history_lens_idx();
         app.lens = idx;
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         app.states
             .insert(lenses::lenses()[idx].key, make_history_state("old.com"));
         let actions = key(&mut app, KeyCode::Char('c'));
@@ -1726,9 +2813,9 @@ mod tests {
     /// window: another key or the window lapsing disarms it.
     #[test]
     fn destructive_keys_need_a_prompt_second_press() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.lens = history_lens_idx();
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         app.states
             .insert(LensKey::History, make_history_state("old.com"));
         // Filtered to nothing, `c` still says it clears everything.
@@ -1759,10 +2846,10 @@ mod tests {
 
     #[test]
     fn history_enter_switches_to_overview() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let idx = history_lens_idx();
         app.lens = idx;
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         app.sel = 0;
         app.states
             .insert(lenses::lenses()[idx].key, make_history_state("old.com"));
@@ -1784,7 +2871,7 @@ mod tests {
 
     #[test]
     fn stale_data_msg_is_dropped() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         // Bump gen to 1 by simulating a fetch (domain set → fetch triggered).
         app.domain = Some("example.com".into());
@@ -1804,7 +2891,7 @@ mod tests {
 
     #[test]
     fn current_gen_data_msg_is_stored() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
         app.fetch_gen.insert(lenses::lenses()[dns_idx].key, 2);
         app.update(Msg::Data {
@@ -1821,7 +2908,7 @@ mod tests {
     #[test]
     fn follow_step_dropped_on_stale_gen() {
         use chrono::Utc;
-        let mut app = App::new(None);
+        let mut app = idle_app();
         // panes.follow.gen starts at 0; send a step with gen 5 (old run).
         app.panes.follow.gen = 3;
         let it = seer_core::dns::FollowIteration {
@@ -1847,7 +2934,7 @@ mod tests {
     #[test]
     fn follow_step_accepted_on_matching_gen() {
         use chrono::Utc;
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.panes.follow.gen = 7;
         let it = seer_core::dns::FollowIteration {
             iteration: 1,
@@ -1884,7 +2971,7 @@ mod tests {
             error: None,
         };
 
-        let mut app = App::new(None);
+        let mut app = idle_app();
         // Establish an in-flight follow run on the first domain.
         let _ = app.set_domain_and_fetch("a.com".into());
         app.panes.follow.gen = 1;
@@ -1930,10 +3017,14 @@ mod tests {
     }
 
     #[test]
-    fn rdap_command_ip_routes_to_tab1() {
-        let mut app = App::new(None);
+    fn rdap_command_ip_routes_to_the_ip_query() {
+        let mut app = idle_app();
         let actions = app.rdap_command("8.8.8.8");
-        assert_eq!(app.tab, 1, ":rdap <ip> must switch to tab 1");
+        assert_eq!(
+            app.options.choice(LensKey::Rdap, OptId::RdapQuery),
+            Some(1),
+            ":rdap <ip> must select the IP query"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -1947,10 +3038,14 @@ mod tests {
     }
 
     #[test]
-    fn rdap_command_asn_routes_to_tab2() {
-        let mut app = App::new(None);
+    fn rdap_command_asn_routes_to_the_asn_query() {
+        let mut app = idle_app();
         let actions = app.rdap_command("AS15169");
-        assert_eq!(app.tab, 2, ":rdap AS<n> must switch to tab 2");
+        assert_eq!(
+            app.options.choice(LensKey::Rdap, OptId::RdapQuery),
+            Some(2),
+            ":rdap AS<n> must select the ASN query"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -1964,10 +3059,14 @@ mod tests {
     }
 
     #[test]
-    fn rdap_command_domain_routes_to_tab0() {
-        let mut app = App::new(None);
+    fn rdap_command_domain_routes_to_the_domain_query() {
+        let mut app = idle_app();
         let actions = app.rdap_command("example.com");
-        assert_eq!(app.tab, 0, ":rdap <domain> must stay on tab 0");
+        assert_eq!(
+            app.options.choice(LensKey::Rdap, OptId::RdapQuery),
+            Some(0),
+            ":rdap <domain> must select the domain query"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2196,22 +3295,22 @@ mod tests {
 
     #[test]
     fn enter_pane_allowed_for_bulk_lens_empty() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let bulk_idx = lenses::find_by_cmd_or_key("bulk").unwrap();
         app.lens = bulk_idx;
         assert_eq!(app.row_count(), 0, "no rows");
-        // Enter maps to KeyAction::EnterPane when focus is Nav.
+        // Enter maps to KeyAction::EnterPane from the Function section.
         key(&mut app, KeyCode::Enter);
         assert_eq!(
-            app.focus,
-            Focus::Pane,
+            app.section,
+            Section::Options,
             "bulk lens should allow EnterPane even with 0 rows",
         );
     }
 
     #[test]
     fn history_always_refetches_even_when_loaded() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.domain = Some("example.com".into());
         let hidx = history_lens_idx();
         app.lens = hidx;
@@ -2248,7 +3347,7 @@ mod tests {
 
     #[test]
     fn history_fetches_without_a_domain() {
-        let mut app = App::new(None); // no target domain
+        let mut app = idle_app(); // no target domain
         app.lens = history_lens_idx();
         let a = app.fetch_current(false);
         assert!(
@@ -2265,9 +3364,9 @@ mod tests {
 
     #[test]
     fn paste_appends_into_active_field() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.input_mode = InputMode::Field {
-            target: EditTarget::DiffB,
+            target: EditTarget::WatchAdd,
             buf: "a.com ".into(),
         };
         app.update(Msg::Input(Event::Paste("b.com c.com".into())));
@@ -2280,7 +3379,7 @@ mod tests {
 
     #[test]
     fn lens_filter_live_buffer_wins_then_commits_and_clears() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         // While the filter field is open, the live edit buffer is the active filter.
         app.input_mode = InputMode::Field {
             target: EditTarget::LensFilter,
@@ -2300,7 +3399,7 @@ mod tests {
 
     #[test]
     fn domain_switch_invalidates_other_lenses_inflight_fetches() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let _ = app.set_domain_and_fetch("a.com".into());
         // Simulate an in-flight DNS fetch for a.com on a non-current lens.
         let dns_idx = lenses::find_by_cmd_or_key("dns").unwrap();
@@ -2322,10 +3421,10 @@ mod tests {
 
     #[test]
     fn history_enter_with_filter_pivots_to_filtered_selection() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let idx = history_lens_idx();
         app.lens = idx;
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         app.states.insert(
             lenses::lenses()[idx].key,
             LensState::Loaded(LensData::History(vec![
@@ -2354,44 +3453,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rdap_tab_switch_without_default_req_drops_inflight_result() {
-        let mut app = App::new(None);
-        app.domain = Some("example.com".into());
-        let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
-        let rdap_key = lenses::lenses()[idx].key;
-        app.lens = idx;
-        // Simulate an in-flight domain-tab fetch.
-        app.fetch_gen.insert(rdap_key, 1);
-        app.states.insert(rdap_key, LensState::Loading);
-        // Switch to the IP tab with no resolved IP: there is no default
-        // request, so no new fetch is issued...
-        app.tab = 1;
-        let actions = app.refetch_for_tab();
-        assert!(
-            actions.is_empty(),
-            "IP tab without a resolved IP must not fetch, got {actions:?}",
-        );
-        // ...and the stale domain-tab result landing late must be dropped, not
-        // rendered as the IP tab's data.
-        let rdap: seer_core::RdapResponse =
-            serde_json::from_str("{}").expect("empty RDAP object deserializes");
-        app.update(Msg::Data {
-            lens: LensKey::Rdap,
-            gen: 1,
-            result: Ok(LensData::Rdap(Box::new(rdap))),
-        });
-        assert!(
-            !matches!(app.state_of(idx), LensState::Loaded(_)),
-            "stale domain result must not render as the IP/ASN tab's data",
-        );
-    }
-
     // ---- Theme tests ----
 
     #[test]
     fn theme_command_swaps_live_theme() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         assert_eq!(app.theme().name, "frappe", "Frappé must be the default");
         let frappe_base = app.theme().base;
         let actions = app.exec_command("theme latte");
@@ -2413,7 +3479,7 @@ mod tests {
 
     #[test]
     fn unknown_theme_errors_and_keeps_current_theme() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let _ = app.exec_command("theme latte");
         let actions = app.exec_command("theme mocha");
         assert!(actions.is_empty());
@@ -2438,7 +3504,7 @@ mod tests {
 
     #[test]
     fn set_theme_by_name_seam_round_trips() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         assert!(app.set_theme_by_name("latte"));
         assert_eq!(app.theme().name, "latte");
         assert!(app.set_theme_by_name("Frappé"), "accented alias must work");
@@ -2456,6 +3522,7 @@ mod tests {
     fn app_on_lens(domain: Option<&str>, lens: &str) -> App {
         let mut app = App::new(domain.map(str::to_string));
         let _ = app.take_startup_actions();
+        app.set_section(Section::Function);
         app.lens = lenses::find_by_cmd_or_key(lens).unwrap();
         app
     }
@@ -2463,7 +3530,7 @@ mod tests {
     #[test]
     fn ctrl_c_on_history_pane_shows_quit_hint_instead_of_clearing() {
         let mut app = app_on_lens(None, "history");
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         app.states
             .insert(LensKey::History, make_history_state("old.com"));
         let actions = chord(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -2487,11 +3554,12 @@ mod tests {
         let actions = chord(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(actions.is_empty(), "Ctrl-D on watch: {actions:?}");
 
-        // Bulk: Ctrl-R must not start a run, Alt-E must not overwrite the CSV.
+        // Bulk: Ctrl-↵ must not start a run, Alt-E must not overwrite the CSV.
         let mut app = app_on_lens(None, "bulk");
-        app.focus = Focus::Pane;
-        app.panes.bulk.domains = "a.com".into();
-        let actions = chord(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.set_section(Section::Details);
+        app.options
+            .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com".into());
+        let actions = chord(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
         assert!(actions.is_empty() && !app.panes.bulk.running, "{actions:?}");
         app.panes.bulk.rows.push(seer_core::bulk::BulkResult {
             operation: seer_core::bulk::BulkOperation::Lookup {
@@ -2505,10 +3573,10 @@ mod tests {
         let actions = chord(&mut app, KeyCode::Char('e'), KeyModifiers::ALT);
         assert!(actions.is_empty(), "Alt-E on bulk: {actions:?}");
 
-        // Follow: Ctrl-S must not start a run.
+        // Follow: Ctrl-↵ must not start a run.
         let mut app = app_on_lens(Some("example.com"), "follow");
-        app.focus = Focus::Pane;
-        let actions = chord(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.set_section(Section::Details);
+        let actions = chord(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
         assert!(
             actions.is_empty() && !app.panes.follow.running,
             "{actions:?}"
@@ -2518,21 +3586,22 @@ mod tests {
     #[test]
     fn shift_and_altgr_keys_keep_working_in_normal_mode() {
         // `G` arrives with SHIFT; it must still jump to the last lens.
-        let mut app = App::new(None);
+        let mut app = idle_app();
         chord(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(app.lens, lenses::lenses().len() - 1);
-        // `]` typed with AltGr (CONTROL|ALT on Windows) still switches tabs.
+        // `}` typed with AltGr (CONTROL|ALT on Windows) still jumps a group.
         let mut app = app_on_lens(None, "rdap");
+        let next = lenses::group_start(app.lens, true);
         chord(
             &mut app,
-            KeyCode::Char(']'),
+            KeyCode::Char('}'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
-        assert_eq!(app.tab, 1);
+        assert_eq!(app.lens, next);
     }
 
     #[test]
-    fn rdap_asn_cache_is_not_served_on_the_domain_tab() {
+    fn rdap_asn_cache_is_not_served_for_the_domain_query() {
         let rdap = |app: &mut App, gen| {
             let r: seer_core::RdapResponse = serde_json::from_str("{}").unwrap();
             app.update(Msg::Data {
@@ -2548,14 +3617,14 @@ mod tests {
             })
         };
 
-        // With a session domain: the revisit refetches the domain object.
+        // With a session domain: back on the Domain query the lens refetches
+        // the domain object.
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         let asn = app.exec_command("rdap AS15169");
         rdap(&mut app, gen_of(&asn).unwrap());
-        key(&mut app, KeyCode::Char('j'));
-        let back = key(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.tab, 0);
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 0);
+        let back = app.fetch_with_current(false);
         assert!(
             back.iter().any(|a| matches!(
                 a,
@@ -2565,35 +3634,16 @@ mod tests {
         );
 
         // Without one: nothing to refetch, but the ASN object must not render
-        // as the Domain tab's data.
-        let mut app = App::new(None);
+        // as the Domain query's data.
+        let mut app = idle_app();
         let asn = app.exec_command("rdap AS15169");
         rdap(&mut app, gen_of(&asn).unwrap());
-        key(&mut app, KeyCode::Char('j'));
-        key(&mut app, KeyCode::Char('k'));
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 0);
+        let _ = app.fetch_with_current(false);
         let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
         assert!(
             matches!(app.state_of(idx), LensState::Idle),
-            "stale ASN object served under the Domain tab"
-        );
-    }
-
-    #[test]
-    fn follow_interval_field_opens_empty_so_typing_replaces() {
-        let mut app = app_on_lens(Some("example.com"), "follow");
-        app.focus = Focus::Pane;
-        key(&mut app, KeyCode::Char('i'));
-        assert!(
-            matches!(&app.input_mode, InputMode::Field { target: EditTarget::FollowInterval, buf } if buf.as_str().is_empty()),
-            "got {:?}",
-            app.input_mode
-        );
-        key(&mut app, KeyCode::Char('6'));
-        key(&mut app, KeyCode::Char('0'));
-        key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            app.panes.follow.interval_secs, 60,
-            "was 3060 when prefilled"
+            "stale ASN object served for the Domain query"
         );
     }
 
@@ -2623,7 +3673,7 @@ mod tests {
 
     #[test]
     fn explicit_requests_mark_the_lens_loading() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let _ = app.rdap_command("8.8.8.8");
         let idx = lenses::find_by_cmd_or_key("rdap").unwrap();
         assert!(
@@ -2643,35 +3693,16 @@ mod tests {
         let _ = app.take_startup_actions();
         let _ = app.exec_command("diff a.com b.com");
         assert_eq!(app.panes.diff.a, "a.com");
-        app.focus = Focus::Pane;
-        let actions = key(&mut app, KeyCode::Enter);
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::Fetch { req: FetchReq::Diff { a, b }, .. } if a == "a.com" && b == "b.com"
-            )),
-            "↵ must re-run a.com ⇄ b.com, got {actions:?}"
+            matches!(
+                app.default_req(LensKey::Diff, "example.com"),
+                Some(FetchReq::Diff { a, b }) if a == "a.com" && b == "b.com"
+            ),
+            "the lens's request must be a.com ⇄ b.com"
         );
         // A new session target resets A to follow it again.
         let _ = app.set_domain_and_fetch("new.com".into());
         assert!(app.panes.diff.a.is_empty());
-    }
-
-    #[test]
-    fn compare_command_domain_drives_resolver_cycling() {
-        let mut app = App::new(Some("example.com".into()));
-        let _ = app.take_startup_actions();
-        let _ = app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
-        app.focus = Focus::Pane;
-        let actions = key(&mut app, KeyCode::Char('b'));
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::Fetch { req: FetchReq::Compare { domain, a, .. }, .. }
-                    if domain == "other.com" && a == "9.9.9.9"
-            )),
-            "`b` must re-run against other.com, got {actions:?}"
-        );
     }
 
     #[test]
@@ -2699,7 +3730,7 @@ mod tests {
 
     #[test]
     fn side_effect_toasts_are_shown_verbatim() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.update(Msg::Toast {
             tone: "ok",
             msg: "wrote seer-bulk-lookup.csv".into(),
@@ -2725,7 +3756,7 @@ mod tests {
             }))),
         );
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.focus, Focus::Pane);
+        assert_eq!(app.section, Section::Details);
         key(&mut app, KeyCode::Char('a'));
         assert!(matches!(
             app.input_mode,
@@ -2744,7 +3775,7 @@ mod tests {
         assert_eq!(parse_asn("ab64496"), None);
         assert_eq!(parse_asn("apple123"), None);
         assert_eq!(parse_asn("AS"), None);
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let actions = app.rdap_command("apple123");
         assert!(
             actions.iter().any(|a| matches!(
@@ -2785,7 +3816,7 @@ mod tests {
 
     #[test]
     fn paste_appends_into_command_buffer() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.input_mode = InputMode::Command("look".into());
         app.update(Msg::Input(Event::Paste("up x.com".into())));
         assert!(
@@ -2854,11 +3885,12 @@ mod tests {
     #[test]
     fn selection_is_clamped_when_a_refetch_returns_fewer_answers() {
         let mut app = dns_app_with(chained_dig(4));
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         key(&mut app, KeyCode::Char('G'));
         assert_eq!(app.sel, 4);
-        // `s` re-queries through another nameserver; its answer is shorter.
-        let actions = key(&mut app, KeyCode::Char('s'));
+        // Another nameserver re-queries the lens; its answer is shorter.
+        assert!(app.options.cycle(LensKey::Dns, OptId::Server, true));
+        let actions = app.fetch_with_current(false);
         let gen = fetch_gen_of(&actions);
         app.update(Msg::Data {
             lens: LensKey::Dns,
@@ -2872,7 +3904,7 @@ mod tests {
     #[test]
     fn slash_filters_the_dns_records_rows() {
         let mut app = dns_app_with(chained_dig(3));
-        app.focus = Focus::Pane;
+        app.set_section(Section::Details);
         key(&mut app, KeyCode::Char('/'));
         assert!(matches!(
             app.input_mode,
@@ -2898,18 +3930,14 @@ mod tests {
     }
 
     #[test]
-    fn the_trace_lens_fetches_a_trace_of_the_records_type() {
+    fn trace_results_load_with_one_row_per_hop() {
         let mut app = app_on_lens(Some("example.com"), "dns");
-        app.panes.dns.record_type = RecordType::MX;
         let actions = app.nav_to(LensKey::Trace.index());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 Action::Fetch {
-                    req: FetchReq::Trace {
-                        domain,
-                        record_type: RecordType::MX,
-                    },
+                    req: FetchReq::Trace { domain, .. },
                     ..
                 } if domain == "example.com"
             )),
@@ -2933,7 +3961,6 @@ mod tests {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         let actions = app.exec_command("dig @9.9.9.9 AAAA example.org");
-        assert_eq!(app.tab, 0);
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2947,10 +3974,6 @@ mod tests {
                 } if domain == "example.org" && ns == "9.9.9.9"
             )),
             "got {actions:?}"
-        );
-        assert_eq!(
-            app.panes.dns.slot_labels(),
-            ["system", "8.8.8.8", "1.1.1.1", "9.9.9.9"]
         );
 
         let actions = app.exec_command("dig example.org https +trace");
@@ -2980,7 +4003,7 @@ mod tests {
     /// has records of its own (usually a CNAME), so the target keeps it.
     #[test]
     fn dig_queries_a_www_host_as_typed() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         let actions = app.exec_command("dig www.seer.test");
         assert!(
             actions.iter().any(|a| matches!(
@@ -3085,13 +4108,14 @@ mod tests {
         assert!(has_fetch(&key(&mut app, KeyCode::Enter)));
     }
 
-    /// A new target, tab or request supersedes a lens's fetch: the cancel
+    /// A new target, option or request supersedes a lens's fetch: the cancel
     /// comes before any new fetch, so it cannot abort the replacement.
     #[test]
     fn superseded_fetches_are_cancelled_before_their_replacement() {
         let mut app = App::new(Some("a.com".into()));
         let _ = app.take_startup_actions();
-        key(&mut app, KeyCode::Char('2')); // WHOIS in flight too
+        key(&mut app, KeyCode::Char('j')); // WHOIS in flight too
+        assert_eq!(app.current_lens().key, LensKey::Whois);
         let actions = app.update(Msg::Input(Event::Paste(String::new())));
         assert!(actions.is_empty(), "a no-op update cancels nothing");
         app.input_mode = InputMode::Field {
@@ -3111,9 +4135,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{lens:?} not cancelled: {actions:?}"));
             assert!(cancel < first_fetch, "{actions:?}");
         }
-        // A tab switch supersedes the old tab's fetch.
-        app.lens = LensKey::Rdap.index();
-        let actions = key(&mut app, KeyCode::Char(']'));
+        // An option change supersedes the old request's fetch.
+        app.nav_to(LensKey::Rdap.index()); // RDAP, domain query in flight
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 2);
+        key(&mut app, KeyCode::Char('j'));
+        let actions = key(&mut app, KeyCode::Char('k'));
         assert!(matches!(
             actions.first(),
             Some(Action::CancelFetch(LensKey::Rdap))
@@ -3121,11 +4147,10 @@ mod tests {
     }
 
     /// `g`/`G` in the nav (and replaying a watch/history row, and the `/`
-    /// target) changed lens but kept the old tab, so the cache check saw a
-    /// tab mismatch and refetched — an Overview refetch records history
-    /// again.
+    /// target) land on the first row, and serve the cached Overview rather
+    /// than refetching it (an Overview refetch records history again).
     #[test]
-    fn every_lens_change_resets_tab_and_selection() {
+    fn every_lens_change_resets_selection() {
         let mut app = App::new(Some("example.com".into()));
         let _ = app.take_startup_actions();
         app.update(Msg::Data {
@@ -3134,27 +4159,29 @@ mod tests {
             result: Ok(empty_dig()),
         });
         assert!(matches!(app.state_of(0), LensState::Loaded(_)));
-        // Onto RDAP's ASN tab, then back with `g`.
+        // Onto RDAP with a stale selection, then back with `g`.
         app.lens = LensKey::Rdap.index();
-        app.tab = 2;
         app.sel = 4;
         let actions = key(&mut app, KeyCode::Char('g'));
-        assert_eq!((app.lens, app.tab, app.sel), (0, 0, 0));
+        assert_eq!((app.lens, app.sel), (0, 0));
         assert!(
             !has_fetch(&actions),
             "the cached Overview is served: {actions:?}"
         );
-        // `G` likewise lands on tab 0.
-        app.tab = 2;
+        // `G` likewise resets the selection.
+        app.sel = 4;
         key(&mut app, KeyCode::Char('G'));
-        assert_eq!((app.tab, app.sel), (0, 0));
-        // The `/` target from a tabbed lens: same domain, cached Overview.
+        assert_eq!(app.sel, 0);
+        // A new `/` target re-runs the lens it is on, from its first row.
         app.lens = LensKey::Rdap.index();
-        app.tab = 2;
+        app.sel = 4;
         key(&mut app, KeyCode::Char('/'));
-        let actions = key(&mut app, KeyCode::Enter);
-        assert_eq!((app.lens, app.tab), (0, 0));
-        assert!(!has_fetch(&actions), "{actions:?}");
+        app.input_mode = InputMode::Field {
+            target: EditTarget::Target,
+            buf: "other.com".into(),
+        };
+        key(&mut app, KeyCode::Enter);
+        assert_eq!((app.lens, app.sel), (LensKey::Rdap.index(), 0));
     }
 
     /// An invalid target used to become the session domain lowercased as
@@ -3190,7 +4217,7 @@ mod tests {
 
     #[test]
     fn pasted_control_characters_become_spaces() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         key(&mut app, KeyCode::Char('/'));
         app.update(Msg::Input(Event::Paste(
             "a.com\r\nb.com\tc\u{1b}[2J".into(),
@@ -3204,7 +4231,7 @@ mod tests {
     /// An idle tick used to redraw the whole frame ten times a second.
     #[test]
     fn idle_ticks_do_not_redraw() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         assert!(app.take_redraw(), "the first frame");
         app.update(Msg::Tick);
         assert!(!app.take_redraw(), "nothing animates");
@@ -3235,7 +4262,7 @@ mod tests {
 
     #[test]
     fn the_raw_view_scrolls_and_resets_on_lens_change() {
-        let mut app = App::new(None);
+        let mut app = idle_app();
         app.lens = LensKey::Dns.index();
         app.update(Msg::Data {
             lens: LensKey::Dns,
@@ -3248,9 +4275,9 @@ mod tests {
         assert!(lines > PAGE_ROWS, "fixture too short: {lines}");
         key(&mut app, KeyCode::PageDown);
         assert_eq!(app.raw_scroll, PAGE_ROWS);
-        // j/k scroll once the raw view is focused.
-        key(&mut app, KeyCode::Enter);
-        assert_eq!(app.focus, Focus::Pane);
+        // j/k scroll once the raw view is focused (Details).
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.section, Section::Details);
         key(&mut app, KeyCode::Char('j'));
         assert_eq!(app.raw_scroll, PAGE_ROWS + 1);
         key(&mut app, KeyCode::Char('k'));
@@ -3264,5 +4291,224 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char('j'));
         assert_eq!(app.raw_scroll, 0, "another lens starts at its top");
+    }
+
+    // ---- Options drive every request ----
+
+    /// Every declared option, changed from its default, changes what its
+    /// lens fetches or starts — so no field in the Options box is dead.
+    #[test]
+    fn every_option_changes_its_lens_request() {
+        use crate::tui::options::OptKind;
+        for lens in lenses::lenses() {
+            for spec in lens.options {
+                let mut app = App::new(Some("example.com".into()));
+                let _ = app.take_startup_actions();
+                app.panes.dns.resolved_ip = Some("192.0.2.1".into());
+                app.options
+                    .set_text(LensKey::Diff, OptId::SecondDomain, "example.org".into());
+                app.options
+                    .set_text(LensKey::Bulk, OptId::BulkDomains, "a.com b.com".into());
+                app.options
+                    .set_text(LensKey::Bulk, OptId::BulkFile, "list.txt".into());
+                // File is read only when Source names it.
+                if spec.id == OptId::BulkFile {
+                    app.options.set_choice(LensKey::Bulk, OptId::BulkSource, 1);
+                }
+                let before = run_signature(&mut app, lens.key);
+                match spec.kind {
+                    OptKind::Text { .. } => {
+                        let alt = if spec.id == OptId::BulkDomains {
+                            "c.com"
+                        } else {
+                            "other.org"
+                        };
+                        app.options.commit_text(lens.key, spec.id, alt).unwrap();
+                    }
+                    _ => assert!(app.options.cycle(lens.key, spec.id, true)),
+                }
+                let after = run_signature(&mut app, lens.key);
+                assert_ne!(before, after, "{} option {:?} is dead", lens.label, spec.id);
+            }
+        }
+    }
+
+    /// What a lens would fetch or start now, as text, for comparison.
+    fn run_signature(app: &mut App, key: LensKey) -> String {
+        match key {
+            LensKey::Follow => format!("{:?}", app.options.follow_run()),
+            LensKey::Bulk => format!("{:?}", app.options.bulk_run()),
+            _ => format!("{:?}", app.default_req(key, "example.com")),
+        }
+    }
+
+    #[test]
+    fn records_and_trace_keep_their_own_record_type() {
+        let mut app = app_on_lens(Some("example.com"), "dns");
+        app.options.set_record_type(LensKey::Dns, RecordType::MX);
+        let actions = app.nav_to(LensKey::Trace.index());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Fetch {
+                    req: FetchReq::Trace {
+                        record_type: RecordType::A,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_rdap_query_change_drops_the_cached_result() {
+        let mut app = app_on_lens(Some("example.com"), "rdap");
+        // Any loaded payload stands in for the domain result: only the
+        // request it was fetched for matters to the cache check.
+        app.states
+            .insert(LensKey::Rdap, LensState::Loaded(empty_dig()));
+        app.last_req
+            .insert(LensKey::Rdap, FetchReq::RdapDomain("example.com".into()));
+        app.options.set_choice(LensKey::Rdap, OptId::RdapQuery, 2); // ASN: no default req
+        let actions = app.fetch_with_current(false);
+        assert!(actions.is_empty());
+        assert!(
+            matches!(app.state_of(app.lens), LensState::Idle),
+            "domain result not re-served"
+        );
+    }
+
+    #[test]
+    fn commands_write_the_options() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.exec_command("dig @9.9.9.9 AAAA example.org");
+        assert_eq!(
+            app.options.record_type(LensKey::Dns),
+            Some(RecordType::AAAA)
+        );
+        assert_eq!(
+            app.options.server(LensKey::Dns, OptId::Server),
+            Some(Some("9.9.9.9".into()))
+        );
+        app.exec_command("dig example.org https +trace");
+        assert_eq!(
+            app.options.record_type(LensKey::Trace),
+            Some(RecordType::HTTPS)
+        );
+        app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
+        assert_eq!(
+            app.options.server(LensKey::Compare, OptId::ServerB),
+            Some(Some("8.8.4.4".into()))
+        );
+        app.exec_command("diff a.com b.com");
+        assert_eq!(
+            app.options.text(LensKey::Diff, OptId::SecondDomain),
+            Some("b.com".into())
+        );
+        app.exec_command("rdap AS15169");
+        assert_eq!(app.options.choice(LensKey::Rdap, OptId::RdapQuery), Some(2));
+    }
+
+    // Review Focus 5.
+    #[test]
+    fn a_new_domain_keeps_options_but_resets_command_overrides() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        app.options.set_record_type(LensKey::Dns, RecordType::MX);
+        app.exec_command("compare other.com 9.9.9.9 8.8.4.4");
+        let _ = app.set_domain_and_fetch("new.com".into());
+        assert_eq!(app.options.record_type(LensKey::Dns), Some(RecordType::MX));
+        assert!(app.panes.compare.domain.is_none());
+        assert!(matches!(
+            app.default_req(LensKey::Compare, "new.com"),
+            Some(FetchReq::Compare { domain, .. }) if domain == "new.com"
+        ));
+    }
+
+    #[test]
+    fn follow_and_bulk_start_from_their_options() {
+        let mut app = app_on_lens(Some("example.com"), "follow");
+        app.options
+            .commit_text(LensKey::Follow, OptId::Count, "5")
+            .unwrap();
+        let out = app.panes.handle_key(
+            LensKey::Follow,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Some("example.com"),
+            &app.options,
+        );
+        assert!(
+            matches!(
+                out,
+                Some(PaneOutcome::Action(Action::StartFollow(ref p))) if p.iterations == 5 && p.interval_secs == 30
+            ),
+            "got {out:?}"
+        );
+
+        // Bulk: Op and Domains come from the options.
+        let mut app = app_on_lens(Some("example.com"), "bulk");
+        assert!(app.options.cycle(LensKey::Bulk, OptId::BulkOp, true));
+        app.options
+            .commit_text(LensKey::Bulk, OptId::BulkDomains, "a.com b.com")
+            .unwrap();
+        let out = app.panes.handle_key(
+            LensKey::Bulk,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Some("example.com"),
+            &app.options,
+        );
+        assert!(
+            matches!(
+                out,
+                Some(PaneOutcome::Action(Action::StartBulk(ref p)))
+                    if p.op == "status" && p.domains == ["a.com", "b.com"]
+            ),
+            "got {out:?}"
+        );
+    }
+
+    /// Answers `fetch`'s request the way the event loop would.
+    fn answer(app: &mut App, actions: &[Action], lens: LensKey, data: LensData) {
+        app.update(Msg::Data {
+            lens,
+            gen: fetch_gen_of(actions),
+            result: Ok(data),
+        });
+    }
+
+    #[test]
+    fn an_ad_hoc_diff_survives_leaving_and_returning() {
+        let mut app = idle_app();
+        let actions = app.exec_command("diff a.com b.com");
+        answer(&mut app, &actions, LensKey::Diff, empty_dig());
+        assert!(matches!(
+            app.state_of(LensKey::Diff.index()),
+            LensState::Loaded(_)
+        ));
+        let _ = app.nav_to(LensKey::Whois.index());
+        let back = app.nav_to(LensKey::Diff.index());
+        assert!(!has_fetch(&back), "no refetch: {back:?}");
+        assert!(matches!(
+            app.state_of(LensKey::Diff.index()),
+            LensState::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn an_rdap_ip_result_without_a_resolved_ip_survives_leaving_and_returning() {
+        let mut app = App::new(Some("example.com".into()));
+        let _ = app.take_startup_actions();
+        let actions = app.exec_command("rdap 8.8.8.8");
+        answer(&mut app, &actions, LensKey::Rdap, empty_dig());
+        let _ = app.nav_to(LensKey::Whois.index());
+        let back = app.nav_to(LensKey::Rdap.index());
+        assert!(!has_fetch(&back), "no refetch: {back:?}");
+        assert!(matches!(
+            app.state_of(LensKey::Rdap.index()),
+            LensState::Loaded(_)
+        ));
     }
 }

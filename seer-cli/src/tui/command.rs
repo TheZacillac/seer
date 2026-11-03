@@ -156,7 +156,7 @@ pub fn parse(raw: &str) -> CmdOutcome {
             let usage = if head == "history" {
                 "usage: history (in the pane: ↵ replay · c twice clears all)"
             } else {
-                "usage: bulk (in the pane: d domains · f file · r run)"
+                "usage: bulk — set Op, Source and Domains/File in Options (3), ↵ to run"
             };
             return CmdOutcome::Invalid(usage.to_string());
         }
@@ -425,6 +425,19 @@ mod tests {
                 target: None
             }
         );
+    }
+
+    /// `bulk <args>` points at Options (where Op, Source and the inputs are
+    /// set now), not at the pane keys that were removed.
+    #[test]
+    fn bulk_usage_points_at_options() {
+        let CmdOutcome::Invalid(msg) = parse("bulk file.txt") else {
+            panic!("bulk with arguments is a usage error");
+        };
+        assert!(msg.contains("Options"), "{msg}");
+        for removed in ["d domains", "f file", "r run"] {
+            assert!(!msg.contains(removed), "names a removed key: {msg}");
+        }
     }
 
     #[test]

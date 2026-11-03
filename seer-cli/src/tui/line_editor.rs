@@ -42,6 +42,12 @@ impl LineEditor {
         self.cursor
     }
 
+    /// The text before and after the cursor, for a renderer that places the
+    /// caret itself (see `widgets::fit_caret`).
+    pub fn split_at_cursor(&self) -> (&str, &str) {
+        self.text.split_at(self.cursor)
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
@@ -262,6 +268,16 @@ mod tests {
         assert_eq!(e.as_str(), "@\\{}[]|~");
         e.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert_eq!(e.cursor(), 0, "Ctrl-A still moves home");
+    }
+
+    #[test]
+    fn split_at_cursor_follows_the_cursor() {
+        let mut e = ed("abc");
+        assert_eq!(e.split_at_cursor(), ("abc", ""));
+        e.home();
+        assert_eq!(e.split_at_cursor(), ("", "abc"));
+        e.right();
+        assert_eq!(e.split_at_cursor(), ("a", "bc"));
     }
 
     #[test]

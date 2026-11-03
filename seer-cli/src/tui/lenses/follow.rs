@@ -11,15 +11,16 @@ use crate::tui::theme::Theme;
 use crate::tui::widgets::page::{Block, Page, TableBlock};
 use crate::tui::widgets::{dot, gauge, or_dash};
 
-pub fn page(theme: &Theme, follow: &FollowState, spin: usize) -> Page {
-    // Title and gauge describe the run on screen; the editable settings (which
-    // only apply to the next run) are shown on the hints line instead, so
-    // editing `n` after a run can't produce e.g. "20/5 done".
-    let total = follow.run_total();
+pub fn page(theme: &Theme, follow: &FollowState, next: Option<(usize, u64)>, spin: usize) -> Page {
+    // Title and gauge describe the run on screen; the Options box shows the
+    // settings the NEXT run will use, so editing Count after a run can't
+    // produce e.g. "20/5 done".
+    let total = follow.run_total(next.map_or(0, |(n, _)| n));
     let interval = follow
         .last_run
+        .or(next)
         .map(|(_, secs)| secs)
-        .unwrap_or(follow.interval_secs);
+        .unwrap_or_default();
     let title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
 
     let ratio = if total > 0 {
@@ -42,13 +43,15 @@ pub fn page(theme: &Theme, follow: &FollowState, spin: usize) -> Page {
             theme.overlay0
         }),
     )]);
-    let hints_line = Line::from(vec![Span::styled(
-        format!(
-            "s start  ·  i interval ({}s)  ·  n count ({})  ·  x stop",
-            follow.interval_secs, follow.count
-        ),
-        Style::default().fg(theme.overlay0),
-    )]);
+
+    // An idle Follow has nothing on screen to say how a run begins.
+    let mut head = vec![gauge_line, status_line];
+    if !follow.running && follow.log.is_empty() {
+        head.push(Line::from(Span::styled(
+            "  ↵ to start",
+            Style::default().fg(theme.overlay0),
+        )));
+    }
 
     let log = Page::new("Change Log", theme.teal);
     let log = if follow.log.is_empty() {
@@ -105,7 +108,7 @@ pub fn page(theme: &Theme, follow: &FollowState, spin: usize) -> Page {
         ))
     };
     Page::new(title, theme.teal)
-        .push(Block::Lines(vec![gauge_line, status_line, hints_line]))
+        .push(Block::Lines(head))
         .push(Block::Gap)
         .push(Block::Panel(log))
 }
@@ -123,7 +126,8 @@ mod tests {
         follow: &FollowState,
         spin: usize,
     ) {
-        page::draw(f, area, theme, page(theme, follow, spin), false);
+        let next = Some((20, 30));
+        page::draw(f, area, theme, page(theme, follow, next, spin), false);
     }
     use crate::tui::test_util::render_text;
     use chrono::Utc;
@@ -224,7 +228,7 @@ mod tests {
 
     #[test]
     fn gauge_uses_the_runs_total_not_the_edited_count() {
-        // After a 20-check run, editing `n` to 5 must not turn the finished
+        // After a 20-check run, editing Count to 5 must not turn the finished
         // run's gauge into "20/5 done".
         let theme = Theme::frappe();
         let mut follow = FollowState {
@@ -236,16 +240,34 @@ mod tests {
             it.total_iterations = 20;
             follow.push(it);
         }
-        follow.count = 5;
 
-        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &follow, 0));
+        // The Count option now reads 5; the finished run's own total wins.
+        let text = render_text(80, 20, |f| {
+            page::draw(
+                f,
+                f.area(),
+                &theme,
+                page(&theme, &follow, Some((5, 30)), 0),
+                false,
+            );
+        });
         assert!(text.contains("20/20 done"), "got: {text}");
         assert!(!text.contains("20/5"), "got: {text}");
         assert!(text.contains("20 checks"), "title shows the run's count");
-        assert!(
-            text.contains("n count (5)"),
-            "hints show the next-run setting"
-        );
+    }
+
+    #[test]
+    fn an_idle_follow_says_how_to_start() {
+        let theme = Theme::frappe();
+        let idle = FollowState::default();
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &idle, 0));
+        assert!(text.contains("↵ to start"), "got: {text}");
+        let running = FollowState {
+            running: true,
+            ..Default::default()
+        };
+        let text = render_text(80, 20, |f| render(f, f.area(), &theme, &running, 0));
+        assert!(!text.contains("↵ to start"), "got: {text}");
     }
 
     #[test]
