@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-11-02
+
 ### Changed
 - `rustyline` 18 → 19. The REPL's file-history API is unchanged, but
   rustyline 19 uses the `cfg_select!` macro, which raises the workspace MSRV
@@ -2233,7 +2235,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.57.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.58.0...HEAD
+[0.58.0]: https://github.com/TheZacillac/seer/compare/v0.57.0...v0.58.0
 [0.57.0]: https://github.com/TheZacillac/seer/compare/v0.56.0...v0.57.0
 [0.56.0]: https://github.com/TheZacillac/seer/compare/v0.55.0...v0.56.0
 [0.55.0]: https://github.com/TheZacillac/seer/compare/v0.54.0...v0.55.0
