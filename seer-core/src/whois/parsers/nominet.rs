@@ -145,6 +145,12 @@ pub(super) fn parse(domain: &str, server: &str, raw: &str) -> WhoisResponse {
                 // sentences in place of a value.
                 _ if value.starts_with("No registrar listed")
                     || value.starts_with("No registration status listed") => {}
+                // "No name servers listed." likewise; it also ends the
+                // section, which would otherwise stay open past its blank
+                // line (no host yet) and swallow the next indented line.
+                Section::NameServers if value.starts_with("No name servers listed") => {
+                    current_section = Section::None;
+                }
                 Section::Registrar if registrar.is_none() => {
                     // Drop Nominet's `[Tag = EXAMPLE]` and Island Networks'
                     // `(http://…)` suffixes.
@@ -579,5 +585,17 @@ WHOIS lookup made on Thu, 1 Oct 2026 at 19:14:26 BST\n";
         assert!(r.registrar.is_none(), "{:?}", r.registrar);
         assert!(r.status.is_empty(), "{:?}", r.status);
         assert_eq!(r.nameservers, vec!["nsa.nic.uk"]);
+    }
+
+    /// Regression: the sentence Nominet prints for an undelegated domain
+    /// became a nameserver named "no".
+    #[test]
+    fn no_name_servers_listed_is_not_a_nameserver() {
+        let raw = "    Domain name:\n        example.co.uk\n\n    Registrar:\n        \
+                   Example Ltd [Tag = EXAMPLE]\n\n    Name servers:\n        \
+                   No name servers listed.\n\n    WHOIS lookup made at 12:00:00 01-Jan-2025\n";
+        let r = parse("example.co.uk", "whois.nic.uk", raw);
+        assert!(r.nameservers.is_empty(), "{:?}", r.nameservers);
+        assert!(r.registrar.is_some());
     }
 }

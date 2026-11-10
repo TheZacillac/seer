@@ -429,9 +429,11 @@ enum RedirectOutcome {
         target: String,
         qualifier: Option<String>,
     },
-    /// The chain cannot be evaluated (a permerror, or a macro seer does not
-    /// expand).
+    /// The chain is a permerror: receivers cannot evaluate it either.
     Failed { target: String, reason: String },
+    /// The chain is valid but seer cannot evaluate it (an RFC 7208 §7 macro
+    /// in the target, which only a receiver can expand).
+    Unevaluated { target: String, reason: String },
     /// A DNS lookup on the chain failed: the effective policy is unknown.
     LookupFailed { target: String, reason: String },
 }
@@ -549,6 +551,16 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
                 format!(
                     "SPF redirect={target} could not be evaluated ({reason}) — receivers get \
                      no usable SPF result."
+                ),
+            );
+        }
+        (SpfTerminal::Redirect(_), Some(RedirectOutcome::Unevaluated { target, reason })) => {
+            return settled(
+                PostureVerdict::Unknown,
+                None,
+                format!(
+                    "SPF redirect={target} was not evaluated ({reason}) — the effective SPF \
+                     policy is unknown."
                 ),
             );
         }
@@ -931,7 +943,7 @@ async fn follow_spf_redirect(dns: Dns<'_>, first_target: String) -> RedirectOutc
     let mut target = first_target;
     for _ in 0..MAX_SPF_LOOKUPS {
         if target.contains('%') {
-            return RedirectOutcome::Failed {
+            return RedirectOutcome::Unevaluated {
                 target,
                 reason: "it uses SPF macros, which seer does not expand".to_string(),
             };
@@ -1911,5 +1923,21 @@ mod tests {
             let posture = lookup_email_posture(&resolver, host, None).await.unwrap();
             assert_eq!(posture.dmarc.verdict, PostureVerdict::Strict, "{host}");
         }
+    }
+
+    /// Regression: a legal `redirect=` with a macro (RFC 7208 §6.1) was
+    /// graded a permerror ("receivers get no usable SPF result").
+    #[tokio::test]
+    async fn a_macro_redirect_is_unknown_not_a_permerror() {
+        let port = spawn_mock_dns_fn(|q, t| match (q, t) {
+            ("macro.test", WireType::TXT) => txt("v=spf1 redirect=%{d}._spf.esp.test"),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let posture = lookup_email_posture(&mock_dns_resolver_default(port), "macro.test", None)
+            .await
+            .unwrap();
+        assert_eq!(posture.spf.verdict, PostureVerdict::Unknown);
+        assert_eq!(posture.spf.permerror, None);
     }
 }

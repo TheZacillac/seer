@@ -126,14 +126,18 @@ def http_error(exc: Exception, message: str = "Request failed") -> HTTPException
     exception (an unclassified 500) is logged with its traceback.
     """
     status = http_status_for(exc)
+    # The text can echo the caller's own input (an invalid domain keeps its
+    # percent-decoded newlines), so it is cleaned before it reaches a log
+    # line: one record per event, no control bytes.
+    text = clean_message(str(exc))
     if status < 500:
-        logger.info("API request rejected (%d): %s", status, exc)
+        logger.info("API request rejected (%d): %s", status, text)
     elif isinstance(
         exc, TimeoutError | ConnectionError | seer.SeerError | ServiceUnavailable | ServerBusy
     ):
-        logger.warning("API request failed (%d): %s", status, exc)
+        logger.warning("API request failed (%d): %s", status, text)
     else:
-        logger.exception("API request failed: %s", exc)
+        logger.exception("API request failed: %s", text)
     return HTTPException(status_code=status, detail=safe_error_message(exc, message))
 
 

@@ -774,6 +774,7 @@ async fn execute_command(
             output: csv,
             progress,
         } => {
+            check_no_quiet("bulk", output, "use --format json for machine output")?;
             let request = bulk::BulkRequest {
                 operation,
                 input: file,
@@ -794,6 +795,7 @@ async fn execute_command(
                 server,
                 changes_only,
             };
+            check_no_quiet("follow", output, "use --format json for machine output")?;
             let args = dns_args::parse_follow(&args, flags)?;
             // Honor the config file's DNS timeout like `dig` does.
             let follower = seer_core::DnsFollower::from_config(config);
@@ -945,6 +947,18 @@ fn dig_query(
 /// `--short` is a plain-text output mode of its own (bare values, whatever
 /// `--format` says), while `-q`/`--fields` select from the JSON result — so
 /// asking for both is a usage error rather than one silently winning.
+/// `-q`/`--fields` shape a single result; a command that streams many (bulk,
+/// follow) has none to shape, so the flags are a usage error there rather
+/// than silently ignored.
+fn check_no_quiet(command: &str, output: &Output, instead: &str) -> Result<(), String> {
+    if output.quiet {
+        return Err(format!(
+            "-q/--fields do not apply to `{command}`; {instead}"
+        ));
+    }
+    Ok(())
+}
+
 fn check_short_output(short: bool, quiet: bool, fields: bool) -> Result<(), String> {
     if short && (quiet || fields) {
         return Err(
@@ -1301,6 +1315,21 @@ mod dig_cli_tests {
         }
         assert!(query(&["--format", "json", "dig", "example.com", "+short"]).is_ok());
         assert!(query(&["-q", "--fields", "status", "dig", "example.com"]).is_ok());
+    }
+
+    /// Regression: `-q`/`--fields` were silently ignored by `bulk` and
+    /// `follow`, which printed their usual prose.
+    #[test]
+    fn quiet_flags_are_a_usage_error_on_streaming_commands() {
+        let quiet = super::Output::new(
+            super::OutputFormat::Human,
+            false,
+            Some(vec!["domain".into()]),
+        );
+        let err = super::check_no_quiet("bulk", &quiet, "use --format json").unwrap_err();
+        assert!(err.contains("-q/--fields") && err.contains("bulk"), "{err}");
+        let plain = super::Output::new(super::OutputFormat::Json, false, None);
+        assert!(super::check_no_quiet("bulk", &plain, "").is_ok());
     }
 }
 

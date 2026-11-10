@@ -93,11 +93,20 @@ pub(crate) fn assess(host: &str, chain: &[String]) -> HttpsUpgradeReport {
         .and_then(|u| u.host_str())
         .is_some_and(|final_host| same_registrable(host, final_host));
     let final_https = parsed.last().is_some_and(is_https);
+    // The site upgraded if any hop after the first is HTTPS on its own
+    // registrable domain — where the chain goes next (an SSO or brand domain)
+    // does not undo that.
+    let own_https_hop = parsed.iter().skip(1).any(|u| {
+        is_https(u)
+            && u.as_ref()
+                .and_then(|u| u.host_str())
+                .is_some_and(|hop| same_registrable(host, hop))
+    });
     HttpsUpgradeReport {
         host: host.to_string(),
         listening: true,
         chain: chain.to_vec(),
-        upgraded: final_https && same_site,
+        upgraded: final_https && (same_site || own_https_hop),
         first_hop_https: parsed.get(1).is_some_and(is_https),
         cross_domain: last.is_some() && !same_site,
     }
@@ -282,5 +291,26 @@ mod tests {
         // assessment of an empty chain.
         let r = check_with(&GuardedFetcher::new().allowing_private_hosts(), "exa mple").await;
         assert!(r.is_err(), "{r:?}");
+    }
+
+    /// Regression: upgrading on the site's own host and then redirecting to
+    /// another domain was reported as "HTTP does not redirect to HTTPS".
+    #[test]
+    fn an_upgrade_followed_by_a_cross_domain_hop_is_still_an_upgrade() {
+        let r = assess(
+            "example.com",
+            &chain(&[
+                "http://example.com/",
+                "https://example.com/",
+                "https://login.other.test/",
+            ]),
+        );
+        assert!(r.upgraded && r.cross_domain && r.first_hop_https, "{r:?}");
+        // Straight to another domain is still not this site's upgrade.
+        let r = assess(
+            "example.com",
+            &chain(&["http://example.com/", "https://other.test/"]),
+        );
+        assert!(!r.upgraded && r.cross_domain, "{r:?}");
     }
 }

@@ -71,10 +71,17 @@ def vet_host(host: str, port: int = 443) -> None:
     A hostname passes unchecked; see the module docs for why. The literal is
     recognized here and vetted by ``seer.validate_public_host`` (core's one
     reserved-range policy), which resolves nothing for a literal.
+
+    A scoped address (``fe80::1%eth0``) is not a literal to core: Python
+    accepts the zone, Rust's parser does not, so core would resolve it as a
+    hostname — and whether that fails would reveal which interfaces this host
+    has. It is left to core's own validation, which rejects it as a name.
     """
     try:
-        ipaddress.ip_address(host)
+        literal = ipaddress.ip_address(host)
     except ValueError:
+        return
+    if getattr(literal, "scope_id", None):
         return
     seer.validate_public_host(host, port)
 

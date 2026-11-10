@@ -44,6 +44,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but `Sec-Fetch-Site: cross-site` gets 403. A request body that fails
   validation returns 422 without echoing the input (NaN, Infinity or a lone
   surrogate used to produce a 500).
+- **Availability.** A throttle notice on a short `%`/`#` comment line
+  (DENIC's "access control limit exceeded") is a refusal, so the verdict is
+  inconclusive instead of guessed from DNS.
+- **WHOIS parsing.** Nominet's "No name servers listed." is no longer a
+  nameserver named `no`. Dates with a `CLT`/`CLST` zone (.cl) parse; a
+  two-digit-year date is refused instead of read as the year 25.
+- **RDAP.** URLs carrying credentials are refused, and a redirect may only
+  target port 443.
+- **Lookup errors.** IPv6 literals that start or end with `::` are redacted
+  from public error text.
+- **Email posture.** An SPF `redirect=` containing a macro is unknown, not a
+  permerror. A DKIM selector record with a `v=` other than `DKIM1` is not a
+  key.
+- **Audit.** A site that upgrades to HTTPS on its own domain and then
+  redirects elsewhere no longer gets `web.upgrade.missing`.
+- **DNS.** A TXT record's `text` is decoded across its character-strings,
+  so a character split between two of them survives.
+- **seer-api.** The multi-worker check recognizes every spelling of the
+  in-memory rate-limit store, and a blank `SEER_RATE_LIMIT` means the
+  default. Control characters are stripped from logged error text and
+  request paths. A scoped IPv6 address (`fe80::1%eth0`) is no longer
+  resolved by the SSRF pre-check.
+
+### Changed
+- `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
+  silently ignored); use `--format json`.
+- TUI: a `:` command with extra arguments (`:prop example.com MX`,
+  `:compare … MX`) is refused instead of dropping them; `:compare` accepts
+  `@server` spellings.
+- An unknown key or section in `~/.seer/config.toml` prints a warning, and
+  `seer doctor` reports it; the file still loads.
+- **seer-api (breaking for clients reading the body):** the API's own 429
+  is `{"detail": "Rate limit exceeded: …"}` with a `Retry-After` header,
+  matching every other error (it was `{"error": …}`).
 
 ## [0.58.0] - 2026-11-02
 

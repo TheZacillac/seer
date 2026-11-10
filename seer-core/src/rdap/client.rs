@@ -682,10 +682,37 @@ fn parse_rdap_url(url: &str) -> Result<(String, u16)> {
             url
         )));
     }
+    // No credentials, as `net::validate_http_url` rules: reqwest would turn
+    // userinfo into an `Authorization` header on a request seer originates.
+    // The URL is not echoed — it carries them.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(SeerError::RdapError(
+            "RDAP URL carries credentials — request blocked".to_string(),
+        ));
+    }
     let host = crate::net::url_host(&parsed)
         .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
     Ok((host, port))
+}
+
+/// Holds a server-supplied redirect target to the standard HTTPS port, so a
+/// redirect chain cannot be used to probe other ports of a public host (the
+/// rule `net::validate_http_url` applies to every HTTP probe). Bootstrap
+/// base URLs are IANA's and keep whatever port they name. `allow_reserved`
+/// is the test seam, with the same loopback-only reach as in
+/// [`send_rdap_request`]: fixtures listen on ephemeral ports.
+fn vet_redirect_port(target: &str, allow_reserved: bool) -> Result<()> {
+    if allow_reserved && is_loopback_url(target) {
+        return Ok(());
+    }
+    let (_, port) = parse_rdap_url(target)?;
+    if port != 443 {
+        return Err(SeerError::RdapError(format!(
+            "RDAP redirect to non-standard port {port} blocked"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves an RDAP host through the shared SSRF guard
@@ -947,6 +974,7 @@ async fn query_rdap_attempt(
             ));
         }
         let next = resolve_redirect_target(&current, location).map_err(|e| (e, None))?;
+        vet_redirect_port(&next, allow_reserved).map_err(|e| (e, None))?;
         if visited.contains(&next) {
             return Err((
                 SeerError::RdapError("RDAP redirect loop detected".to_string()),
@@ -2340,5 +2368,21 @@ mod tests {
 
         *BOOTSTRAP_CACHE.write().await = None;
         *BOOTSTRAP_LAST_ATTEMPT.write().await = None;
+    }
+
+    /// Regression: redirect targets were held to https and public addresses
+    /// only, not to the shared URL policy's "no credentials, standard port".
+    #[test]
+    fn rdap_urls_refuse_credentials_and_redirects_refuse_other_ports() {
+        assert!(parse_rdap_url("https://user:pw@rdap.example.com/domain/x").is_err());
+        assert!(parse_rdap_url("https://user@rdap.example.com/domain/x").is_err());
+        assert!(vet_redirect_port("https://rdap.example.com:8443/domain/x", false).is_err());
+        vet_redirect_port("https://rdap.example.com/domain/x", false).unwrap();
+        vet_redirect_port("https://rdap.example.com:443/domain/x", false).unwrap();
+        // A bootstrap base URL may name its own port.
+        assert_eq!(
+            parse_rdap_url("https://rdap.example.com:8443/").unwrap().1,
+            8443
+        );
     }
 }

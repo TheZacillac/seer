@@ -4,6 +4,7 @@ import hmac
 import ipaddress
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
@@ -14,7 +15,6 @@ from fastapi.responses import JSONResponse
 from limits import parse_many as _parse_rate_limits
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.routing import Route
 
@@ -153,8 +153,10 @@ def _mcp_rate_ok(client_ip: str) -> bool:
     """
     global _mcp_rate_values
     if _mcp_rate_values is None:
+        # Blank counts as unset, as for the other variables: parsing "" would
+        # raise on every /mcp request.
         _mcp_rate_values = _parse_rate_limits(
-            os.environ.get("SEER_RATE_LIMIT", "30/minute")
+            (os.environ.get("SEER_RATE_LIMIT") or "").strip() or "30/minute"
         )
     window = mcp_rate_limiter()
     return all(window.hit(item, "mcp", client_ip) for item in _mcp_rate_values)
@@ -257,6 +259,32 @@ def _fetch_site_blocked(origin: str, fetch_site: str) -> bool:
     if origin or _api_key():
         return False
     return fetch_site.strip().lower() == "cross-site"
+
+
+def _is_memory_storage(storage_uri: str) -> bool:
+    """Whether ``storage_uri`` selects the per-process in-memory store.
+
+    ``limits`` picks the backend by URL scheme, so ``MEMORY://``,
+    ``memory://x``, ``async+memory://`` and a value with stray whitespace all
+    mean the same store as ``memory://``.
+    """
+    scheme = storage_uri.strip().partition("://")[0].lower()
+    return scheme.rpartition("+")[2] == "memory"
+
+
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """429 for the API's own limit, in the ``{"detail": …}`` shape every
+    other error uses, with ``Retry-After`` (slowapi's stock handler answers
+    ``{"error": …}`` and no header)."""
+    response = JSONResponse(
+        {"detail": f"Rate limit exceeded: {exc.detail}"}, status_code=429
+    )
+    current = getattr(request.state, "view_rate_limit", None)
+    if current is not None:
+        item, args = current
+        reset_at = limiter.limiter.get_window_stats(item, *args)[0]
+        response.headers["Retry-After"] = str(max(1, int(reset_at - time.time()) + 1))
+    return response
 
 
 def _validation_error_handler(request: Request, exc: RequestValidationError):
@@ -400,7 +428,7 @@ async def lifespan(_app: FastAPI):
         workers = env_int("WEB_CONCURRENCY", 1, min_value=1)
     else:
         workers = env_int("UVICORN_WORKERS", 1, min_value=1)
-    if workers > 1 and storage_uri == "memory://":
+    if workers > 1 and _is_memory_storage(storage_uri):
         log.error(
             "Multi-worker deployment (WEB_CONCURRENCY=%d) requires "
             "SEER_RATE_LIMIT_STORAGE (e.g. redis://host:6379). Refusing to "
@@ -452,7 +480,7 @@ app = FastAPI(
 
 # Add rate limiter to app state and exception handler
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
 # Body size cap — reject oversized payloads with 413 before they hit

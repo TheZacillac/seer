@@ -723,6 +723,11 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
+| `ARCANUM_LOG_LEVEL` | Logging level or filter for the CLI and the bindings; takes precedence over `RUST_LOG` | — |
+| `ARCANUM_LOG_FORMAT` | Log line format: `text` or `json` | `text` |
+| `ARCANUM_LOG_FILE` | `1` / `true` / `yes` also writes a daily-rotated log file | off |
+| `ARCANUM_LOG_DIR` | Directory for that log file | `~/.arcanum/logs` |
+| `ARCANUM_OTEL_ENDPOINT` | OTLP endpoint for trace export (builds with the `otel` feature only) | — |
 | `SEER_LOG_LEVEL` | API log level; `ARCANUM_LOG_LEVEL` takes precedence when set | `INFO` |
 | `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting which domains may be queried | — |
 | `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` (without it, requests arriving on a non-loopback interface get a 503 however the server was started) | `127.0.0.1` |
@@ -737,6 +742,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_REQUEST_TIMEOUT` | Per-request deadline (seconds) covering the SSRF pre-check, the core call and bulk jobs (slot wait included); on expiry the client gets a 504 (a stream: an `error` event), or a 503 when it was still waiting for a bulk slot. `0` disables (a bulk job then waits for a slot as long as it takes) | `0` |
 | `SEER_DISPATCH_THREADS` | Max threads in the pool running blocking core calls (REST + `/mcp`); at least `2` | `50` |
 | `SEER_MAX_CONCURRENT_BULK` | Max in-flight bulk jobs per worker process, shared by every `/bulk` and `/bulk/stream` route and the MCP `seer_bulk_*` tools; clamped to `SEER_DISPATCH_THREADS` − 1 so single-domain requests always keep a thread. `SEER_MAX_CONCURRENT_STREAMS` (its old, streams-only name) is still read when this is unset | `8` |
+| `SEER_MAX_CONCURRENT_STREAMS` | Former name of `SEER_MAX_CONCURRENT_BULK`; still read when that is unset | — |
 | `SEER_TRUST_PROXY` | Trust `X-Forwarded-For` from `SEER_TRUSTED_PROXY_IPS` | `false` |
 | `SEER_TRUSTED_PROXY_IPS` | Comma-separated IPs allowed to set `X-Forwarded-For` | — |
 | `SEER_MCP_ALLOWED_HOSTS` | Comma-separated `Host:` values for the MCP `/mcp` endpoint — setting this turns on DNS-rebinding protection | — |

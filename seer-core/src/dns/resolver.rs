@@ -1592,12 +1592,17 @@ pub(crate) fn convert_rdata(
         (RecordType::NS, HickoryRData::NS(ns)) => Some(RecordData::NS {
             nameserver: names.spell(&ns.0),
         }),
-        (RecordType::TXT, HickoryRData::TXT(txt)) => Some(RecordData::txt(
-            txt.txt_data
+        // `text` is decoded from the joined bytes: a multi-byte character may
+        // straddle two character-strings (they split at 255 bytes, not at a
+        // character boundary), and decoding each alone would garble it.
+        (RecordType::TXT, HickoryRData::TXT(txt)) => Some(RecordData::TXT {
+            text: String::from_utf8_lossy(&txt.txt_data.concat()).into_owned(),
+            strings: txt
+                .txt_data
                 .iter()
                 .map(|data| String::from_utf8_lossy(data).into_owned())
                 .collect(),
-        )),
+        }),
         (RecordType::SOA, HickoryRData::SOA(soa)) => Some(RecordData::SOA {
             mname: names.spell(&soa.mname),
             rname: names.spell(&soa.rname),
@@ -2878,6 +2883,22 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// Regression: each TXT character-string was decoded on its own, so a
+    /// character split across two of them became replacement characters.
+    #[test]
+    fn txt_text_is_decoded_across_character_string_boundaries() {
+        let txt = hickory_resolver::proto::rr::rdata::TXT::from_bytes(vec![b"caf\xC3", b"\xA9"]);
+        let data = convert_rdata(
+            RecordType::TXT,
+            &HickoryRData::TXT(txt),
+            NameSpelling::Ascii,
+        );
+        let Some(RecordData::TXT { text, .. }) = data else {
+            panic!("not a TXT record: {data:?}");
+        };
+        assert_eq!(text, "café");
     }
 
     /// The memo holds at most `MAX_CUSTOM_RESOLVERS` specs, dropping the
