@@ -121,6 +121,13 @@ pub async fn run_bulk(
         }
     };
 
+    // Checked before the run: discovering an unwritable path afterwards
+    // would throw away every result.
+    if let Some(csv_path) = &csv_path {
+        crate::utils::ensure_writable(csv_path)
+            .map_err(|e| format!("Cannot write output file {csv_path}: {e}"))?;
+    }
+
     eprintln!("{}", bulk_banner(domains.len(), &request.operation));
     let executor = seer_core::BulkExecutor::from_config(config);
     let results = match (mode != ProgressMode::None).then(|| BulkBar::new(operations.len())) {
@@ -136,10 +143,18 @@ pub async fn run_bulk(
     if let Some(rendered) = crate::payload::structured(&results, format) {
         println!("{rendered}");
     }
-    if let Some(csv_path) = &csv_path {
-        write_bulk_csv(&results, &request.operation, csv_path)?;
-        report(&format!("Results written to: {}", csv_path.ctp_green()));
-    }
+    // A write that still fails (the disk filled during the run) is reported
+    // after the summary and failures, which are then the only record.
+    let csv_error = match &csv_path {
+        Some(csv_path) => match write_bulk_csv(&results, &request.operation, csv_path) {
+            Ok(()) => {
+                report(&format!("Results written to: {}", csv_path.ctp_green()));
+                None
+            }
+            Err(e) => Some(e),
+        },
+        None => None,
+    };
     report(&bulk_summary(&results));
     // Failures already streamed by `--progress verbose|failures` aren't
     // repeated; otherwise they would be visible only inside the CSV/JSON.
@@ -149,6 +164,10 @@ pub async fn run_bulk(
         for result in failures {
             report(&failure_line(result));
         }
+    }
+
+    if let Some(e) = csv_error {
+        return Err(e);
     }
 
     Ok(BulkTally {

@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from limits import parse_many as _parse_rate_limits
@@ -243,6 +244,35 @@ def _origin_blocked(origin: str, allowed: list[str]) -> bool:
     return not _is_loopback_host(_header_host(origin))
 
 
+def _fetch_site_blocked(origin: str, fetch_site: str) -> bool:
+    """Whether a browser request that carries no Origin is a drive-by.
+
+    Browsers omit ``Origin`` on no-cors GETs (``<img>``, ``<script>``, a
+    top-level navigation), so :func:`_origin_blocked` alone lets a page on
+    another site drive the keyless API with one. They do send
+    ``Sec-Fetch-Site`` on those requests, and a page cannot forge it:
+    ``cross-site`` with no key is refused. Non-browser clients send neither
+    header and pass; with ``SEER_API_KEY`` set, auth already refuses these.
+    """
+    if origin or _api_key():
+        return False
+    return fetch_site.strip().lower() == "cross-site"
+
+
+def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """422 for a body that fails validation, without echoing the input.
+
+    FastAPI's default handler includes the offending value, which Starlette
+    cannot encode when it is NaN, Infinity or a lone surrogate — turning a
+    client error into a 500 with a traceback.
+    """
+    detail = [
+        {"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+        for e in exc.errors()
+    ]
+    return JSONResponse({"detail": detail}, status_code=422)
+
+
 def _mcp_origin_blocked(origin: str) -> bool:
     """:func:`_origin_blocked` for /mcp.
 
@@ -423,6 +453,7 @@ app = FastAPI(
 # Add rate limiter to app state and exception handler
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
 # Body size cap — reject oversized payloads with 413 before they hit
 # any router. Default 64KB is generous for a 100-domain bulk request
@@ -496,7 +527,9 @@ async def auth_middleware(request: Request, call_next):
             return JSONResponse(
                 {"detail": "rate limit exceeded"}, status_code=429
             )
-    elif _origin_blocked(origin, _csv_env("SEER_CORS_ORIGINS")):
+    elif _origin_blocked(origin, _csv_env("SEER_CORS_ORIGINS")) or _fetch_site_blocked(
+        origin, request.headers.get("sec-fetch-site", "")
+    ):
         return JSONResponse(
             {
                 "detail": "cross-origin request blocked; set "

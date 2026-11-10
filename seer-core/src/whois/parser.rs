@@ -441,6 +441,21 @@ impl WhoisResponse {
         !self.has_registration_fields() && self.nameservers.is_empty()
     }
 
+    /// True when a status affirms the registration itself: `active` (DENIC's
+    /// `connect`), `ok`, `registered`, or an EPP `client…`/`server…` code. A
+    /// record can carry one with no registrar, dates or nameservers — a .de
+    /// domain delegated without `Nserver:` lines — and must still read as
+    /// registered rather than fall to the DNS tie-break. Other statuses
+    /// (`available`, `reserved`, `invalid`, …) prove nothing either way.
+    pub(crate) fn has_registered_status(&self) -> bool {
+        self.status.iter().any(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "active" | "ok" | "registered" | "connect")
+                || s.starts_with("client")
+                || s.starts_with("server")
+        })
+    }
+
     /// True when any registration field at all was extracted: the
     /// [`is_thin`](Self::is_thin) fields or a status.
     pub(crate) fn has_any_registry_field(&self) -> bool {
@@ -708,6 +723,11 @@ const AVAILABILITY_SENTENCE_PATTERNS: &[&str] = &[
 /// [`NON_AVAILABILITY_WORDS`].
 const NON_AVAILABILITY_PATTERNS: &[&str] = &[
     "not available", // "...is not available for registration."
+    // Other negations of the same sentence, which contain the positive
+    // "available for registration" without the literal "not available".
+    "not currently available",
+    "no longer available",
+    "isn't available",
     // Reserved-status phrasings. Deliberately NOT the bare word "reserved":
     // nearly every WHOIS body ends with an "All rights reserved." copyright
     // footer, and matching it would misroute genuinely-unregistered domains
@@ -741,6 +761,7 @@ const NON_AVAILABILITY_WORDS: &[&str] = &[
     "denied",
     "refused",
     "blocked",
+    "unavailable", // "This domain is unavailable for registration."
 ];
 
 /// True when a normalized (lowercased, single-spaced) line negates, refuses
@@ -1984,6 +2005,33 @@ Name Server: ns1.example.com
                 "must NOT detect available from: {raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn negated_available_for_registration_is_not_available() {
+        // Regression: only the literal "not available" vetoed the positive
+        // "available for registration" substring.
+        for raw in [
+            "This domain is unavailable for registration.\n",
+            "This name is not currently available for registration.\n",
+            "Name no longer available for registration\n",
+            "This name isn't available for registration\n",
+        ] {
+            let r = make_response(raw);
+            assert!(!r.is_available(), "{raw:?}");
+            assert!(r.indicates_registry_refusal(), "{raw:?}");
+        }
+        // The word gate keeps a domain that merely contains the word.
+        assert!(make_response("No match for UNAVAILABLE.COM\n").is_available());
+        // Only a status that affirms registration counts as one.
+        let status = |s: &str| WhoisResponse {
+            status: vec![s.to_string()],
+            ..make_response("")
+        };
+        assert!(status("active").has_registered_status());
+        assert!(status("clientTransferProhibited").has_registered_status());
+        assert!(!status("available").has_registered_status());
+        assert!(!status("reserved").has_registered_status());
     }
 
     #[test]

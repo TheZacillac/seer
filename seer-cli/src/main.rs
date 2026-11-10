@@ -678,7 +678,7 @@ fn handle_quiet_output<T: serde::Serialize>(value: &T, fields: &Option<Vec<Strin
 fn print_error(format: OutputFormat, msg: &str) {
     match machine_error(format, msg) {
         Some(structured) => eprintln!("{}", structured),
-        None => eprintln!("{} {}", "Error:".ctp_red(), msg),
+        None => eprintln!("{} {}", "Error:".ctp_red(), utils::sanitize_error(msg)),
     }
 }
 

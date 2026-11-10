@@ -61,7 +61,8 @@ fn completions(line_to_cursor: &str) -> Option<(usize, Vec<Pair>, Case)> {
     let words: Vec<&str> = line_to_cursor.split_whitespace().collect();
     // The word under the cursor (empty after a space) and its position.
     let (current, index) = match words.last() {
-        Some(last) if !line_to_cursor.ends_with(' ') => (*last, words.len() - 1),
+        // Any Unicode whitespace ends a word, as `split_whitespace` reads it.
+        Some(last) if !line_to_cursor.ends_with(char::is_whitespace) => (*last, words.len() - 1),
         _ => ("", words.len()),
     };
     let command = words.first().map(|w| w.to_lowercase());
@@ -185,6 +186,20 @@ impl Helper for SeerCompleter {}
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+
+    /// Regression: a word ended by a non-ASCII space (NBSP, U+3000) was still
+    /// "the current word", so the replacement started inside that space's
+    /// bytes and rustyline panicked slicing there.
+    #[test]
+    fn completion_after_unicode_whitespace_starts_on_a_char_boundary() {
+        let completer = SeerCompleter::new();
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        for line in ["set o\u{a0}", "watch a\u{3000}", "?\u{a0}"] {
+            let (start, _) = completer.complete(line, line.len(), &ctx).unwrap();
+            assert_eq!(start, line.len(), "{line:?}");
+        }
+    }
 
     #[test]
     fn complete_does_not_panic_on_multibyte_cursor_midchar() {

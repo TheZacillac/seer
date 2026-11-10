@@ -251,6 +251,45 @@ def test_cross_origin_rest_request_blocked_without_key(monkeypatch, client):
     assert "access-control-allow-origin" not in {k.lower() for k in resp.headers}
 
 
+def test_cross_site_request_without_origin_blocked_without_key(monkeypatch, client):
+    """Regression: a no-cors GET (`<img src=…>`, a navigation) carries no
+    Origin, so the guard read it as a non-browser client and ran it."""
+    _no_key(monkeypatch)
+    calls = []
+    monkeypatch.setattr(seer, "lookup", lambda d: calls.append(d) or {"domain": d}, raising=False)
+    resp = client.get("/lookup/example.com", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status_code == 403
+    assert calls == []
+    # The page's own requests and a typed URL are not cross-site.
+    for site in ("same-origin", "none"):
+        resp = client.get("/lookup/example.com", headers={"Sec-Fetch-Site": site})
+        assert resp.status_code == 200, site
+    # With a key, auth is the guard: the request gets as far as the 401.
+    monkeypatch.setenv("SEER_API_KEY", "k")
+    resp = client.get("/lookup/example.com", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"domains":["a.com"],"concurrency":NaN}',
+        b'{"domains":["a.com"],"concurrency":Infinity}',
+        b'{"domains":[NaN]}',
+        b'{"domains":["a\\ud800.com"],"concurrency":"x"}',
+    ],
+)
+def test_unencodable_invalid_body_is_422_not_500(monkeypatch, body):
+    """Regression: the default 422 echoed the input, which cannot be encoded
+    when it holds NaN/Infinity or a lone surrogate, so the reply was a 500."""
+    _no_key(monkeypatch)
+    monkeypatch.setattr(seer, "bulk_lookup", lambda *a, **k: [], raising=False)
+    quiet = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
+    resp = quiet.post("/lookup/bulk", content=body, headers={"content-type": "application/json"})
+    assert resp.status_code == 422, resp.text
+    assert all(set(e) == {"loc", "msg", "type"} for e in resp.json()["detail"])
+
+
 def test_cors_allowlist_admits_its_origins(monkeypatch):
     import importlib
 

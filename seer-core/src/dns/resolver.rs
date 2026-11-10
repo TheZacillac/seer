@@ -405,6 +405,9 @@ pub struct DnsResolver {
     /// Cached default resolver (Google DNS). Reused across all queries
     /// that don't specify a custom nameserver.
     default_resolver: TokioResolver,
+    /// The config `default_resolver` was built from, kept so
+    /// [`resolve_uncached`](Self::resolve_uncached) can build a fresh one.
+    default_config: ResolverConfig,
     /// [`query`](Self::query)'s direct transport, built once with the same
     /// timeout (its rustls client config is not free to build).
     transport: Transport,
@@ -454,6 +457,7 @@ impl DnsResolver {
         Self {
             timeout,
             default_resolver: build_default_resolver(timeout),
+            default_config: default_upstream_config(),
             transport: Transport::new(timeout),
             port_override: None,
             allow_private_hosts: false,
@@ -513,11 +517,10 @@ impl DnsResolver {
     /// after [`with_timeout`](Self::with_timeout), which rebuilds it.
     #[cfg(test)]
     pub(crate) fn with_default_upstream_port(mut self, port: u16) -> Self {
-        self.default_resolver = build_resolver(
-            single_server_config(std::net::Ipv4Addr::LOCALHOST.into(), port, false),
-            self.timeout,
-        )
-        .expect("a plain UDP resolver builds");
+        self.default_config =
+            single_server_config(std::net::Ipv4Addr::LOCALHOST.into(), port, false);
+        self.default_resolver = build_resolver(self.default_config.clone(), self.timeout)
+            .expect("a plain UDP resolver builds");
         self.custom = Arc::default();
         self
     }
@@ -540,7 +543,7 @@ impl DnsResolver {
     /// The default is 5 seconds, which is sufficient for most DNS queries.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self.default_resolver = build_default_resolver(timeout);
+        self.default_resolver = build_plain_resolver(self.default_config.clone(), timeout);
         self.transport = Transport::new(timeout);
         self.custom = Arc::default();
         self
@@ -591,7 +594,19 @@ impl DnsResolver {
     fn default_target(&self) -> ResolveTarget<'_> {
         ResolveTarget {
             resolver: Cow::Borrowed(&self.default_resolver),
-            config: default_upstream_config(),
+            config: self.default_config.clone(),
+        }
+    }
+
+    /// A resolver for the default upstream built for this call alone, so its
+    /// record cache is empty.
+    fn fresh_default_target(&self) -> ResolveTarget<'static> {
+        ResolveTarget {
+            resolver: Cow::Owned(build_plain_resolver(
+                self.default_config.clone(),
+                self.timeout,
+            )),
+            config: self.default_config.clone(),
         }
     }
 
@@ -681,12 +696,13 @@ impl DnsResolver {
     }
 
     /// The resolver a [`resolve`](Self::resolve) call runs on: the memoized
-    /// one for `nameserver` (one built for this call alone when `fresh`), or
-    /// the cached default.
+    /// one for `nameserver`, or the cached default — or, when `fresh`, one
+    /// built for this call alone either way.
     async fn upstream(&self, nameserver: Option<&str>, fresh: bool) -> Result<ResolveTarget<'_>> {
         Ok(match self.effective_nameserver(nameserver) {
             Some(ns) if fresh => self.custom_target(ns).await?,
             Some(ns) => self.memoized_custom_target(ns).await?,
+            None if fresh => self.fresh_default_target(),
             None => self.default_target(),
         })
     }
@@ -875,7 +891,7 @@ impl DnsResolver {
     }
 
     /// [`resolve`](Self::resolve) through a resolver built for this call
-    /// alone when `nameserver` is given, so nothing is served from an earlier
+    /// alone (custom nameserver or default upstream), so nothing is served from an earlier
     /// answer: for callers that watch a server over time (`follow`,
     /// propagation) or probe its health (`doctor`), where a cached answer
     /// would hide a change or a dead server.
@@ -2836,6 +2852,32 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(queries.load(Ordering::SeqCst), 4);
+    }
+
+    /// Regression: `resolve_uncached` with no nameserver ran on the cached
+    /// default resolver, so a default `follow` replayed its first answer
+    /// until the TTL expired.
+    #[tokio::test]
+    async fn resolve_uncached_asks_the_default_upstream_every_time() {
+        let (port, queries) = counting_server().await;
+        let resolver = DnsResolver::new()
+            .with_timeout(Duration::from_millis(500))
+            .with_default_upstream_port(port);
+        for _ in 0..3 {
+            resolver
+                .resolve_uncached("seer.test", RecordType::A, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // The plain `resolve` keeps its cache.
+        for _ in 0..3 {
+            resolver
+                .resolve("seer.test", RecordType::A, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     /// The memo holds at most `MAX_CUSTOM_RESOLVERS` specs, dropping the

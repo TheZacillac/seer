@@ -11,6 +11,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Availability.** A WHOIS record whose status affirms the registration
+  (DENIC `Status: connect`, `ok`, an EPP code) but carries no registrar,
+  dates or nameservers is registered — it used to fall to the DNS tie-break
+  and could read "likely available". "unavailable / not currently available
+  / no longer available for registration" no longer match the positive
+  "available for registration" pattern.
+- **RDAP.** A 200 body that is an RDAP error object (`errorCode`) or carries
+  no object class and no record data is a failed lookup, not an empty
+  "registered" record.
+- **Takeover.** A failed CNAME lookup makes the host inconclusive (and the
+  audit's takeover check incomplete) instead of clean. The S3 `.s3-website`
+  fragment only matches names under `amazonaws.com` / `amazonaws.com.cn`.
+- **Status / watch / diff.** When nothing resolves and a DNS lookup failed,
+  the status check reports a `dns` error instead of "does not resolve".
+  `diff` keeps a leading `www.`, so a host can be compared with its apex.
+- **DNSSEC.** A check whose DS read failed, or whose DNSKEY read timed out,
+  returns an error instead of a `partial` / `misconfigured` verdict (an
+  answered DNSKEY failure with DS present is still `misconfigured`).
+- **Email posture.** The DMARC walk always ends at the Organizational
+  Domain, so a deeply nested name inherits its policy.
+- **Follow.** `follow` (and every uncached lookup) without a nameserver asks
+  the default upstream each time instead of replaying a cached answer until
+  its TTL expired.
+- **REPL.** Tab after a non-ASCII space (NBSP, U+3000) no longer panics.
+- **Bulk.** An unwritable CSV path is refused before the run; a write that
+  fails afterwards is reported after the summary and failure list.
+- **CLI errors** are sanitized like every other remote text (human and
+  Markdown).
+- **seer-api.** Without `SEER_API_KEY`, a browser request with no `Origin`
+  but `Sec-Fetch-Site: cross-site` gets 403. A request body that fails
+  validation returns 422 without echoing the input (NaN, Infinity or a lone
+  surrogate used to produce a 500).
+
 ## [0.58.0] - 2026-11-02
 
 ### Changed

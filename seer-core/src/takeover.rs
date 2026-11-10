@@ -93,13 +93,13 @@ pub(crate) struct ProviderFingerprint {
     /// would also fire on an attacker-chosen target like
     /// `x.github.io.attacker.example`.
     pub(crate) cname_suffixes: &'static [&'static str],
-    /// Interior fragments matched with `contains`, for providers whose
-    /// endpoint embeds a variable component the suffix cannot cover — S3
-    /// website endpoints carry the region in the middle
-    /// (`bucket.s3-website-us-east-1.amazonaws.com`). Kept separate from
-    /// `cname_suffixes` so the loose match is opt-in per provider rather than
-    /// the default for all of them.
-    pub(crate) cname_infixes: &'static [&'static str],
+    /// `(fragment, suffix)` pairs for providers whose endpoint embeds a
+    /// variable component the suffix cannot cover — S3 website endpoints
+    /// carry the region in the middle
+    /// (`bucket.s3-website-us-east-1.amazonaws.com`). The fragment is matched
+    /// with `contains`, but only on a name that also ends with the suffix, so
+    /// it stays anchored to the provider's own domain.
+    pub(crate) cname_infixes: &'static [(&'static str, &'static str)],
     /// Literal markers that appear in the provider's unclaimed-resource page.
     /// Matched case-insensitively. Empty means the provider has no body
     /// fingerprint stable enough to assert on, so only the DNS signal applies.
@@ -141,7 +141,10 @@ pub(crate) const PROVIDERS: &[ProviderFingerprint] = &[
     ProviderFingerprint {
         provider: "AWS S3",
         cname_suffixes: &[".s3.amazonaws.com"],
-        cname_infixes: &[".s3-website"],
+        cname_infixes: &[
+            (".s3-website", ".amazonaws.com"),
+            (".s3-website", ".amazonaws.com.cn"),
+        ],
         body_markers: &["NoSuchBucket", "The specified bucket does not exist"],
         claim_statuses: &[404],
     },
@@ -377,7 +380,8 @@ pub struct TakeoverReport {
     pub hosts_skipped: usize,
     pub vulnerable: usize,
     pub potential: usize,
-    /// Provider-CNAME hosts that could not be checked (see
+    /// Hosts that could not be checked — a failed CNAME lookup, or a
+    /// provider CNAME whose address lookup or probe failed (see
     /// [`TakeoverVerdict::Inconclusive`]).
     #[serde(default)]
     pub inconclusive: usize,
@@ -404,7 +408,9 @@ pub(crate) fn match_provider(cname: &str) -> Option<&'static ProviderFingerprint
     let c = cname.trim_end_matches('.').to_ascii_lowercase();
     PROVIDERS.iter().find(|p| {
         p.cname_suffixes.iter().any(|suffix| c.ends_with(suffix))
-            || p.cname_infixes.iter().any(|infix| c.contains(infix))
+            || p.cname_infixes
+                .iter()
+                .any(|(infix, suffix)| c.ends_with(suffix) && c.contains(infix))
     })
 }
 
@@ -493,16 +499,26 @@ pub(crate) struct HostResolution {
     /// (timeout, SERVFAIL) rather than answering NXDOMAIN/NODATA — "we could
     /// not tell", which must never be reported as "does not resolve".
     pub(crate) lookup_error: Option<String>,
+    /// Set when a CNAME lookup in the chain failed outright before any hop
+    /// named a provider: the chain is unknown, so "no provider" is not a
+    /// clean answer.
+    pub(crate) cname_error: Option<String>,
 }
 
-/// The CNAME target of `name`, or `None` when it has none (or the lookup
-/// failed — a chain walk simply stops there).
-async fn cname_of(resolver: &DnsResolver, name: &str) -> Option<String> {
-    let records = resolver.resolve(name, RecordType::CNAME, None).await.ok()?;
-    records.into_iter().find_map(|r| match r.data {
+/// The CNAME target of `name`: `Ok(None)` when it has none, `Err` (the
+/// sanitized message) when the lookup itself failed.
+async fn cname_of(
+    resolver: &DnsResolver,
+    name: &str,
+) -> std::result::Result<Option<String>, String> {
+    let records = resolver
+        .resolve(name, RecordType::CNAME, None)
+        .await
+        .map_err(|e| e.sanitized_message())?;
+    Ok(records.into_iter().find_map(|r| match r.data {
         RecordData::CNAME { target } => Some(target),
         _ => None,
-    })
+    }))
 }
 
 /// Resolves the addresses of `host` and walks its CNAME chain for a provider.
@@ -534,6 +550,11 @@ pub(crate) async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostReso
     // A resolver answers a CNAME query with one hop and does not chase it, so
     // the chain is walked here, one query per hop, until a hop names a
     // provider, the chain ends, it loops, or the hop cap is reached.
+    let mut cname_error = None;
+    let cname = cname.unwrap_or_else(|e| {
+        cname_error = Some(e);
+        None
+    });
     let mut provider = None;
     let mut seen = std::collections::HashSet::new();
     let mut hop = cname.clone();
@@ -546,7 +567,10 @@ pub(crate) async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostReso
         if !seen.insert(target.clone()) {
             break;
         }
-        hop = cname_of(resolver, &target).await;
+        hop = cname_of(resolver, &target).await.unwrap_or_else(|e| {
+            cname_error = Some(e);
+            None
+        });
     }
 
     HostResolution {
@@ -554,6 +578,7 @@ pub(crate) async fn resolve_host(resolver: &DnsResolver, host: &str) -> HostReso
         cname,
         provider,
         lookup_error,
+        cname_error,
     }
 }
 
@@ -645,22 +670,33 @@ async fn check_host(
         cname,
         provider,
         lookup_error,
+        cname_error,
     } = resolve_host(resolver, &host).await;
 
     // No CNAME, or a chain that names no provider we recognize: nothing to
     // claim. These hosts are never fetched, which is what keeps the HTTP
     // fan-out proportional to the number of plausible candidates rather than
     // to the size of the zone.
+    //
+    // A chain that could not be read is different: the host was not checked,
+    // so it is inconclusive rather than clean.
     let Some((provider, provider_cname)) = provider else {
+        let (verdict, probe_note) = match cname_error {
+            Some(e) => (
+                TakeoverVerdict::Inconclusive,
+                Some(format!("CNAME lookup failed ({e}); re-run to confirm")),
+            ),
+            None => (TakeoverVerdict::Safe, None),
+        };
         return TakeoverFinding {
             host,
-            verdict: TakeoverVerdict::Safe,
+            verdict,
             provider: None,
             cname,
             addresses,
             evidence: None,
             http_status: None,
-            probe_note: None,
+            probe_note,
         };
     };
 
@@ -909,6 +945,52 @@ mod tests {
         // text to manufacture a "confirmed" finding.
         assert!(match_provider("x.github.io.attacker.example").is_none());
         assert!(match_provider("app.herokuapp.com.evil.test").is_none());
+    }
+
+    #[test]
+    fn an_infix_match_still_needs_the_providers_suffix() {
+        // Regression: `.s3-website` matched anywhere, so an attacker-chosen
+        // target and other clouds' S3-compatible endpoints read as AWS S3.
+        assert!(match_provider("x.s3-website.attacker.example").is_none());
+        assert!(match_provider("bucket.s3-website.fr-par.scw.cloud").is_none());
+        assert!(match_provider("b.s3-website.cn-north-1.amazonaws.com.cn").is_some());
+    }
+
+    /// Regression: a failed CNAME lookup read as "no CNAME", so a scan run
+    /// against a failing resolver reported every host clean.
+    #[tokio::test]
+    async fn a_failed_cname_lookup_is_inconclusive_not_safe() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+        use hickory_resolver::proto::op::ResponseCode;
+
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::ServFail)).await;
+        let report = scan_takeover(
+            &mock_dns_resolver_default(port),
+            "down.test",
+            vec!["down.test".into(), "www.down.test".into()],
+            2,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.inconclusive, 2);
+        assert!(report
+            .findings
+            .iter()
+            .all(|f| f.verdict == TakeoverVerdict::Inconclusive && f.provider.is_none()));
+
+        // NODATA everywhere is a clean answer, not a failure.
+        let port = spawn_mock_dns_fn(|_, _| MockReply::NoData).await;
+        let report = scan_takeover(
+            &mock_dns_resolver_default(port),
+            "ok.test",
+            vec!["ok.test".into()],
+            1,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!((report.inconclusive, report.findings.len()), (0, 0));
     }
 
     #[test]

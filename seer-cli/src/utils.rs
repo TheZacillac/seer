@@ -184,10 +184,26 @@ impl FollowKeyListener {
 /// directory, whose mode must not change.
 pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
     use std::io::Write;
+
+    let path = path.as_ref();
+    let (mut file, tmp_path) = create_sibling_temp(path)?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp_path, path));
+    if written.is_err() {
+        // Best-effort cleanup so a failed write leaves no temp behind.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    written
+}
+
+/// Creates the uniquely named sibling temp file [`atomic_write`] publishes
+/// from, returning it with its path.
+fn create_sibling_temp(path: &Path) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let path = path.as_ref();
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -198,20 +214,31 @@ pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<(
     let mut tmp_name = name.to_os_string();
     tmp_name.push(format!(".{}.{}.tmp", std::process::id(), seq));
     let tmp_path = path.with_file_name(tmp_name);
-
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp_path)?;
-    let written = file
-        .write_all(content.as_bytes())
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&tmp_path, path));
-    if written.is_err() {
-        // Best-effort cleanup so a failed write leaves no temp behind.
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    written
+    Ok((file, tmp_path))
+}
+
+/// Checks that [`atomic_write`] could publish at `path`, by creating and
+/// removing the temp file it would write: a missing or read-only directory
+/// fails here, before the work whose output the file is for.
+pub fn ensure_writable<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+    let (file, tmp_path) = create_sibling_temp(path.as_ref())?;
+    drop(file);
+    std::fs::remove_file(tmp_path)
+}
+
+/// Remote or user text made safe for an error line on the terminal or in
+/// Markdown: each line goes through `sanitize_line` (escape sequences and
+/// control characters dropped). Line breaks are kept — an error's own
+/// "Tip:" paragraph is deliberate layout.
+pub fn sanitize_error(msg: &str) -> String {
+    msg.lines()
+        .map(seer_core::output::sanitize_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Maximum allowed size of a bulk input file, in bytes (1 MB).
@@ -311,7 +338,7 @@ pub fn machine_error(output_format: seer_core::output::OutputFormat, msg: &str) 
         OutputFormat::Json | OutputFormat::Yaml => {
             Some(serde_json::json!({ "error": msg }).to_string())
         }
-        OutputFormat::Markdown => Some(format!("**Error:** {}", msg)),
+        OutputFormat::Markdown => Some(format!("**Error:** {}", sanitize_error(msg))),
     }
 }
 
@@ -775,6 +802,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    /// Regression: bulk found an unwritable CSV path only after the run.
+    #[test]
+    fn ensure_writable_fails_for_a_missing_directory_and_leaves_nothing() {
+        let dir = scratch_dir("writable");
+        ensure_writable(dir.join("out.csv")).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(ensure_writable(dir.join("missing").join("out.csv")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression: error lines reached the terminal (and Markdown) raw.
+    #[test]
+    fn error_text_is_sanitized_per_line() {
+        let msg = "Invalid domain name: ab\x1b]0;owned\x07cd.com\n\nTip: try\x1b[2J this";
+        assert_eq!(
+            sanitize_error(msg),
+            "Invalid domain name: abcd.com\n\nTip: try this"
+        );
+        let md = machine_error(seer_core::output::OutputFormat::Markdown, msg).unwrap();
+        assert!(!md.contains('\x1b'), "{md:?}");
+        // JSON carries the text escaped, unchanged.
+        let json = machine_error(seer_core::output::OutputFormat::Json, msg).unwrap();
+        assert!(json.contains("\\u001b"), "{json}");
     }
 
     #[test]

@@ -1041,8 +1041,9 @@ async fn assess_spf(dns: Dns<'_>, apex_txt: &TxtLookup) -> Assessed<SpfPolicy> {
 
 /// Finds the DMARC record set that applies to `domain`: its own
 /// `_dmarc.<domain>`, or — when that has no DMARC record — the nearest parent
-/// that has one, walking one label at a time (at most [`MAX_DMARC_WALK`])
-/// but never above the Organizational Domain (RFC 7489 §3.2: the registrable
+/// that has one, walking one label at a time (at most [`MAX_DMARC_WALK`]
+/// queries, the last always being the Organizational Domain) but never
+/// above the Organizational Domain (RFC 7489 §3.2: the registrable
 /// domain under the Public Suffix List). RFC 7489 §6.6.3 falls back to the
 /// Organizational Domain itself; the nearest publishing ancestor below it is
 /// what the DMARCbis tree walk adds. A query error stops the walk rather than
@@ -1064,14 +1065,23 @@ async fn discover_dmarc(dns: Dns<'_>, domain: &str, own: TxtLookup) -> DmarcDisc
     let Some(org) = crate::psl::registrable_parent(domain) else {
         return DmarcDiscovery::NotFound;
     };
+    // Every ancestor from the parent up to the Organizational Domain, nearest
+    // first. A name deeper than the cap skips its middle ancestors, never the
+    // Organizational Domain: that is the one RFC 7489 §6.6.3 always consults.
+    let mut parents: Vec<&str> = Vec::new();
     let mut current = domain;
-    for _ in 0..MAX_DMARC_WALK {
-        let Some((_, parent)) = current.split_once('.') else {
-            break;
-        };
+    while let Some((_, parent)) = current.split_once('.') {
         if parent.len() < org.len() {
             break;
         }
+        parents.push(parent);
+        current = parent;
+    }
+    if parents.len() > MAX_DMARC_WALK {
+        parents.truncate(MAX_DMARC_WALK - 1);
+        parents.push(org);
+    }
+    for parent in parents {
         let name = format!("_dmarc.{parent}");
         let txts = match dns.txt(&name).await {
             Ok(txts) => txts,
@@ -1084,7 +1094,6 @@ async fn discover_dmarc(dns: Dns<'_>, domain: &str, own: TxtLookup) -> DmarcDisc
                 inherited: true,
             });
         }
-        current = parent;
     }
     DmarcDiscovery::NotFound
 }
@@ -1885,5 +1894,22 @@ mod tests {
             .unwrap();
         assert_eq!(posture.spf.verdict, PostureVerdict::Strict);
         assert_eq!(posture.dmarc.verdict, PostureVerdict::Strict);
+    }
+
+    /// Regression: the walk cap was counted from the left, so a name eight
+    /// or more labels below the Organizational Domain never queried it and
+    /// its inherited policy read as absent.
+    #[tokio::test]
+    async fn a_deep_name_still_reaches_the_organizational_dmarc() {
+        let port = spawn_mock_dns_fn(|q, t| match (q, t) {
+            ("_dmarc.example.com", WireType::TXT) => txt("v=DMARC1; p=reject"),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let resolver = mock_dns_resolver_default(port);
+        for host in ["a.b.example.com", "a.b.c.d.e.f.g.h.i.j.example.com"] {
+            let posture = lookup_email_posture(&resolver, host, None).await.unwrap();
+            assert_eq!(posture.dmarc.verdict, PostureVerdict::Strict, "{host}");
+        }
     }
 }

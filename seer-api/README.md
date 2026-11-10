@@ -57,7 +57,9 @@ Server runs on `http://127.0.0.1:8000` (loopback-only by default).
   `SEER_API_KEY`, a request carrying an `Origin` header is refused (403)
   unless the origin is a loopback one or listed in `SEER_CORS_ORIGINS` —
   so a web page cannot drive a local API from your browser. Clients that
-  send no `Origin` (curl, SDKs) are unaffected. No CORS headers are sent
+  send no `Origin` (curl, SDKs) are unaffected. A browser request with no
+  `Origin` but `Sec-Fetch-Site: cross-site` (an `<img>` or a link on another
+  site) is refused the same way. No CORS headers are sent
   unless `SEER_CORS_ORIGINS` is set.
 - **No DNS rebinding without a key.** With no `SEER_API_KEY`, a request
   whose `Host` is not a loopback name (`localhost`, `127.0.0.0/8`, `[::1]`,

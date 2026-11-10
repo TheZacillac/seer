@@ -127,10 +127,14 @@ impl StatusClient {
         }
         response.caa = Some(caa_policy);
 
-        // Expiration and DNS never add a sub-check error: a failed lookup
-        // folds into "unknown" (no expiration / no records).
+        // Expiration never adds a sub-check error: a failed lookup folds
+        // into "unknown". DNS does when nothing resolved and a lookup failed:
+        // that is "could not tell", which must not read as "does not resolve".
         response.domain_expiration = expiry_result;
-        response.dns_resolution = Some(dns_result);
+        match dns_result {
+            Ok(dns) => response.dns_resolution = Some(dns),
+            Err(e) => response.errors.push(sub_check_error("dns", &e)),
+        }
 
         Ok(response)
     }
@@ -205,7 +209,7 @@ impl StatusClient {
 
     /// Fetches DNS root record resolution (A, AAAA, CNAME, NS). A failed
     /// query contributes no records rather than an error.
-    async fn fetch_dns_resolution(&self, domain: &str) -> DnsResolution {
+    async fn fetch_dns_resolution(&self, domain: &str) -> Result<DnsResolution> {
         let resolver = &self.dns_resolver;
 
         // Query all record types concurrently
@@ -216,11 +220,25 @@ impl StatusClient {
             resolver.resolve(domain, RecordType::NS, None)
         );
 
+        // A failed A/AAAA/CNAME lookup, kept for the "nothing resolved" case
+        // below (`resolve` answers NXDOMAIN/NODATA with an empty `Ok`).
+        let mut failure: Option<SeerError> = None;
+        let mut records = |result: Result<Vec<crate::dns::DnsRecord>>| {
+            result.unwrap_or_else(|e| {
+                failure.get_or_insert(e);
+                Vec::new()
+            })
+        };
+        let (a_result, aaaa_result, cname_result) = (
+            records(a_result),
+            records(aaaa_result),
+            records(cname_result),
+        );
+
         // Each query answers only its own type, so the A|AAAA accessor splits
         // the two lists exactly.
-        let addresses = |result: Result<Vec<crate::dns::DnsRecord>>| -> Vec<String> {
+        let addresses = |result: Vec<crate::dns::DnsRecord>| -> Vec<String> {
             result
-                .unwrap_or_default()
                 .iter()
                 .filter_map(|r| r.data.address().map(str::to_string))
                 .collect()
@@ -229,14 +247,13 @@ impl StatusClient {
         let aaaa_records = addresses(aaaa_result);
 
         // Extract CNAME target (trim trailing dot)
-        let cname_target: Option<String> =
-            cname_result.unwrap_or_default().into_iter().find_map(|r| {
-                if let RecordData::CNAME { target } = r.data {
-                    Some(target.trim_end_matches('.').to_string())
-                } else {
-                    None
-                }
-            });
+        let cname_target: Option<String> = cname_result.into_iter().find_map(|r| {
+            if let RecordData::CNAME { target } = r.data {
+                Some(target.trim_end_matches('.').to_string())
+            } else {
+                None
+            }
+        });
 
         // Extract NS records (trim trailing dots)
         let nameservers: Vec<String> = ns_result
@@ -254,13 +271,19 @@ impl StatusClient {
         // Domain resolves if it has A/AAAA records or a CNAME
         let resolves = !a_records.is_empty() || !aaaa_records.is_empty() || cname_target.is_some();
 
-        DnsResolution {
+        // Nothing resolved and a lookup failed: unknown, not "does not
+        // resolve". (An address from any lookup settles it the other way.)
+        if let (false, Some(e)) = (resolves, failure) {
+            return Err(e);
+        }
+
+        Ok(DnsResolution {
             a_records,
             aaaa_records,
             cname_target,
             nameservers,
             resolves,
-        }
+        })
     }
 }
 
@@ -469,12 +492,39 @@ mod tests {
             dns_resolver: mock_dns_resolver_default(port),
             ..StatusClient::new()
         };
-        let dns = client.fetch_dns_resolution("seer.test").await;
+        let dns = client.fetch_dns_resolution("seer.test").await.unwrap();
         assert_eq!(dns.a_records, ["192.0.2.1", "192.0.2.2"]);
         assert_eq!(dns.aaaa_records, ["2001:db8::1"]);
         assert_eq!(dns.cname_target, None);
         assert_eq!(dns.nameservers, ["ns1.seer.test"]);
         assert!(dns.resolves);
+    }
+
+    /// Regression: every lookup error was folded into empty records, so a
+    /// resolver outage read as a definite "does not resolve" — which the
+    /// watchlist counts as critical.
+    #[tokio::test]
+    async fn a_failed_resolver_is_an_error_not_does_not_resolve() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+        use hickory_resolver::proto::op::ResponseCode;
+
+        let client_for = |port| StatusClient {
+            dns_resolver: mock_dns_resolver_default(port),
+            ..StatusClient::new()
+        };
+        let port = spawn_mock_dns_fn(|_, _| MockReply::Rcode(ResponseCode::ServFail)).await;
+        assert!(client_for(port)
+            .fetch_dns_resolution("seer.test")
+            .await
+            .is_err());
+
+        // A real negative answer is still "does not resolve".
+        let port = spawn_mock_dns_fn(|_, _| MockReply::NxDomain).await;
+        let dns = client_for(port)
+            .fetch_dns_resolution("seer.test")
+            .await
+            .unwrap();
+        assert!(!dns.resolves);
     }
 
     /// The hostname verdict comes from the rule shared with `ssl.rs`
