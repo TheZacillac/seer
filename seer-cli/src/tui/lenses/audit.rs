@@ -72,8 +72,8 @@ pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option
     };
 
     let title = match &a.overall {
-        Some(o) => format!("Security Audit · {} · {}/100", o.letter.as_str(), o.score),
-        None => "Security Audit · not graded".to_string(),
+        Some(o) => format!("Audit · {} · {}/100", o.letter.as_str(), o.score),
+        None => "Audit · not graded".to_string(),
     };
     let skipped = a
         .runs

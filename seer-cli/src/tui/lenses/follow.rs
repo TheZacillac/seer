@@ -21,7 +21,7 @@ pub fn page(theme: &Theme, follow: &FollowState, next: Option<(usize, u64)>, spi
         .or(next)
         .map(|(_, secs)| secs)
         .unwrap_or_default();
-    let title = format!("Follow  ·  {interval}s interval  ·  {total} checks");
+    let title = format!("Follow · {interval}s interval · {total} checks");
 
     let ratio = if total > 0 {
         (follow.log.len() as f64 / total as f64).min(1.0)

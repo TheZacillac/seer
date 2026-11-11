@@ -65,8 +65,7 @@ pub fn page(
         "/ filter  ·  j/k move  ·  g/G top/bottom  ·  ↵ load details",
         Style::default().fg(theme.overlay0),
     ));
-    let mut page =
-        Page::new("TLD Browser", theme.maroon).push(Block::Lines(vec![filter_line, hint]));
+    let mut page = Page::new("TLD Info", theme.maroon).push(Block::Lines(vec![filter_line, hint]));
 
     page = if list.is_empty() {
         page.push(Block::Lines(vec![Line::from(Span::styled(

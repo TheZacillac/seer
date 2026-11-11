@@ -58,9 +58,10 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     let inner_w = if area.width < layout::NARROW_W {
         area.width
     } else {
-        area.width.saturating_sub(layout::LEFT_W)
+        // The right column starts on the left column's border line.
+        (area.width + 1).saturating_sub(layout::LEFT_W)
     }
-    .saturating_sub(2);
+    .saturating_sub(panel::CHROME_W);
     let (opt_lines, cursor_row) =
         widgets::options::rows(theme, &fields, inner_w, app.section == Section::Options);
     let rows = if fields.is_empty() {
@@ -101,9 +102,8 @@ pub fn view(f: &mut Frame, app: &App, theme: &Theme) {
     status_or_command(f, a.status, app, theme);
 
     if a.narrow && app.section == Section::Function {
-        let want = u16::try_from(lenses::lenses().len() + 6).unwrap_or(u16::MAX);
         let popup = Rect {
-            height: a.details.height.min(want),
+            height: a.details.height.min(function_list::wanted_height()),
             ..a.details
         };
         f.render_widget(Clear, popup);
@@ -191,8 +191,15 @@ fn function_line(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 /// The Details section's title: `4 <title>`, with the spinner while loading.
+/// It always leads with the function's label, the name picked in 2 Function,
+/// so a page titled only by its content gets the label in front.
 fn details_title(app: &App, title: &str) -> String {
-    let t = Section::Details.title(title);
+    let label = app.current_lens().label;
+    let t = if title.starts_with(label) {
+        Section::Details.title(title)
+    } else {
+        Section::Details.title(&format!("{label} · {title}"))
+    };
     match app.state_of(app.lens) {
         LensState::Loading => format!("{t}  {} resolving…", SPIN[app.spin]),
         _ => t,
@@ -425,21 +432,19 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
     let lens = app.current_lens();
-    // Narrow frames drop the brand so the hints (and `? help`) fit.
+    let wide = area.width >= layout::NARROW_W;
+    // Narrow frames drop the brand and the context so the hints (and
+    // `? help`) fit.
     let mut spans = Vec::new();
-    if area.width >= layout::NARROW_W {
+    if wide {
         spans.push(Span::styled(
-            "🔮 seer  ",
+            " seer ",
             Style::default()
-                .fg(theme.mauve)
+                .fg(theme.base)
+                .bg(theme.mauve)
                 .add_modifier(Modifier::BOLD),
         ));
-    }
-    if app.format != seer_core::output::OutputFormat::Human {
-        spans.push(Span::styled(
-            format!("--format {:?}  ", app.format).to_lowercase(),
-            Style::default().fg(theme.green),
-        ));
+        spans.push(Span::raw(" "));
     }
     if let Some(t) = &app.toast {
         spans.push(Span::styled(
@@ -456,6 +461,24 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ));
     }
     spans.push(Span::raw(" "));
+    // The session's context, flush right: output format and theme. A raw
+    // format is green, like the raw view's title.
+    let raw = app.format != seer_core::output::OutputFormat::Human;
+    let context = if wide {
+        vec![
+            Span::styled(
+                format!("{:?}", app.format).to_lowercase(),
+                Style::default().fg(if raw { theme.green } else { theme.overlay0 }),
+            ),
+            Span::styled(
+                format!(" · {} ", theme.name),
+                Style::default().fg(theme.overlay0),
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    let context_w: usize = context.iter().map(Span::width).sum();
     // The focused section lists the keys that act in it.
     let keys: Vec<(String, &str)> = match app.section {
         Section::Domain => vec![
@@ -508,20 +531,34 @@ fn status_or_command(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         };
         keys.remove(drop);
     }
+    // Keys carry the weight; what they do reads as a quiet label.
     for (k, t) in keys {
         spans.push(Span::styled(
             format!(" {k}"),
-            Style::default().fg(theme.crust).bg(theme.overlay),
+            Style::default()
+                .fg(theme.lavender)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {t} "),
             Style::default().fg(theme.overlay0),
         ));
     }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.mantle)),
-        area,
-    );
+    let bar = Style::default().bg(theme.mantle);
+    let left_w: usize = spans.iter().map(Span::width).sum();
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+    // Hints and a toast keep their columns: the context only takes free ones.
+    let context_w = u16::try_from(context_w).unwrap_or(u16::MAX);
+    if left_w + usize::from(context_w) <= usize::from(area.width) {
+        f.render_widget(
+            Paragraph::new(Line::from(context)).style(bar),
+            Rect {
+                x: area.right() - context_w,
+                width: context_w,
+                ..area
+            },
+        );
+    }
 }
 
 /// The `Space` switcher: the query, then the lenses it matches, best first
@@ -572,54 +609,82 @@ fn switcher(f: &mut Frame, area: Rect, buf: &LineEditor, theme: &Theme) {
 /// Width of the key column in the help overlay.
 const HELP_KEY_COL: usize = 16;
 
+/// The global bindings, grouped by what they are for.
+const HELP: [(&str, &[(&str, &str)]); 3] = [
+    (
+        "Navigate",
+        &[
+            ("Tab / Shift-Tab", "next / previous section"),
+            ("1 2 3 4", "Domain · Function · Options · Details"),
+            ("j / k  ·  ↑ ↓", "move (functions, fields, rows)"),
+            ("{ / }", "previous / next group"),
+            ("g / G", "jump to top / bottom"),
+            ("Space", "go to any function by name"),
+            ("Esc", "close · back to Function"),
+        ],
+    ),
+    (
+        "Act",
+        &[
+            ("↵", "edit an option · run · open"),
+            ("h / l  ·  ← →", "change the selected option"),
+            ("/", "edit the domain · filter rows in Details"),
+            (":", "command (lookup · dig · ssl · set output · theme · q)"),
+            ("y", "copy current output to clipboard"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("r", "raw output ⇄ human view"),
+            ("PgUp / PgDn", "scroll the raw view (j / k in Details)"),
+            ("?", "this help · Esc closes"),
+        ],
+    ),
+];
+
 fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let global = [
-        ("Tab / Shift-Tab", "next / previous section"),
-        ("1 2 3 4", "Domain · Function · Options · Details"),
-        ("j / k  ·  ↑ ↓", "move (functions, fields, rows)"),
-        ("h / l  ·  ← →", "change the selected option"),
-        ("↵", "edit an option · run · open"),
-        ("{ / }", "previous / next group"),
-        ("Space", "go to any function by name"),
-        ("Esc", "close · back to Function"),
-        ("g / G", "jump to top / bottom"),
-        ("r", "raw output ⇄ human view"),
-        ("PgUp / PgDn", "scroll the raw view (j / k in Details)"),
-        ("y", "copy current output to clipboard"),
-        ("/", "edit the domain · filter rows in Details"),
-        (":", "command (lookup · dig · ssl · set output · theme · q)"),
-        ("?", "this help · Esc closes"),
-    ];
     let lens = app.current_lens();
     let lens_rows: Vec<(String, &str)> = lens.keys.iter().map(|h| (h.label(), h.what)).collect();
     let row = |(k, t): (&str, &str)| {
         Line::from(vec![
             Span::styled(
                 format!("{k:<HELP_KEY_COL$}"),
-                Style::default().fg(theme.peach),
+                Style::default().fg(theme.lavender),
             ),
             Span::styled(t.to_string(), Style::default().fg(theme.subtext)),
         ])
+    };
+    let heading = |text: String| {
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(theme.overlay0)
+                .add_modifier(Modifier::BOLD),
+        ))
     };
     // The focused lens's own keys lead, so on a short terminal the rows cut
     // off (and marked) are global ones the status bar also lists.
     let mut lines: Vec<Line> = Vec::new();
     if !lens_rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("{} {} keys", lens.glyph, lens.label),
-            Style::default().fg(theme.lavender),
-        )));
+        lines.push(heading(format!("{} {} keys", lens.glyph, lens.label)));
         lines.extend(lens_rows.iter().map(|(k, t)| row((k.as_str(), *t))));
-        lines.push(Line::default());
     }
-    lines.extend(global.iter().copied().map(row));
+    for (group, rows) in HELP {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(heading(group.to_string()));
+        lines.extend(rows.iter().copied().map(row));
+    }
     // Wide enough for the longest row (border + padding), never past the frame.
     let longest = lines.iter().map(Line::width).max().unwrap_or(0);
-    let w = u16::try_from(longest + 4)
+    let w = u16::try_from(longest)
         .unwrap_or(u16::MAX)
+        .saturating_add(panel::CHROME_W)
         .max(60)
         .min(area.width.saturating_sub(4));
-    let rows = u16::try_from(lines.len() + 4).unwrap_or(u16::MAX);
+    let rows = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let h = rows.min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -634,7 +699,7 @@ fn help_overlay(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.base).fg(theme.text)),
         popup,
     );
-    let inner = panel::render(f, popup, theme, "keybindings", theme.lavender, true);
+    let inner = panel::render(f, popup, theme, "Keys", theme.lavender, true);
     inspector::draw(f, inner, theme, lines);
 }
 
@@ -672,7 +737,10 @@ mod tests {
         // Idle: the tail of the domain behind a `…`.
         let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
         let row = s.lines().nth(1).unwrap_or_default();
-        assert!(row.contains("⌕ …") && row.contains("example.com│"), "{row}");
+        assert!(
+            row.contains("⌕ …") && row.contains("example.com │"),
+            "{row}"
+        );
         // Editing: the caret at the end stays visible.
         app.set_section(Section::Domain);
         let s = render_lines(80, 24, |f| view(f, &app, app.theme()));
@@ -750,8 +818,8 @@ mod tests {
         app.lens = LensKey::Bulk.index();
         app.set_section(Section::Options);
         app.opt_cursor = app.visible_options().len() - 1;
-        // 40×11: one Options row fits, but Bulk's fields wrap onto two.
-        let s = render_lines(40, 11, |f| view(f, &app, app.theme()));
+        // 40×10: one Options row fits, but Bulk's fields wrap onto two.
+        let s = render_lines(40, 10, |f| view(f, &app, app.theme()));
         assert!(s.contains("Domains"), "the last field is in view:\n{s}");
         assert!(!s.contains("Source"), "the row above scrolled away:\n{s}");
         assert!(s.contains("4 Bulk"), "Details keeps its box:\n{s}");
@@ -830,6 +898,62 @@ mod tests {
         let s = render_lines(100, 30, |f| view(f, &app, app.theme()));
         assert!(s.contains("go to"), "{s}");
         assert!(s.contains("Subdomains") && s.contains("SECURITY"), "{s}");
+    }
+
+    /// The status row ends with the session's context; a narrow frame and
+    /// a toast too long to share the row both leave it out.
+    #[test]
+    fn the_status_bar_ends_with_format_and_theme() {
+        let mut app = App::new(None);
+        app.set_section(Section::Function);
+        let last = |app: &App, w| {
+            render_lines(w, 24, |f| view(f, app, app.theme()))
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        };
+        assert!(
+            last(&app, 100).ends_with("human · frappe"),
+            "{}",
+            last(&app, 100)
+        );
+        assert!(last(&app, 100).starts_with(" seer "), "{}", last(&app, 100));
+        assert!(!last(&app, 60).contains("frappe"), "{}", last(&app, 60));
+        // At 80 columns every hint outranks the context.
+        assert!(
+            last(&app, 80).ends_with(": cmd  ? help"),
+            "{}",
+            last(&app, 80)
+        );
+        app.format = seer_core::output::OutputFormat::Json;
+        assert!(
+            last(&app, 100).ends_with("json · frappe"),
+            "{}",
+            last(&app, 100)
+        );
+        app.set_toast("info", &"x".repeat(120));
+        assert!(!last(&app, 100).contains("frappe"), "{}", last(&app, 100));
+    }
+
+    /// Details is titled by the function picked in 2 Function, whatever the
+    /// page calls itself.
+    #[test]
+    fn details_titles_lead_with_the_function_label() {
+        let mut app = App::new(None);
+        app.lens = LensKey::Status.index();
+        assert_eq!(details_title(&app, "Status"), "4 Status");
+        assert_eq!(details_title(&app, "HTTP Health"), "4 Status · HTTP Health");
+    }
+
+    #[test]
+    fn help_overlay_groups_the_global_keys() {
+        let mut app = App::new(None);
+        app.help = true;
+        let s = render_lines(100, 40, |f| view(f, &app, app.theme()));
+        let at = |h: &str| s.find(h).unwrap_or_else(|| panic!("no {h}: {s}"));
+        assert!(at("Navigate") < at("Act") && at("Act") < at("View"), "{s}");
     }
 
     /// At 80 columns the Function hints still end with `? help`.
@@ -1093,9 +1217,9 @@ mod tests {
     /// verify a live `:theme latte` swap actually recolors the frame.
     #[test]
     fn live_theme_swap_recolors_the_frame() {
-        // The status row's background is the mantle.
+        // The status row's background is the mantle (past the `seer` pill).
         let status_bg =
-            |app: &App| render_buffer(100, 30, |f| view(f, app, app.theme()))[(0, 29)].bg;
+            |app: &App| render_buffer(100, 30, |f| view(f, app, app.theme()))[(8, 29)].bg;
 
         let mut app = App::new(None);
         assert_eq!(status_bg(&app), Theme::frappe().mantle);

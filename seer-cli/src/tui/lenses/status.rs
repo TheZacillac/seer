@@ -37,7 +37,7 @@ pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
         rows.push(("resolves", resolves.to_string()));
     }
     Some(
-        Page::new("HTTP Health", theme.green)
+        Page::new("Status", theme.green)
             .push(Block::Lines(vec![headline]))
             .push(Block::Gap)
             .push(Block::Kv {
