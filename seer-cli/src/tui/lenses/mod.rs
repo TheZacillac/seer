@@ -255,7 +255,7 @@ static LENSES: &[Lens] = &[
     lens(LensKey::Subdomains, "Subdomains", "⋔", "SECURITY")
         .filter()
         .heavy(),
-    lens(LensKey::Headers, "HTTP Headers", "☰", "SECURITY"),
+    lens(LensKey::Headers, "HTTP Headers", "⇅", "SECURITY"),
     lens(LensKey::Audit, "Audit", "◉", "SECURITY").heavy(),
     lens(LensKey::Takeover, "Takeover", "⚑", "SECURITY")
         .filter()

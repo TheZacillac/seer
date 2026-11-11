@@ -97,7 +97,7 @@ pub fn page(
         return None;
     };
     let title = format!(
-        "dig · {} records · {}",
+        "Records · {} · {}",
         result.record_type,
         sanitize_line(&result.name)
     );
@@ -310,7 +310,7 @@ mod tests {
     fn a_positive_answer_lists_the_chain_under_its_real_owners() {
         let text = draw(&dig_data(chained()), "", None);
         assert!(
-            text.contains("dig · A records · www.seer.test"),
+            text.contains("Records · A · www.seer.test"),
             "title names the type and name: {text}"
         );
         assert!(

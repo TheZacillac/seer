@@ -15,7 +15,7 @@ use crate::tui::widgets::{dot, gauge};
 /// The batch runner: progress, then the results panel and, when open (`v`),
 /// the selected row's detail panel. What to run is in the Options box.
 pub fn page(theme: &Theme, bulk: &BulkState, spin: usize) -> Page {
-    let top_title = format!("Bulk  ·  {}", bulk.results_op());
+    let top_title = format!("Bulk · {}", bulk.results_op());
 
     // Progress gauge: use bulk.total when set (file loads or explicit run).
     // Falls back to rows.len() so the gauge is never stuck at 0%.
@@ -74,7 +74,7 @@ pub fn page(theme: &Theme, bulk: &BulkState, spin: usize) -> Page {
 
     // The op the rows were produced with — the Op option is the NEXT run's.
     let results = Page::new(
-        format!("Results  ·  seer bulk {}", bulk.results_op()),
+        format!("Results · seer bulk {}", bulk.results_op()),
         theme.mauve,
     );
     if bulk.rows.is_empty() {
@@ -308,7 +308,7 @@ mod tests {
         };
         bulk.rows.push(make_result("a.com", true));
         let text = render_text(80, 24, |f| render(f, f.area(), &theme, &bulk, 0));
-        assert!(text.contains("Bulk  ·  status"), "got: {text}");
+        assert!(text.contains("Bulk · status"), "got: {text}");
     }
 
     #[test]

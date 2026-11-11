@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **TUI.** The four sections share one frame: boxes that touch share a
+  single border line with junctions instead of doubling it, and content has
+  a column of padding. Focus shows as an inverted title rather than a
+  brighter border. The Function list spaces its groups when there is room,
+  highlights the selection across the row, and marks a clipped list with
+  `↑ n more` / `↓ n more`. Groups of rows inside Details sit under a
+  `── title ──` rule instead of a nested box. Details titles always lead
+  with the function's name (`Records · A · example.com`, `Status`,
+  `SSL / Cert · valid · 44d left`). The status bar ends with the output
+  format and theme, and `?` help groups its keys under Navigate / Act /
+  View.
+
 ### Fixed
 - **Availability.** A WHOIS record whose status affirms the registration
   (DENIC `Status: connect`, `ok`, an EPP code) but carries no registrar,

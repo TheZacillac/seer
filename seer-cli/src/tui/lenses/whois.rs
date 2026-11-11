@@ -85,7 +85,7 @@ mod tests {
         let text = render_whois(serde_json::json!({}));
         let row = |key: &str| {
             text.lines()
-                .find(|l| l.contains(&format!("│{key} ·")))
+                .find(|l| l.contains(&format!("│ {key} ·")))
                 .unwrap_or_else(|| panic!("no {key} row: {text}"))
                 .to_string()
         };

@@ -39,15 +39,27 @@ pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
             dot::line(theme, tone, w.message.clone())
         })
         .collect();
+    // The verdict leads, in the title: the rows below are its evidence.
+    let verdict = if s.is_valid { "valid" } else { "INVALID" };
+    let days = s.days_until_expiry;
+    let when = if days < 0 {
+        format!("expired {}d ago", -days)
+    } else {
+        format!("{days}d left")
+    };
+    let title = format!("SSL / Cert · {verdict} · {when}");
+    let accent = if s.is_valid { theme.green } else { theme.red };
+    let names =
+        Page::new("Names", theme.green).push(Block::Lines(vec![chips::line(theme, &s.san_names)]));
     Some(
-        Page::new("Certificate", theme.green)
+        Page::new(title, accent)
             .push(Block::Kv {
                 key_color: theme.green,
                 rows,
             })
             .push_if(!warnings.is_empty(), || Block::Lines(warnings))
             .push(Block::Gap)
-            .push(Block::Lines(vec![chips::line(theme, &s.san_names)])),
+            .push(Block::Panel(names)),
     )
 }
 
@@ -89,6 +101,20 @@ mod tests {
         let data = LensData::Ssl(Box::new(ssl_fixture()));
         let s = render_to_text(&data, 60, 12);
         assert!(s.contains("225"));
+    }
+
+    /// The title carries the verdict; the SANs sit under their own rule.
+    #[test]
+    fn the_title_gives_the_verdict_and_the_names_are_labelled() {
+        let s = render_to_text(&LensData::Ssl(Box::new(ssl_fixture())), 60, 14);
+        assert!(s.contains("SSL / Cert · valid · 225d left"), "{s}");
+        assert!(s.contains("── Names ─"), "{s}");
+
+        let mut report = ssl_fixture();
+        report.is_valid = false;
+        report.days_until_expiry = -3;
+        let s = render_to_text(&LensData::Ssl(Box::new(report)), 60, 14);
+        assert!(s.contains("INVALID · expired 3d ago"), "{s}");
     }
 
     #[test]

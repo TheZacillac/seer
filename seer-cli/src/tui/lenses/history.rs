@@ -72,7 +72,7 @@ pub fn page(
     .selected(focused.then_some(sel))
     .detail(detail);
     Some(
-        Page::new("Lookup History", theme.teal)
+        Page::new("History", theme.teal)
             .push(Block::Table(table))
             .push(Block::Gap)
             .push(Block::Lines(vec![Line::from(Span::styled(

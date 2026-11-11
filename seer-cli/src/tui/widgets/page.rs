@@ -5,8 +5,8 @@
 //! header and three rows), then a table's detail (down to three lines),
 //! then scrolling text, then key/value rows (each down to one line) — so
 //! verdicts and notes are never the part cut. What still does not fit is
-//! clipped at the bottom; rows left over go to the page's last panel, so a
-//! bottom panel reaches the frame edge. A band cut short ends with
+//! clipped at the bottom. A nested page is a group of rows under a
+//! `── title ───` rule, not a box of its own. A band cut short ends with
 //! `… N more <unit>`.
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style};
@@ -71,7 +71,7 @@ pub enum Block {
     },
     /// A selectable table, and the selected row's detail.
     Table(TableBlock),
-    /// A nested bordered page.
+    /// A nested page: its blocks under a titled rule.
     Panel(Page),
 }
 
@@ -163,7 +163,7 @@ impl Part {
             Part::Gap => 1,
             Part::Fixed(lines) | Part::Shrink { lines, .. } => lines.len(),
             Part::Rows { header, rows, .. } => usize::from(!header.is_empty()) + rows.len(),
-            Part::Panel { parts, .. } => 2 + parts.iter().map(Part::want).sum::<usize>(),
+            Part::Panel { parts, .. } => 1 + parts.iter().map(Part::want).sum::<usize>(),
         }
     }
 
@@ -175,7 +175,7 @@ impl Part {
             Part::Rows { header, rows, .. } => {
                 usize::from(!header.is_empty()) + rows.len().min(inspector::MIN_ROWS)
             }
-            Part::Panel { parts, .. } => 2 + parts.iter().map(Part::min).sum::<usize>(),
+            Part::Panel { parts, .. } => 1 + parts.iter().map(Part::min).sum::<usize>(),
         }
     }
 
@@ -253,7 +253,7 @@ fn prepare(theme: &Theme, blocks: Vec<Block>, width: u16) -> Vec<Part> {
             Block::Panel(page) => parts.push(Part::Panel {
                 title: page.title,
                 accent: page.accent,
-                parts: prepare(theme, page.blocks, width.saturating_sub(2)),
+                parts: prepare(theme, page.blocks, width),
             }),
         }
     }
@@ -271,7 +271,6 @@ fn note(text: &str, color: Color, width: u16) -> Vec<Line<'static>> {
 /// Heights for `parts` in `avail` rows: all they want, then rows taken in
 /// priority order (first part first within one) down to each minimum; a
 /// panel's own parts are taken from in the same passes when it is drawn.
-/// Rows left over go to the last part when it is a panel.
 fn allocate(parts: &[Part], avail: usize) -> Vec<usize> {
     let mut heights: Vec<usize> = parts.iter().map(Part::want).collect();
     let mut over = heights.iter().sum::<usize>().saturating_sub(avail);
@@ -285,14 +284,10 @@ fn allocate(parts: &[Part], avail: usize) -> Vec<usize> {
             over -= give;
         }
     }
-    let used: usize = heights.iter().sum();
-    if let (Some(Part::Panel { .. }), Some(last)) = (parts.last(), heights.last_mut()) {
-        *last += avail.saturating_sub(used);
-    }
     heights
 }
 
-/// Draw `page` over `area`; `focused` brightens its border.
+/// Draw `page` over `area`; `focused` inverts its title.
 pub fn draw(f: &mut Frame, area: Rect, theme: &Theme, page: Page, focused: bool) {
     let inner = panel::render(f, area, theme, &page.title, page.accent, focused);
     let parts = prepare(theme, page.blocks, inner.width);
@@ -380,8 +375,14 @@ fn draw_parts(f: &mut Frame, area: Rect, theme: &Theme, parts: Vec<Part>) {
                 accent,
                 parts,
             } => {
-                let inner = panel::render(f, rect, theme, &title, accent, false);
-                draw_parts(f, inner, theme, parts);
+                let head = panel::rule(theme, &title, accent, rect.width);
+                f.render_widget(Paragraph::new(head), Rect { height: 1, ..rect });
+                let body = Rect {
+                    y: rect.y + 1,
+                    height: rect.height - 1,
+                    ..rect
+                };
+                draw_parts(f, body, theme, parts);
             }
         }
     }
@@ -460,14 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn the_last_panel_fills_to_the_bottom() {
-        let inner = page().push(lines(1, "x"));
+    fn a_nested_page_is_a_rule_over_its_rows() {
+        let inner = Page::new("Inner", Color::Reset).push(lines(1, "x"));
         let s = draw_page(30, 12, page().push(lines(1, "a")).push(Block::Panel(inner)));
         let rows: Vec<&str> = s.lines().collect();
-        assert!(
-            rows[10].contains('╰'),
-            "inner border on the last inner row: {s}"
-        );
+        assert!(rows[2].starts_with("│ ── Inner ─"), "{s}");
+        assert!(rows[2].ends_with("─ │"), "the rule fills the width: {s}");
+        assert!(rows[3].starts_with("│ x0"), "{s}");
     }
 
     #[test]
@@ -515,8 +515,8 @@ mod tests {
         let buf = crate::tui::test_util::render_buffer(10, 6, |f| {
             draw(f, f.area(), &theme, page().push(Block::Table(t)), false);
         });
-        assert_eq!(buf[(1, 1)].fg, Color::Red);
-        assert_eq!(buf[(1, 2)].bg, theme.surface0);
+        assert_eq!(buf[(2, 1)].fg, Color::Red);
+        assert_eq!(buf[(2, 2)].bg, theme.surface0);
     }
 
     /// A panel gives rows up in the same order as everything else: its

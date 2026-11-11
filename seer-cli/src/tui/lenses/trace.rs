@@ -25,7 +25,7 @@ pub fn page(theme: &Theme, data: &LensData, focused: bool, sel: usize) -> Option
         return None;
     };
     let title = format!(
-        "trace · {} {}",
+        "Trace · {} {}",
         sanitize_line(&trace.name),
         trace.record_type
     );
