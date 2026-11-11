@@ -328,7 +328,8 @@ enum SilentRegistry {
 /// evidence either way. Precedence, highest first:
 ///
 /// 1. WHOIS says "no match" → available (high, `whois`).
-/// 2. WHOIS carries registration data → [`Fallback::Registered`].
+/// 2. WHOIS carries registration data, or a status affirming the
+///    registration → [`Fallback::Registered`].
 /// 3. RDAP 404 → available (high, `rdap`): the registry's own answer.
 /// 4. A thin WHOIS refusal/throttle → inconclusive (issue #45): never
 ///    inverted into "available" or guessed from DNS.
@@ -351,7 +352,7 @@ pub(crate) fn classify_fallback(
                     .with_details("WHOIS indicates domain is not registered"),
             )
         }
-        Ok(w) if !w.is_thin() => return Fallback::Registered,
+        Ok(w) if !w.is_thin() || w.has_registered_status() => return Fallback::Registered,
         // Thin WHOIS — often an access-blocked refusal like SWITCH's ".ch" —
         // but the registry's own RDAP authoritatively 404'd.
         Ok(_) if rdap_404 => return rdap_404_verdict(),
@@ -1059,6 +1060,26 @@ mod tests {
         assert!(!r.available, "a delegated DENIC record is registered");
         assert_eq!(r.confidence, "high");
         assert_eq!(r.method, "whois");
+    }
+
+    #[test]
+    fn denic_connect_without_nameservers_is_registered() {
+        // Regression: `Status: connect` with no `Nserver:` line (a .de name
+        // delegated through Nsentry records) was thin, so an apex with no NS
+        // set read as likely available.
+        let w = WhoisResponse::parse(
+            "example.de",
+            "whois.denic.de",
+            "Domain: example.de\nStatus: connect\nChanged: 2020-01-01T00:00:00+01:00\n",
+        );
+        assert!(w.nameservers.is_empty() && w.has_registered_status());
+        let rdap_err = SeerError::RdapBootstrapError("no RDAP server for example.de".to_string());
+        let r = decide_fallback("example.de", &rdap_err, Ok(w), DnsPresence::Absent);
+        assert!(!r.available);
+        assert_eq!(
+            (r.confidence.as_str(), r.method.as_str()),
+            ("high", "whois")
+        );
     }
 
     // --- subdomain guard (names below the registrable domain) ---------

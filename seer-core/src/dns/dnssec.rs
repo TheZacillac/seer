@@ -384,6 +384,15 @@ impl DnssecChecker {
         // decides where the records live, so `www.` must not be pre-stripped
         // (a `www` zone cut, however rare, would otherwise be skipped).
         let domain = crate::validation::normalize_host(domain)?;
+        // The walk and the DS/DNSKEY reads go straight to the upstream; a
+        // special-use name (`.onion`, `.invalid`) must never be sent there
+        // (RFC 7686), and has no delegation to check.
+        if crate::dns::query::answered_locally(&domain) {
+            return Err(SeerError::InvalidInput(format!(
+                "{domain} is a special-use name (RFC 6761) that is never sent to DNS servers, \
+                 so it has no DNSSEC chain to check"
+            )));
+        }
         debug!(domain = %domain, "Checking DNSSEC");
 
         // One deadline for the whole check; the walk must end early enough
@@ -445,8 +454,7 @@ impl DnssecChecker {
         let ds_result = ds_result.unwrap_or_else(|_| Err(out_of_time()));
         let dnskey_result = dnskey_result.unwrap_or_else(|_| Err(out_of_time()));
         // With neither record set read there is no evidence either way:
-        // "unsigned" would be a verdict on a zone never seen. One failed
-        // query still leaves the other's answer to report on.
+        // "unsigned" would be a verdict on a zone never seen.
         if let (Err(ds), Err(dnskey)) = (&ds_result, &dnskey_result) {
             let detail =
                 format!("DNSSEC check for {zone} read neither DS ({ds}) nor DNSKEY ({dnskey})");
@@ -456,10 +464,26 @@ impl DnssecChecker {
                 SeerError::DnsError(detail)
             });
         }
-        let ds_records = ds_result.unwrap_or_else(|e| {
-            issues.push(format!("DS query failed: {e}"));
-            Vec::new()
-        });
+        // A failed DS read is never evidence that the parent has no DS, so
+        // the chain cannot be judged at all. A DNSKEY read that timed out is
+        // likewise no evidence; only an answered failure (the SERVFAIL a
+        // validating upstream gives a broken chain) is judged below.
+        if let Err(ds) = &ds_result {
+            let detail = format!("DNSSEC check for {zone} could not read DS at the parent ({ds})");
+            return Err(if ds.timed_out {
+                SeerError::Timeout(detail)
+            } else {
+                SeerError::DnsError(detail)
+            });
+        }
+        if let Err(dnskey) = &dnskey_result {
+            if dnskey.timed_out {
+                return Err(SeerError::Timeout(format!(
+                    "DNSSEC check for {zone} could not read DNSKEY ({dnskey})"
+                )));
+            }
+        }
+        let ds_records = ds_result.unwrap_or_default();
         let dnskey_query_failed = dnskey_result.is_err();
         let dnskeys = dnskey_result.unwrap_or_else(|e| {
             issues.push(format!("DNSKEY query failed: {e}"));
@@ -1490,6 +1514,58 @@ mod tests {
             !seen.lock().unwrap().keys().any(|k| k.ends_with(" DNSKEY")),
             "{:?}",
             seen.lock().unwrap().keys()
+        );
+    }
+
+    /// Regression: one failed read became an empty set and was judged as
+    /// absence — a DS timeout read as "no DS at parent" (`partial`), a DNSKEY
+    /// timeout as a broken chain (`misconfigured`).
+    #[tokio::test]
+    async fn one_timed_out_read_gives_no_verdict() {
+        for ds_fails in [true, false] {
+            let port = spawn_mock_dns_fn(move |q, t| match (q, t) {
+                ("signed.test", WireType::SOA) => MockReply::Answer(vec![soa_rdata("signed.test")]),
+                ("signed.test", WireType::DS) if ds_fails => MockReply::NoReply,
+                ("signed.test", WireType::DS) => {
+                    MockReply::Answer(vec![ds_rdata(ds_for("signed.test", &test_key()))])
+                }
+                ("signed.test", WireType::DNSKEY) if ds_fails => {
+                    MockReply::Answer(vec![dnskey_rdata(test_key())])
+                }
+                ("signed.test", WireType::DNSKEY) => MockReply::NoReply,
+                _ => MockReply::NoData,
+            })
+            .await;
+            let result = mock_checker(port)
+                .with_timeout(Duration::from_millis(200))
+                .check("signed.test")
+                .await;
+            assert!(
+                matches!(result, Err(SeerError::Timeout(_))),
+                "ds_fails={ds_fails}: {result:?}"
+            );
+        }
+    }
+
+    /// Regression: the zone-apex walk sent a `.onion` name to the upstream.
+    #[tokio::test]
+    async fn a_special_use_name_is_never_sent_on_the_wire() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let port = spawn_mock_dns_fn(move |name, _| {
+            seen.lock().unwrap().push(name.to_string());
+            MockReply::NxDomain
+        })
+        .await;
+        let result = mock_checker(port).check("facebookcorewwwi.onion").await;
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "{:?}",
+            asked.lock().unwrap()
+        );
+        assert!(
+            matches!(result, Err(SeerError::InvalidInput(_))),
+            "{result:?}"
         );
     }
 }

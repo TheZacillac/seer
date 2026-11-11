@@ -181,6 +181,9 @@ fn analyze_wildcard(records: &[CaaRecord]) -> Option<String> {
     }
 }
 
+/// How many resolver timeouts the whole CAA tree climb may take.
+pub(crate) const CAA_WALK_BUDGET_TIMEOUTS: u32 = 3;
+
 /// Looks up CAA records for `host`, climbing the DNS tree per RFC 8659
 /// section 3 until a record set is found or only a TLD remains.
 ///
@@ -191,6 +194,11 @@ fn analyze_wildcard(records: &[CaaRecord]) -> Option<String> {
 /// Errors only on invalid input. A resolver error yields
 /// [`CaaPolicy::empty`] with `lookup_failed` set — CAA is advisory, so a CAA
 /// query that did not return never fails a higher-level check.
+///
+/// The whole climb shares one deadline (`CAA_WALK_BUDGET_TIMEOUTS` resolver
+/// timeouts): each level is bounded on its own, but a silent resolver would
+/// otherwise cost a full timeout per label, and `ssl` and `status` wait on
+/// this lookup. Running out counts as a failed lookup.
 pub async fn lookup_caa(
     resolver: &DnsResolver,
     host: &str,
@@ -198,12 +206,18 @@ pub async fn lookup_caa(
 ) -> Result<CaaPolicy> {
     let mut current = normalize_host(host)?;
     let mut failed = false;
+    let deadline =
+        tokio::time::Instant::now() + resolver.timeout().saturating_mul(CAA_WALK_BUDGET_TIMEOUTS);
 
     loop {
-        match resolver
-            .resolve(&current, RecordType::CAA, nameserver)
-            .await
-        {
+        let lookup = resolver.resolve(&current, RecordType::CAA, nameserver);
+        let Ok(answer) = tokio::time::timeout_at(deadline, lookup).await else {
+            return Ok(CaaPolicy {
+                lookup_failed: true,
+                ..CaaPolicy::empty()
+            });
+        };
+        match answer {
             Ok(records) if !records.is_empty() => {
                 let caa: Vec<CaaRecord> = records
                     .into_iter()
@@ -804,5 +818,24 @@ mod tests {
             .unwrap();
         assert!(!policy.has_policy);
         assert!(!policy.lookup_failed);
+    }
+
+    /// Regression: the tree walk had no overall deadline, so a silent
+    /// resolver cost one full timeout (times its attempts) per label and a
+    /// deep name stalled the `ssl` and `status` checks that wait on it.
+    #[tokio::test]
+    async fn the_walk_is_bounded_by_one_deadline() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+
+        let port = spawn_mock_dns_fn(|_, _| MockReply::NoReply).await;
+        let resolver = mock_dns_resolver_default(port);
+        let budget = resolver.timeout() * CAA_WALK_BUDGET_TIMEOUTS;
+        let started = std::time::Instant::now();
+        let policy = lookup_caa(&resolver, "a.b.c.d.e.f.g.h.i.j.caa.test", None)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(policy.lookup_failed);
+        assert!(elapsed < budget + resolver.timeout(), "took {elapsed:?}");
     }
 }

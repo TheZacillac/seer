@@ -119,6 +119,11 @@ pub(crate) fn assess(domain: &str, p: &EmailPosture) -> CheckOutput {
     }
 
     // MTA-STS and DANE protect inbound mail: only meaningful with MX hosts.
+    let smtp_tlsa = p
+        .dane
+        .records
+        .iter()
+        .any(|r| r.scope.starts_with("_25._tcp"));
     for (check, verdict, present, id, severity, title, fix) in [
         (
             MTA_STS,
@@ -131,11 +136,15 @@ pub(crate) fn assess(domain: &str, p: &EmailPosture) -> CheckOutput {
         ),
         (
             DANE,
-            p.dane.verdict,
-            p.dane
-                .records
-                .iter()
-                .any(|r| r.scope.starts_with("_25._tcp")),
+            // This check is about the SMTP scope alone, while the posture's
+            // verdict also covers `_443._tcp`: only a failed SMTP-side
+            // lookup leaves the answer unknown.
+            if p.dane.smtp_lookup_failed && !smtp_tlsa {
+                PostureVerdict::Unknown
+            } else {
+                PostureVerdict::Absent
+            },
+            smtp_tlsa,
             "email.dane.missing",
             Severity::Info,
             "No DANE TLSA records at the MX hosts",
@@ -331,6 +340,7 @@ mod tests {
                     cert_data: "ab".into(),
                 }],
                 verdict: PostureVerdict::Present,
+                smtp_lookup_failed: false,
             },
             mx: MailExchangers::Hosts(vec!["mx.example.com".into()]),
             notes: vec![],
@@ -553,5 +563,67 @@ mod tests {
         let out = assess("example.com", &p);
         assert_eq!(ids(&out), vec!["email.dmarc.missing"]);
         assert_eq!(out.findings[0].severity, Severity::High);
+    }
+
+    /// Regression: the DANE check read one verdict for the SMTP and HTTPS
+    /// scopes together, so a failed `_25._tcp` lookup beside an HTTPS TLSA
+    /// record became a "missing" finding, and a failed HTTPS lookup made a
+    /// cleanly answered SMTP question incomplete.
+    #[tokio::test]
+    async fn dane_is_judged_on_the_smtp_scope_alone() {
+        use crate::dns::test_support::{mock_dns_resolver_default, spawn_mock_dns_fn, MockReply};
+        use hickory_resolver::proto::op::ResponseCode;
+        use hickory_resolver::proto::rr::rdata as wire;
+        use hickory_resolver::proto::rr::{Name, RData, RecordType as WireType};
+
+        let tlsa = || {
+            MockReply::Answer(vec![RData::TLSA(wire::TLSA::new(
+                wire::tlsa::CertUsage::from(3),
+                wire::tlsa::Selector::from(1),
+                wire::tlsa::Matching::from(1),
+                vec![0xAB; 32],
+            ))])
+        };
+        let mx = || {
+            MockReply::Answer(vec![RData::MX(wire::MX::new(
+                10,
+                Name::from_ascii("mx.m.test.").unwrap(),
+            ))])
+        };
+        use crate::posture::lookup_email_posture;
+        let lookup = |port| async move {
+            lookup_email_posture(&mock_dns_resolver_default(port), "m.test", None)
+                .await
+                .unwrap()
+        };
+        let ran = |out: &CheckOutput| {
+            let run = out.runs.iter().find(|r| r.check == DANE).unwrap();
+            run.status == CheckStatus::Ran
+        };
+
+        // SMTP lookup fails, HTTPS has a record: unknown, not "missing".
+        let port = spawn_mock_dns_fn(move |q, t| match (q, t) {
+            ("m.test", WireType::MX) => mx(),
+            ("_25._tcp.mx.m.test", WireType::TLSA) => MockReply::Rcode(ResponseCode::ServFail),
+            ("_443._tcp.m.test", WireType::TLSA) => tlsa(),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let p = lookup(port).await;
+        let out = assess("m.test", &p);
+        assert!(!ran(&out), "{:?}", out.runs);
+        assert!(!out.findings.iter().any(|f| f.id == "email.dane.missing"));
+
+        // HTTPS lookup fails, SMTP answers "none": a real finding.
+        let port = spawn_mock_dns_fn(move |q, t| match (q, t) {
+            ("m.test", WireType::MX) => mx(),
+            ("_443._tcp.m.test", WireType::TLSA) => MockReply::Rcode(ResponseCode::ServFail),
+            _ => MockReply::NoData,
+        })
+        .await;
+        let p = lookup(port).await;
+        let out = assess("m.test", &p);
+        assert!(ran(&out), "{:?}", out.runs);
+        assert!(out.findings.iter().any(|f| f.id == "email.dane.missing"));
     }
 }

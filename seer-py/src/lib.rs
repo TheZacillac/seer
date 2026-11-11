@@ -330,6 +330,17 @@ fn nameserver_target(spec: &str) -> Option<(String, u16)> {
     NameserverSpec::parse(spec).ok().map(|s| (s.host, s.port))
 }
 
+/// `host` as seer-core normalizes a probe target (`normalize_host`: scheme,
+/// path, userinfo, port and trailing dot dropped, lowercased, IDN to
+/// punycode), or `None` for input it rejects. Lets `seer-api` recognize an IP
+/// literal in whatever spelling core would reduce to one (`127.0.0.1.`,
+/// `127.0.0.1:443`, `https://127.0.0.1/`) with core's own normalization
+/// rather than a hand-synced copy. Pure; no network I/O.
+#[pyfunction]
+fn normalize_host(host: &str) -> Option<String> {
+    seer_core::validation::normalize_host(host).ok()
+}
+
 /// Generates the single-argument bindings that make one core call and return
 /// its serialized result. `$call` runs inside the runtime, so a client static
 /// it names is built there on first use, with the GIL released.
@@ -379,7 +390,10 @@ call_fn! {
 /// Look up RDAP data for an Autonomous System Number (0 to 4294967295).
 /// An out-of-range number raises ValueError.
 #[pyfunction]
-fn rdap_asn<'py>(py: Python<'py>, asn: i64) -> PyResult<Bound<'py, PyAny>> {
+fn rdap_asn<'py>(
+    py: Python<'py>,
+    #[pyo3(from_py_with = int_arg)] asn: i64,
+) -> PyResult<Bound<'py, PyAny>> {
     let asn = u32::try_from(asn).map_err(|_| {
         PyValueError::new_err(format!("asn must be between 0 and 4294967295 (got {asn})"))
     })?;
@@ -514,6 +528,20 @@ const MAX_BULK_DOMAINS: usize = 100;
 /// from arithmetic (e.g. `len / chunk`) can't accidentally deadlock on a
 /// zero-permit semaphore. Taken as `i64` so a negative value raises this
 /// `ValueError` rather than PyO3's `OverflowError` for an unsigned parameter.
+/// Extracts an integer argument, so that one too large for `i64` raises the
+/// `ValueError` every other out-of-range value does instead of PyO3's
+/// `OverflowError` (`rdap_asn(2**64)`); the caller's range check then never
+/// sees it. Anything that is not an integer keeps PyO3's `TypeError`.
+fn int_arg(value: &Bound<'_, PyAny>) -> PyResult<i64> {
+    value.extract::<i64>().map_err(|e| {
+        if e.is_instance_of::<pyo3::exceptions::PyOverflowError>(value.py()) {
+            PyValueError::new_err("integer argument is out of range")
+        } else {
+            e
+        }
+    })
+}
+
 fn validate_concurrency(concurrency: i64) -> PyResult<usize> {
     match usize::try_from(concurrency) {
         Ok(c) if c <= MAX_CONCURRENCY => Ok(c.max(1)),
@@ -720,7 +748,7 @@ macro_rules! bulk_fn {
         fn $name<'py>(
             py: Python<'py>,
             domains: Vec<String>,
-            concurrency: i64,
+            #[pyo3(from_py_with = int_arg)] concurrency: i64,
             progress: Option<Py<PyAny>>,
         ) -> PyResult<Bound<'py, PyAny>> {
             run_bulk(py, domains, concurrency, progress, |domain| {
@@ -745,7 +773,7 @@ fn bulk_dig<'py>(
     py: Python<'py>,
     domains: Vec<String>,
     record_type: &str,
-    concurrency: i64,
+    #[pyo3(from_py_with = int_arg)] concurrency: i64,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
@@ -767,7 +795,7 @@ fn bulk_propagation<'py>(
     py: Python<'py>,
     domains: Vec<String>,
     record_type: &str,
-    concurrency: i64,
+    #[pyo3(from_py_with = int_arg)] concurrency: i64,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     validate_domains(&domains)?;
@@ -796,7 +824,11 @@ fn caa<'py>(py: Python<'py>, domain: String) -> PyResult<Bound<'py, PyAny>> {
 
 #[pyfunction]
 #[pyo3(signature = (domain, concurrency = 10))]
-fn takeover<'py>(py: Python<'py>, domain: String, concurrency: i64) -> PyResult<Bound<'py, PyAny>> {
+fn takeover<'py>(
+    py: Python<'py>,
+    domain: String,
+    #[pyo3(from_py_with = int_arg)] concurrency: i64,
+) -> PyResult<Bound<'py, PyAny>> {
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
         let result = SUBDOMAIN_ENUMERATOR.enumerate(&domain).await?;
@@ -817,7 +849,7 @@ fn takeover<'py>(py: Python<'py>, domain: String, concurrency: i64) -> PyResult<
 fn confusables<'py>(
     py: Python<'py>,
     domain: String,
-    concurrency: i64,
+    #[pyo3(from_py_with = int_arg)] concurrency: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
@@ -831,7 +863,7 @@ fn confusables<'py>(
 fn subdomains_classify<'py>(
     py: Python<'py>,
     domain: String,
-    concurrency: i64,
+    #[pyo3(from_py_with = int_arg)] concurrency: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let concurrency = validate_concurrency(concurrency)?;
     let response = run_async(py, async move {
@@ -875,7 +907,7 @@ fn dns_follow<'py>(
     domain: String,
     record_type: &str,
     nameserver: Option<String>,
-    iterations: i64,
+    #[pyo3(from_py_with = int_arg)] iterations: i64,
     interval_minutes: f64,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Refuse concurrent calls before touching any shared state — a second
@@ -1029,7 +1061,9 @@ fn record_types() -> Vec<String> {
 /// An adversarial WHOIS or RDAP response could nest arrays or objects
 /// deeply enough to overflow the thread stack during conversion, which
 /// aborts the process unrecoverably. The cap surfaces the failure as a
-/// catchable `ValueError` instead. 128 levels is well above anything any
+/// catchable `UpstreamError` instead — the depth comes from response data,
+/// never from the caller's input, so it is not a `ValueError` (which REST
+/// would answer with 400 and MCP with "invalid input"). 128 levels is well above anything any
 /// real-world registry response has ever contained.
 const MAX_JSON_DEPTH: usize = 128;
 
@@ -1053,7 +1087,7 @@ fn json_to_python_inner<'py>(
     // beyond that are rejected (`tests/test_json_depth.py` pins both
     // boundaries).
     if depth > MAX_JSON_DEPTH {
-        return Err(PyValueError::new_err(format!(
+        return Err(exceptions::UpstreamError::new_err(format!(
             "JSON structure exceeds max depth {MAX_JSON_DEPTH}"
         )));
     }
@@ -1099,7 +1133,7 @@ const MAX_TEST_NESTING: usize = 1024;
 /// nested arrays and runs it through [`json_to_python`].
 ///
 /// Used by `tests/test_json_depth.py` to verify the [`MAX_JSON_DEPTH`]
-/// guard raises `ValueError` instead of overflowing the thread stack on
+/// guard raises `UpstreamError` instead of overflowing the thread stack on
 /// an adversarial payload.
 ///
 /// This is a `#[pyfunction]` rather than a `#[cfg(test)]` Rust unit test
@@ -1181,8 +1215,9 @@ mod _seer {
         availability, bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation,
         bulk_ssl, bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
         dns_compare, dns_follow, dns_trace, dnssec, headers, info, lookup, nameserver_target,
-        posture, propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
-        subdomains, subdomains_classify, takeover, tld_info, validate_public_host, whois,
+        normalize_host, posture, propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip,
+        record_types, ssl, status, subdomains, subdomains_classify, takeover, tld_info,
+        validate_public_host, whois,
     };
 
     /// Forwards Rust `log` records into Python's `logging` — and `tracing`

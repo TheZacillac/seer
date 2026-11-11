@@ -35,11 +35,14 @@ pub fn page(theme: &Theme, data: &LensData) -> Option<Page> {
         summary_text,
         Style::default().fg(summary_color),
     ));
+    // The servers are set in the Options box; this lens has no keys of its
+    // own to advertise.
     let hint = Line::from(vec![
-        Span::styled("a ", Style::default().fg(theme.overlay0)),
-        Span::styled("cycle A  ", Style::default().fg(theme.subtext)),
-        Span::styled("b ", Style::default().fg(theme.overlay0)),
-        Span::styled("cycle B", Style::default().fg(theme.subtext)),
+        Span::styled("3 ", Style::default().fg(theme.overlay0)),
+        Span::styled(
+            "Options: servers A and B",
+            Style::default().fg(theme.subtext),
+        ),
     ]);
 
     // Build comparison rows from both servers' records.
@@ -299,5 +302,19 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("0 difference"), "{text}");
+    }
+
+    /// Regression: see `compare_keys_a_and_b_are_not_advertised…` in app.rs —
+    /// the page must not name keys the lens does not handle.
+    #[test]
+    fn the_hint_points_at_the_options_box() {
+        let theme = Theme::frappe();
+        let data = LensData::Compare(Box::new(comparison_fixture(true)));
+        let text = render_text(90, 14, |f| render(f, f.area(), &theme, &data));
+        assert!(
+            !text.contains("cycle A") && !text.contains("cycle B"),
+            "{text}"
+        );
+        assert!(text.contains("Options"), "{text}");
     }
 }

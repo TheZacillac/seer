@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -441,6 +441,21 @@ impl WhoisResponse {
         !self.has_registration_fields() && self.nameservers.is_empty()
     }
 
+    /// True when a status affirms the registration itself: `active` (DENIC's
+    /// `connect`), `ok`, `registered`, or an EPP `client…`/`server…` code. A
+    /// record can carry one with no registrar, dates or nameservers — a .de
+    /// domain delegated without `Nserver:` lines — and must still read as
+    /// registered rather than fall to the DNS tie-break. Other statuses
+    /// (`available`, `reserved`, `invalid`, …) prove nothing either way.
+    pub(crate) fn has_registered_status(&self) -> bool {
+        self.status.iter().any(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "active" | "ok" | "registered" | "connect")
+                || s.starts_with("client")
+                || s.starts_with("server")
+        })
+    }
+
     /// True when any registration field at all was extracted: the
     /// [`is_thin`](Self::is_thin) fields or a status.
     pub(crate) fn has_any_registry_field(&self) -> bool {
@@ -615,16 +630,25 @@ impl WhoisResponse {
     /// "no match") and [`registry_unavailable`](Self::registry_unavailable)
     /// (the TLD has no usable port-43 WHOIS server at all). Scans every
     /// non-comment line (no word-count gate) so a sentence-form refusal like
-    /// SWITCH's "Requests of this client are not permitted." is caught.
+    /// SWITCH's "Requests of this client are not permitted." is caught. A
+    /// `%`/`#` comment line counts too when it is short enough to be a
+    /// status line (`MAX_STATUS_LINE_WORDS`): RIPE-style registries print
+    /// their throttle notice as a comment (`% Error: … access control limit
+    /// exceeded`), while the long comment lines are terms-of-use prose that
+    /// merely mentions rate limits.
     pub fn indicates_registry_refusal(&self) -> bool {
         for line in self.raw_response.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('%') {
+            let content = trimmed.trim_start_matches(['%', '#']).trim_start();
+            if content.is_empty() {
                 continue;
             }
-            let lower = trimmed.to_lowercase();
-            let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-            if is_non_availability_line(&normalized) {
+            let lower = content.to_lowercase();
+            let words: Vec<&str> = lower.split_whitespace().collect();
+            if content.len() != trimmed.len() && words.len() > MAX_STATUS_LINE_WORDS {
+                continue;
+            }
+            if is_non_availability_line(&words.join(" ")) {
                 return true;
             }
         }
@@ -708,6 +732,11 @@ const AVAILABILITY_SENTENCE_PATTERNS: &[&str] = &[
 /// [`NON_AVAILABILITY_WORDS`].
 const NON_AVAILABILITY_PATTERNS: &[&str] = &[
     "not available", // "...is not available for registration."
+    // Other negations of the same sentence, which contain the positive
+    // "available for registration" without the literal "not available".
+    "not currently available",
+    "no longer available",
+    "isn't available",
     // Reserved-status phrasings. Deliberately NOT the bare word "reserved":
     // nearly every WHOIS body ends with an "All rights reserved." copyright
     // footer, and matching it would misroute genuinely-unregistered domains
@@ -727,6 +756,7 @@ const NON_AVAILABILITY_PATTERNS: &[&str] = &[
     "not permitted", // SWITCH .ch "Requests of this client are not permitted."
     "try again",     // throttle hint ("please try again later")
     "temporarily unavailable",
+    "limit exceeded", // DENIC "% Error: … access control limit exceeded"
 ];
 
 /// Single-token refusal / throttle markers. Unlike the phrases above these
@@ -741,6 +771,7 @@ const NON_AVAILABILITY_WORDS: &[&str] = &[
     "denied",
     "refused",
     "blocked",
+    "unavailable", // "This domain is unavailable for registration."
 ];
 
 /// True when a normalized (lowercased, single-spaced) line negates, refuses
@@ -1079,7 +1110,24 @@ pub(crate) fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
 /// same either way. Shared with the RDAP parser (RDAP's `eventDate` is nominally
 /// strict RFC 3339, but real servers are as sloppy as WHOIS, so both reuse this
 /// tolerant parser).
+///
+/// A year before 1000 is refused: chrono's `%Y` takes one to four digits, so
+/// a two-digit-year date (`31-12-25`) would otherwise "parse" as the year 31.
 pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<DateTime<Utc>> {
+    parse_date_any_year(date_str, order).filter(|d| d.year() >= 1000)
+}
+
+/// Zone abbreviations registries print after a local time, with the UTC
+/// offset each stands for. Only unambiguous ones belong here (`CST`, `IST`
+/// and the like name several zones).
+const ZONE_ABBREVIATIONS: &[(&str, &str)] = &[
+    // NIC Chile (.cl): `2002-10-22 17:48:23 CLST`
+    (" CLST", "-03:00"),
+    (" CLT", "-04:00"),
+];
+
+/// [`parse_date_with_order`] without the year check.
+fn parse_date_any_year(date_str: &str, order: DateOrder) -> Option<DateTime<Utc>> {
     static_regex! {
         // Registro.br appends the registration ticket: `created: 19970711 #46903`.
         TICKET_SUFFIX = r"\s+#\d+$";
@@ -1094,7 +1142,16 @@ pub(crate) fn parse_date_with_order(date_str: &str, order: DateOrder) -> Option<
     if trimmed.len() > MAX_DATE_LEN {
         return None;
     }
-    let zulu = trimmed.strip_suffix(" UTC").map(|d| format!("{d}Z"));
+    let zulu = trimmed
+        .strip_suffix(" UTC")
+        .map(|d| format!("{d}Z"))
+        .or_else(|| {
+            ZONE_ABBREVIATIONS
+                .iter()
+                .find_map(|(abbreviation, offset)| {
+                    Some(format!("{}{offset}", trimmed.strip_suffix(abbreviation)?))
+                })
+        });
     let cleaned = zulu
         .as_deref()
         .unwrap_or(trimmed)
@@ -1984,6 +2041,33 @@ Name Server: ns1.example.com
                 "must NOT detect available from: {raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn negated_available_for_registration_is_not_available() {
+        // Regression: only the literal "not available" vetoed the positive
+        // "available for registration" substring.
+        for raw in [
+            "This domain is unavailable for registration.\n",
+            "This name is not currently available for registration.\n",
+            "Name no longer available for registration\n",
+            "This name isn't available for registration\n",
+        ] {
+            let r = make_response(raw);
+            assert!(!r.is_available(), "{raw:?}");
+            assert!(r.indicates_registry_refusal(), "{raw:?}");
+        }
+        // The word gate keeps a domain that merely contains the word.
+        assert!(make_response("No match for UNAVAILABLE.COM\n").is_available());
+        // Only a status that affirms registration counts as one.
+        let status = |s: &str| WhoisResponse {
+            status: vec![s.to_string()],
+            ..make_response("")
+        };
+        assert!(status("active").has_registered_status());
+        assert!(status("clientTransferProhibited").has_registered_status());
+        assert!(!status("available").has_registered_status());
+        assert!(!status("reserved").has_registered_status());
     }
 
     #[test]
@@ -3588,5 +3672,40 @@ Name Server: ns2.example.com
         );
         assert_eq!(fmt(parse_date("2024-01-15T13:30:00.000+03")), want, "+03");
         assert_eq!(fmt(parse_date("2024-01-15T10:30:00.000")), want, "naive");
+    }
+
+    /// Regression: a throttle notice on a `%` comment line was skipped, so
+    /// the availability ladder guessed from DNS instead of answering
+    /// "inconclusive".
+    #[test]
+    fn a_short_comment_line_refusal_is_a_refusal() {
+        for raw in [
+            "% Error: 55000000002 Connection refused; access control limit exceeded\n",
+            "%ERROR:201: access denied\n",
+            "% Quota exceeded\n",
+        ] {
+            assert!(make_response(raw).indicates_registry_refusal(), "{raw:?}");
+        }
+        // Terms-of-use prose in a comment is not one.
+        let tos = "% Use of this service is subject to a rate limit and abusive clients \
+                   will find their access denied without further notice.\n";
+        assert!(!make_response(tos).indicates_registry_refusal());
+    }
+
+    /// Regression: `%Y` accepts short years, so `31-12-25` read as the year
+    /// 31; and a trailing zone abbreviation dropped the whole date.
+    #[test]
+    fn short_years_are_refused_and_chilean_zones_are_read() {
+        assert_eq!(parse_date("31-12-25"), None);
+        assert_eq!(parse_date("12-31-25"), None);
+        let fmt = |s: &str| parse_date(s).map(|d| d.to_rfc3339());
+        assert_eq!(
+            fmt("2002-10-22 17:48:23 CLST").as_deref(),
+            Some("2002-10-22T20:48:23+00:00")
+        );
+        assert_eq!(
+            fmt("2002-06-22 17:48:23 CLT").as_deref(),
+            Some("2002-06-22T21:48:23+00:00")
+        );
     }
 }

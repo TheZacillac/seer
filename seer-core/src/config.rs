@@ -163,6 +163,21 @@ impl SeerConfig {
         match toml::from_str::<SeerConfig>(content) {
             Ok(config) => {
                 debug!(?path, "Loaded config");
+                // An unknown key is tolerated (a newer or older seer may know
+                // it) but said out loud: a misspelled one would otherwise
+                // leave its default in force with nothing to show for it.
+                let unknown = Self::unknown_keys(content);
+                if !unknown.is_empty() {
+                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    WARN_ONCE.call_once(|| {
+                        eprintln!(
+                            "Warning: unknown setting{} in {} ignored: {}",
+                            if unknown.len() == 1 { "" } else { "s" },
+                            path.display(),
+                            unknown.join(", ")
+                        );
+                    });
+                }
                 config.clamped()
             }
             Err(e) => {
@@ -182,6 +197,39 @@ impl SeerConfig {
                 Self::default()
             }
         }
+    }
+
+    /// The dotted paths of keys and tables in `content` that no setting
+    /// reads (`timeouts.whois_sec`, `timeout`), in file order. Empty when
+    /// the content is not valid TOML — that is reported as malformed.
+    pub(crate) fn unknown_keys(content: &str) -> Vec<String> {
+        // Every setting present, so the optional ones count as known.
+        let full = Self {
+            nameserver: Some(String::new()),
+            watch: WatchConfig {
+                webhook_url: Some(String::new()),
+            },
+            ..Self::default()
+        };
+        let (Ok(file), Ok(known)) = (content.parse::<toml::Table>(), toml::Table::try_from(full))
+        else {
+            return Vec::new();
+        };
+        fn walk(file: &toml::Table, known: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+            for (key, value) in file {
+                let path = format!("{prefix}{key}");
+                match (value, known.get(key)) {
+                    (toml::Value::Table(file), Some(toml::Value::Table(known))) => {
+                        walk(file, known, &format!("{path}."), out);
+                    }
+                    (_, Some(_)) => {}
+                    (_, None) => out.push(path),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&file, &known, "", &mut out);
+        out
     }
 
     /// Clamp loaded values into sane ranges. Without this, a user
@@ -442,5 +490,22 @@ concurrency = 20
         config.bulk.rate_limit_ms = 10_000_000;
         let config = config.clamped();
         assert!(config.bulk.rate_limit_ms <= 60_000);
+    }
+
+    /// Regression: a misspelled key or section was ignored without a word,
+    /// so `seer config` showed defaults as though the file had set them.
+    #[test]
+    fn unknown_keys_are_reported_by_path() {
+        let content = "nameserver = \"1.1.1.1\"\n[timeouts]\nwhois_sec = 3\ndns_secs = 2\n\n\
+                       [bulk]\nconcurency = 2\n\n[timeout]\ndns_secs = 1\n\n\
+                       [watch]\nwebhook_url = \"https://example.com/hook\"\n";
+        let mut unknown = SeerConfig::unknown_keys(content);
+        unknown.sort();
+        assert_eq!(
+            unknown,
+            ["bulk.concurency", "timeout", "timeouts.whois_sec"]
+        );
+        assert!(SeerConfig::unknown_keys(&SeerConfig::default_toml()).is_empty());
+        assert!(SeerConfig::unknown_keys("not = [valid").is_empty());
     }
 }

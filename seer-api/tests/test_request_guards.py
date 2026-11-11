@@ -251,6 +251,159 @@ def test_cross_origin_rest_request_blocked_without_key(monkeypatch, client):
     assert "access-control-allow-origin" not in {k.lower() for k in resp.headers}
 
 
+def test_cross_site_request_without_origin_blocked_without_key(monkeypatch, client):
+    """Regression: a no-cors GET (`<img src=…>`, a navigation) carries no
+    Origin, so the guard read it as a non-browser client and ran it."""
+    _no_key(monkeypatch)
+    calls = []
+    monkeypatch.setattr(seer, "lookup", lambda d: calls.append(d) or {"domain": d}, raising=False)
+    resp = client.get("/lookup/example.com", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status_code == 403
+    assert calls == []
+    # The page's own requests and a typed URL are not cross-site.
+    for site in ("same-origin", "none"):
+        resp = client.get("/lookup/example.com", headers={"Sec-Fetch-Site": site})
+        assert resp.status_code == 200, site
+    # With a key, auth is the guard: the request gets as far as the 401.
+    monkeypatch.setenv("SEER_API_KEY", "k")
+    resp = client.get("/lookup/example.com", headers={"Sec-Fetch-Site": "cross-site"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"domains":["a.com"],"concurrency":NaN}',
+        b'{"domains":["a.com"],"concurrency":Infinity}',
+        b'{"domains":[NaN]}',
+        b'{"domains":["a\\ud800.com"],"concurrency":"x"}',
+    ],
+)
+def test_unencodable_invalid_body_is_422_not_500(monkeypatch, body):
+    """Regression: the default 422 echoed the input, which cannot be encoded
+    when it holds NaN/Infinity or a lone surrogate, so the reply was a 500."""
+    _no_key(monkeypatch)
+    monkeypatch.setattr(seer, "bulk_lookup", lambda *a, **k: [], raising=False)
+    quiet = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
+    resp = quiet.post("/lookup/bulk", content=body, headers={"content-type": "application/json"})
+    assert resp.status_code == 422, resp.text
+    assert all(set(e) == {"loc", "msg", "type"} for e in resp.json()["detail"])
+
+
+def test_own_rate_limit_uses_the_detail_shape_with_retry_after(monkeypatch, client):
+    """Regression: the API's own 429 answered `{"error": …}` with no
+    Retry-After, unlike every other error (and an upstream 429)."""
+    _no_key(monkeypatch)
+    monkeypatch.setattr(seer, "takeover", lambda *a, **k: {"domain": "x.com"}, raising=False)
+    responses = [client.get("/takeover/ratelimit-shape.com") for _ in range(8)]
+    limited = [r for r in responses if r.status_code == 429]
+    assert limited, [r.status_code for r in responses]
+    assert limited[0].json()["detail"].startswith("Rate limit exceeded")
+    assert int(limited[0].headers["retry-after"]) >= 1
+
+
+def test_control_characters_never_reach_the_logs(monkeypatch, client, caplog):
+    """Regression: `%0A` in a domain forged a second log record, and ESC in
+    the path reached the request log raw."""
+    _no_key(monkeypatch)
+
+    def _reject(domain):
+        raise ValueError(f"Invalid domain name: {domain}")
+
+    monkeypatch.setattr(seer, "whois", _reject, raising=False)
+    with caplog.at_level(logging.INFO, logger="seer_api"):
+        resp = client.get("/whois/a.b%0AWARNING:seer_api:FORGED%1b[2J")
+    assert resp.status_code == 400
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("FORGED" in m for m in messages), messages
+    assert not any("\n" in m or "\x1b" in m for m in messages), messages
+
+
+@pytest.mark.parametrize(
+    "uri", ["memory://", "MEMORY://", "memory:// ", "memory://x", "async+memory://"]
+)
+def test_every_spelling_of_the_memory_store_is_recognized(uri):
+    """Regression: the multi-worker check compared the URI to the exact
+    string `memory://`, so another spelling of the same store passed."""
+    from seer_api import main
+
+    assert main._is_memory_storage(uri)
+    assert not main._is_memory_storage("redis://host:6379")
+
+
+def test_a_scoped_address_is_not_resolved_by_the_precheck(monkeypatch):
+    """Regression: Python accepts `fe80::1%eth0` as a literal, core does not,
+    so the pre-check had core resolve it — an oracle for interface names."""
+    from seer_api import ssrf
+
+    def _never(host, port):
+        raise AssertionError(f"resolved {host}")
+
+    monkeypatch.setattr(seer, "validate_public_host", _never, raising=False)
+    ssrf.vet_host("fe80::1%nosuchif0")
+    ssrf.vet_host("fe80::1%lo")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"domains": ["", "   "]},
+        {"domains": ["example.com", " "]},
+        {"domains": ["example.com"], "concurrency": True},
+    ],
+)
+def test_rest_bulk_body_holds_the_contract_mcp_enforces(monkeypatch, client, body):
+    """Regression: REST accepted blank domains and a boolean concurrency
+    that the MCP bulk tools reject, though both claim one contract."""
+    _no_key(monkeypatch)
+    calls = []
+    monkeypatch.setattr(seer, "bulk_lookup", lambda *a, **k: calls.append(a) or [], raising=False)
+    resp = client.post("/lookup/bulk", json=body)
+    assert resp.status_code == 422, resp.text
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["127.0.0.1", "127.0.0.1.", "127.0.0.1:443", "x@127.0.0.1", " 127.0.0.1", "https://127.0.0.1/"],
+)
+def test_every_spelling_of_a_reserved_literal_gets_the_precheck(monkeypatch, spelling):
+    """Regression: the literal test ran on the raw input while core
+    normalizes first, so `127.0.0.1.` and `127.0.0.1:443` skipped the
+    documented 400 and got whatever core answered instead."""
+    from seer_api import ssrf
+
+    def _normalize(host):
+        # What seer-core's `normalize_host` returns for these inputs.
+        return "127.0.0.1"
+
+    seen = []
+
+    def _refuse(host, port):
+        seen.append(host)
+        raise ValueError(f"Invalid input: refusing to connect to reserved address: {host}")
+
+    monkeypatch.setattr(seer, "normalize_host", _normalize, raising=False)
+    monkeypatch.setattr(seer, "validate_public_host", _refuse, raising=False)
+    with pytest.raises(ValueError, match="reserved"):
+        ssrf.vet_host(spelling)
+    assert seen == ["127.0.0.1"]
+
+
+def test_a_hostname_is_still_never_prechecked(monkeypatch):
+    from seer_api import ssrf
+
+    def _never(host, port):
+        raise AssertionError(f"pre-checked {host}")
+
+    monkeypatch.setattr(seer, "normalize_host", lambda h: h.lower(), raising=False)
+    monkeypatch.setattr(seer, "validate_public_host", _never, raising=False)
+    ssrf.vet_host("Internal.Corp.Example")
+    # Bindings without `normalize_host`: the plain-literal check only.
+    monkeypatch.delattr(seer, "normalize_host", raising=False)
+    ssrf.vet_host("127.0.0.1.")
+
+
 def test_cors_allowlist_admits_its_origins(monkeypatch):
     import importlib
 

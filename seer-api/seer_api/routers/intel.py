@@ -91,7 +91,7 @@ async def subdomains(
     flagged.
     """
     call = (
-        run_seer(seer.subdomains_classify, domain, concurrency)
+        run_bulk(seer.subdomains_classify, domain, concurrency)
         if resolve
         else run_seer(seer.subdomains, domain)
     )
@@ -224,7 +224,7 @@ async def takeover(
     reported as potential. Rate-limited like ``confusables`` because it fans
     out across the whole enumerated zone.
     """
-    return await as_http(run_seer(seer.takeover, domain, concurrency), "Takeover scan failed")
+    return await as_http(run_bulk(seer.takeover, domain, concurrency), "Takeover scan failed")
 
 
 # --- confusables ---------------------------------------------------------
@@ -240,4 +240,4 @@ async def confusables(
     concurrency: int = Query(10, ge=1, le=MAX_CONCURRENCY),
 ):
     """Find registered typosquat / look-alike domains for a domain."""
-    return await as_http(run_seer(seer.confusables, domain, concurrency), "Confusables scan failed")
+    return await as_http(run_bulk(seer.confusables, domain, concurrency), "Confusables scan failed")

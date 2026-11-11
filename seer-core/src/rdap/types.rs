@@ -620,9 +620,33 @@ impl RdapResponse {
     /// the existing `validate_size` size/width check with a recursive
     /// entity-nesting depth check to prevent adversarial responses from
     /// driving recursion to a stack-overflow abort.
+    ///
+    /// Also refuses a body that is not an RDAP object at all: an RFC 9083 §6
+    /// error object (`errorCode`) or a JSON document with no object class
+    /// and no identifying member (a gateway or WAF page), either of which
+    /// some servers send with HTTP 200. Every member here is optional, so
+    /// such a body would otherwise parse as an empty "registered" record.
     pub fn validate(&self) -> Result<()> {
         self.validate_size()?;
         Self::walk_depth(&self.entities, 0)?;
+        if self.extra.contains_key("errorCode") {
+            return Err(SeerError::RdapError(
+                "server returned an RDAP error object instead of a record".to_string(),
+            ));
+        }
+        let identified = self.object_class_name.is_some()
+            || self.handle.is_some()
+            || self.ldh_name.is_some()
+            || self.unicode_name.is_some()
+            || !self.status.is_empty()
+            || !self.events.is_empty()
+            || !self.entities.is_empty()
+            || !self.nameservers.is_empty();
+        if !identified {
+            return Err(SeerError::RdapError(
+                "response is not an RDAP object (no objectClassName or record data)".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1411,5 +1435,25 @@ mod tests {
         let ids = &r.entities[0].public_ids;
         assert_eq!(ids.len(), 1, "{ids:?}");
         assert_eq!(ids[0].identifier, "292");
+    }
+
+    #[test]
+    fn a_non_record_body_fails_validation() {
+        // Regression: an error object or gateway page sent with HTTP 200
+        // parsed as an all-default record and read as "registered, high".
+        for body in [
+            r#"{"errorCode":404,"title":"Not Found","description":["no such domain"]}"#,
+            r#"{"message":"rate limited"}"#,
+            "{}",
+        ] {
+            let r: RdapResponse = serde_json::from_str(body).unwrap();
+            assert!(r.validate().is_err(), "{body}");
+        }
+        let ok: RdapResponse =
+            serde_json::from_str(r#"{"objectClassName":"domain","handle":"X"}"#).unwrap();
+        ok.validate().unwrap();
+        // A sparse record without the class name still counts.
+        let sparse: RdapResponse = serde_json::from_str(r#"{"ldhName":"example.com"}"#).unwrap();
+        sparse.validate().unwrap();
     }
 }

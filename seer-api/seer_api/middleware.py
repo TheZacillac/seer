@@ -229,6 +229,12 @@ class RequestMetrics:
 metrics = RequestMetrics()
 
 
+def _log_safe(text: str) -> str:
+    """``text`` with control characters removed, for one log line: a request
+    path keeps bytes such as ESC that would otherwise reach the log raw."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+
+
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Middleware that logs requests with timing and adds request IDs."""
 
@@ -254,7 +260,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 "request_id=%s method=%s path=%s status=500 latency_ms=%.1f",
                 request_id,
                 request.method,
-                request.url.path,
+                _log_safe(request.url.path),
                 latency_ms,
             )
             raise
@@ -272,7 +278,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             "request_id=%s method=%s path=%s status=%d latency_ms=%.1f",
             request_id,
             request.method,
-            request.url.path,
+            _log_safe(request.url.path),
             response.status_code,
             latency_ms,
         )

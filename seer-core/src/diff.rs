@@ -83,8 +83,8 @@ impl DomainDiffer {
     /// All four network calls (lookup + status for each domain) run concurrently.
     #[instrument(skip(self), fields(domain_a = %domain_a, domain_b = %domain_b))]
     pub async fn diff(&self, domain_a: &str, domain_b: &str) -> Result<DomainDiff> {
-        let domain_a = crate::validation::normalize_domain(domain_a)?;
-        let domain_b = crate::validation::normalize_domain(domain_b)?;
+        let domain_a = compared_name(domain_a)?;
+        let domain_b = compared_name(domain_b)?;
 
         // Box::pin each branch so the four heavyweight futures live on the heap
         // instead of inlining into the join! state. Each lookup/status future
@@ -120,6 +120,14 @@ impl DomainDiffer {
             errors,
         })
     }
+}
+
+/// The name one side of a diff is compared under: the exact host
+/// (`normalize_host`, so `www.` is kept). The DNS and TLS rows are per-host
+/// probes — `www` routinely has its own records and certificate — while the
+/// registration lookup reduces the name to its registrable form itself.
+fn compared_name(input: &str) -> Result<String> {
+    crate::validation::normalize_host(input)
 }
 
 /// One sanitized line per failed `(domain, check, error)` leg; the full error
@@ -203,6 +211,18 @@ fn build_ssl_diff(a: Option<&StatusResponse>, b: Option<&StatusResponse>) -> Ssl
 
 #[cfg(test)]
 mod tests {
+    /// Regression: both sides were normalized with `normalize_domain`, so
+    /// `diff www.example.com example.com` compared the apex with itself.
+    #[test]
+    fn www_is_kept_so_a_host_can_be_compared_with_its_apex() {
+        assert_eq!(
+            compared_name("https://WWW.Example.com/").unwrap(),
+            "www.example.com"
+        );
+        assert_eq!(compared_name("example.com").unwrap(), "example.com");
+        assert!(compared_name("not a domain").is_err());
+    }
+
     use super::*;
 
     #[test]

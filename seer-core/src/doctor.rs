@@ -283,6 +283,16 @@ impl Doctor {
         // feature isn't enabled in this workspace.
         match std::fs::read_to_string(path) {
             Ok(content) => match toml::from_str::<SeerConfig>(&content) {
+                Ok(_) if !SeerConfig::unknown_keys(&content).is_empty() => DoctorCheck::new(
+                    CHECK_CONFIG,
+                    CheckStatus::Warn,
+                    format!(
+                        "{} has unknown settings (ignored): {}",
+                        path.display(),
+                        one_line(&SeerConfig::unknown_keys(&content).join(", "))
+                    ),
+                    None,
+                ),
                 Ok(_) => DoctorCheck::new(
                     CHECK_CONFIG,
                     CheckStatus::Pass,

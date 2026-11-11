@@ -84,7 +84,7 @@ pub(crate) fn assess(r: &TakeoverReport) -> CheckOutput {
         })
         .collect();
     if findings.is_empty() && r.inconclusive > 0 {
-        out.incomplete(CHECK, K, "provider CNAME could not be checked");
+        out.incomplete(CHECK, K, "some hosts could not be checked");
     } else {
         out.ran(CHECK, K, findings);
     }

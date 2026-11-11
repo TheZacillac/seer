@@ -11,6 +11,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Availability.** A WHOIS record whose status affirms the registration
+  (DENIC `Status: connect`, `ok`, an EPP code) but carries no registrar,
+  dates or nameservers is registered — it used to fall to the DNS tie-break
+  and could read "likely available". "unavailable / not currently available
+  / no longer available for registration" no longer match the positive
+  "available for registration" pattern.
+- **RDAP.** A 200 body that is an RDAP error object (`errorCode`) or carries
+  no object class and no record data is a failed lookup, not an empty
+  "registered" record.
+- **Takeover.** A failed CNAME lookup makes the host inconclusive (and the
+  audit's takeover check incomplete) instead of clean. The S3 `.s3-website`
+  fragment only matches names under `amazonaws.com` / `amazonaws.com.cn`.
+- **Status / watch / diff.** When nothing resolves and a DNS lookup failed,
+  the status check reports a `dns` error instead of "does not resolve".
+  `diff` keeps a leading `www.`, so a host can be compared with its apex.
+- **DNSSEC.** A check whose DS read failed, or whose DNSKEY read timed out,
+  returns an error instead of a `partial` / `misconfigured` verdict (an
+  answered DNSKEY failure with DS present is still `misconfigured`).
+- **Email posture.** The DMARC walk always ends at the Organizational
+  Domain, so a deeply nested name inherits its policy.
+- **Follow.** `follow` (and every uncached lookup) without a nameserver asks
+  the default upstream each time instead of replaying a cached answer until
+  its TTL expired.
+- **REPL.** Tab after a non-ASCII space (NBSP, U+3000) no longer panics.
+- **Bulk.** An unwritable CSV path is refused before the run; a write that
+  fails afterwards is reported after the summary and failure list.
+- **CLI errors** are sanitized like every other remote text (human and
+  Markdown).
+- **seer-api.** Without `SEER_API_KEY`, a browser request with no `Origin`
+  but `Sec-Fetch-Site: cross-site` gets 403. A request body that fails
+  validation returns 422 without echoing the input (NaN, Infinity or a lone
+  surrogate used to produce a 500).
+- **Availability.** A throttle notice on a short `%`/`#` comment line
+  (DENIC's "access control limit exceeded") is a refusal, so the verdict is
+  inconclusive instead of guessed from DNS.
+- **WHOIS parsing.** Nominet's "No name servers listed." is no longer a
+  nameserver named `no`. Dates with a `CLT`/`CLST` zone (.cl) parse; a
+  two-digit-year date is refused instead of read as the year 25.
+- **RDAP.** URLs carrying credentials are refused, and a redirect may only
+  target port 443.
+- **Lookup errors.** IPv6 literals that start or end with `::` are redacted
+  from public error text.
+- **Email posture.** An SPF `redirect=` containing a macro is unknown, not a
+  permerror. A DKIM selector record with a `v=` other than `DKIM1` is not a
+  key.
+- **Audit.** A site that upgrades to HTTPS on its own domain and then
+  redirects elsewhere no longer gets `web.upgrade.missing`.
+- **DNS.** A TXT record's `text` is decoded across its character-strings,
+  so a character split between two of them survives.
+- **seer-api.** The multi-worker check recognizes every spelling of the
+  in-memory rate-limit store, and a blank `SEER_RATE_LIMIT` means the
+  default. Control characters are stripped from logged error text and
+  request paths. A scoped IPv6 address (`fe80::1%eth0`) is no longer
+  resolved by the SSRF pre-check.
+- **Special-use names.** `dig +trace` and the DNSSEC check refuse a name
+  that is never sent to DNS servers (`.onion`, `.invalid`) instead of
+  sending it to a root server or the upstream (RFC 7686).
+- **CAA.** The tree climb has one overall deadline (three resolver
+  timeouts); a silent resolver used to cost a full timeout per label, which
+  stalled `ssl` and `status` on deep names.
+- **Audit.** The DANE check is judged on the SMTP scope alone: a failed
+  `_25._tcp` lookup is incomplete even when an HTTPS TLSA record exists, and
+  a failed HTTPS lookup no longer hides a clean SMTP answer.
+- **Subdomains.** CT log fetches go through the SSRF guard and connect to
+  the vetted addresses, like every other outbound request.
+- **RDAP.** A reply nested more than 64 levels deep is refused (it could
+  pass core and then fail a whole Python bulk call).
+- **TUI.** An ad-hoc `:diff` / `:compare` re-runs when its options change
+  with no session domain; a Follow run that cannot start says why; PgDn in
+  the Bulk detail stops at the last line; the Compare page no longer
+  advertises the removed `a` / `b` keys.
+- **seer-api.** Fan-out scans (takeover, confusables, subdomain
+  classification, REST and MCP) take a slot from the bulk cap, so they can
+  no longer pin every dispatch thread. A REST bulk body with a blank domain
+  or a boolean `concurrency` is a 422, as MCP already refused.
+- **seer-py.** An over-deep result raises `UpstreamError`, not `ValueError`.
+- **Follow.** The banner shows the interval the run actually uses (rounded
+  to the second, at least 1s when looping), not the typed minutes.
+- **seer-py.** An integer argument too large for 64 bits raises
+  `ValueError` like any other out-of-range value, not `OverflowError`.
+- **seer-api.** The SSRF pre-check recognizes a reserved IP literal in any
+  spelling core reduces to one (`127.0.0.1.`, `127.0.0.1:443`,
+  `https://127.0.0.1/`), so they get the documented 400.
+
+### Added
+- `seer.normalize_host(host)` (Python): seer-core's probe-target
+  normalization, or `None` for invalid input.
+
+### Changed
+- `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
+  silently ignored); use `--format json`.
+- TUI: a `:` command with extra arguments (`:prop example.com MX`,
+  `:compare … MX`) is refused instead of dropping them; `:compare` accepts
+  `@server` spellings.
+- An unknown key or section in `~/.seer/config.toml` prints a warning, and
+  `seer doctor` reports it; the file still loads.
+- **seer-api (breaking for clients reading the body):** the API's own 429
+  is `{"detail": "Rate limit exceeded: …"}` with a `Retry-After` header,
+  matching every other error (it was `{"error": …}`).
+
 ## [0.58.0] - 2026-11-02
 
 ### Changed

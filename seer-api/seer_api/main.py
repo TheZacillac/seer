@@ -4,16 +4,17 @@ import hmac
 import ipaddress
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from limits import parse_many as _parse_rate_limits
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.routing import Route
 
@@ -152,8 +153,10 @@ def _mcp_rate_ok(client_ip: str) -> bool:
     """
     global _mcp_rate_values
     if _mcp_rate_values is None:
+        # Blank counts as unset, as for the other variables: parsing "" would
+        # raise on every /mcp request.
         _mcp_rate_values = _parse_rate_limits(
-            os.environ.get("SEER_RATE_LIMIT", "30/minute")
+            (os.environ.get("SEER_RATE_LIMIT") or "").strip() or "30/minute"
         )
     window = mcp_rate_limiter()
     return all(window.hit(item, "mcp", client_ip) for item in _mcp_rate_values)
@@ -241,6 +244,61 @@ def _origin_blocked(origin: str, allowed: list[str]) -> bool:
     if _api_key():
         return False
     return not _is_loopback_host(_header_host(origin))
+
+
+def _fetch_site_blocked(origin: str, fetch_site: str) -> bool:
+    """Whether a browser request that carries no Origin is a drive-by.
+
+    Browsers omit ``Origin`` on no-cors GETs (``<img>``, ``<script>``, a
+    top-level navigation), so :func:`_origin_blocked` alone lets a page on
+    another site drive the keyless API with one. They do send
+    ``Sec-Fetch-Site`` on those requests, and a page cannot forge it:
+    ``cross-site`` with no key is refused. Non-browser clients send neither
+    header and pass; with ``SEER_API_KEY`` set, auth already refuses these.
+    """
+    if origin or _api_key():
+        return False
+    return fetch_site.strip().lower() == "cross-site"
+
+
+def _is_memory_storage(storage_uri: str) -> bool:
+    """Whether ``storage_uri`` selects the per-process in-memory store.
+
+    ``limits`` picks the backend by URL scheme, so ``MEMORY://``,
+    ``memory://x``, ``async+memory://`` and a value with stray whitespace all
+    mean the same store as ``memory://``.
+    """
+    scheme = storage_uri.strip().partition("://")[0].lower()
+    return scheme.rpartition("+")[2] == "memory"
+
+
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """429 for the API's own limit, in the ``{"detail": …}`` shape every
+    other error uses, with ``Retry-After`` (slowapi's stock handler answers
+    ``{"error": …}`` and no header)."""
+    response = JSONResponse(
+        {"detail": f"Rate limit exceeded: {exc.detail}"}, status_code=429
+    )
+    current = getattr(request.state, "view_rate_limit", None)
+    if current is not None:
+        item, args = current
+        reset_at = limiter.limiter.get_window_stats(item, *args)[0]
+        response.headers["Retry-After"] = str(max(1, int(reset_at - time.time()) + 1))
+    return response
+
+
+def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """422 for a body that fails validation, without echoing the input.
+
+    FastAPI's default handler includes the offending value, which Starlette
+    cannot encode when it is NaN, Infinity or a lone surrogate — turning a
+    client error into a 500 with a traceback.
+    """
+    detail = [
+        {"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+        for e in exc.errors()
+    ]
+    return JSONResponse({"detail": detail}, status_code=422)
 
 
 def _mcp_origin_blocked(origin: str) -> bool:
@@ -370,7 +428,7 @@ async def lifespan(_app: FastAPI):
         workers = env_int("WEB_CONCURRENCY", 1, min_value=1)
     else:
         workers = env_int("UVICORN_WORKERS", 1, min_value=1)
-    if workers > 1 and storage_uri == "memory://":
+    if workers > 1 and _is_memory_storage(storage_uri):
         log.error(
             "Multi-worker deployment (WEB_CONCURRENCY=%d) requires "
             "SEER_RATE_LIMIT_STORAGE (e.g. redis://host:6379). Refusing to "
@@ -422,7 +480,8 @@ app = FastAPI(
 
 # Add rate limiter to app state and exception handler
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
+app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
 # Body size cap — reject oversized payloads with 413 before they hit
 # any router. Default 64KB is generous for a 100-domain bulk request
@@ -496,7 +555,9 @@ async def auth_middleware(request: Request, call_next):
             return JSONResponse(
                 {"detail": "rate limit exceeded"}, status_code=429
             )
-    elif _origin_blocked(origin, _csv_env("SEER_CORS_ORIGINS")):
+    elif _origin_blocked(origin, _csv_env("SEER_CORS_ORIGINS")) or _fetch_site_blocked(
+        origin, request.headers.get("sec-fetch-site", "")
+    ):
         return JSONResponse(
             {
                 "detail": "cross-origin request blocked; set "

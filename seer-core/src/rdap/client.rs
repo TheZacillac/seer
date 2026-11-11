@@ -682,10 +682,37 @@ fn parse_rdap_url(url: &str) -> Result<(String, u16)> {
             url
         )));
     }
+    // No credentials, as `net::validate_http_url` rules: reqwest would turn
+    // userinfo into an `Authorization` header on a request seer originates.
+    // The URL is not echoed — it carries them.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(SeerError::RdapError(
+            "RDAP URL carries credentials — request blocked".to_string(),
+        ));
+    }
     let host = crate::net::url_host(&parsed)
         .ok_or_else(|| SeerError::RdapError(format!("URL '{}' has no host", url)))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
     Ok((host, port))
+}
+
+/// Holds a server-supplied redirect target to the standard HTTPS port, so a
+/// redirect chain cannot be used to probe other ports of a public host (the
+/// rule `net::validate_http_url` applies to every HTTP probe). Bootstrap
+/// base URLs are IANA's and keep whatever port they name. `allow_reserved`
+/// is the test seam, with the same loopback-only reach as in
+/// [`send_rdap_request`]: fixtures listen on ephemeral ports.
+fn vet_redirect_port(target: &str, allow_reserved: bool) -> Result<()> {
+    if allow_reserved && is_loopback_url(target) {
+        return Ok(());
+    }
+    let (_, port) = parse_rdap_url(target)?;
+    if port != 443 {
+        return Err(SeerError::RdapError(format!(
+            "RDAP redirect to non-standard port {port} blocked"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves an RDAP host through the shared SSRF guard
@@ -866,6 +893,17 @@ async fn read_and_parse_rdap_body(
             )),
         })?;
 
+    // Refuse absurd nesting before parsing. serde_json accepts ~127 levels,
+    // and unknown members are kept (`RdapResponse::extra`), so a hostile
+    // reply could otherwise parse here and then overflow the depth limit of
+    // a consumer that wraps the record further (the Python bindings convert
+    // a whole bulk result in one pass, so one such row failed the batch).
+    let depth = json_nesting_depth(&body);
+    if depth > MAX_RDAP_JSON_DEPTH {
+        return Err(SeerError::RdapError(format!(
+            "RDAP response nests {depth} levels deep (max {MAX_RDAP_JSON_DEPTH})"
+        )));
+    }
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
     // Bound attacker-controlled payload post-deserialization. The 10MB
     // body cap prevents unbounded download, but a well-formed response
@@ -874,6 +912,41 @@ async fn read_and_parse_rdap_body(
     // recursive walkers to stack-overflow. See RdapResponse::validate.
     rdap.validate()?;
     Ok(rdap)
+}
+
+/// Deepest nesting an RDAP reply may have. A real record needs about forty
+/// levels at the very most (sixteen nested entities, each an array and an
+/// object, plus a jCard), so this leaves room and still sits far below what
+/// any consumer of the parsed record can take.
+const MAX_RDAP_JSON_DEPTH: usize = 64;
+
+/// The deepest `[`/`{` nesting in a JSON document, by one pass over its
+/// bytes (brackets inside strings do not count). Malformed input gets some
+/// answer; the parser that runs next rejects it.
+fn json_nesting_depth(body: &[u8]) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in body {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// Whether `url` targets a loopback IP literal — the only hosts the
@@ -947,6 +1020,7 @@ async fn query_rdap_attempt(
             ));
         }
         let next = resolve_redirect_target(&current, location).map_err(|e| (e, None))?;
+        vet_redirect_port(&next, allow_reserved).map_err(|e| (e, None))?;
         if visited.contains(&next) {
             return Err((
                 SeerError::RdapError("RDAP redirect loop detected".to_string()),
@@ -2340,5 +2414,40 @@ mod tests {
 
         *BOOTSTRAP_CACHE.write().await = None;
         *BOOTSTRAP_LAST_ATTEMPT.write().await = None;
+    }
+
+    /// Regression: redirect targets were held to https and public addresses
+    /// only, not to the shared URL policy's "no credentials, standard port".
+    #[test]
+    fn rdap_urls_refuse_credentials_and_redirects_refuse_other_ports() {
+        assert!(parse_rdap_url("https://user:pw@rdap.example.com/domain/x").is_err());
+        assert!(parse_rdap_url("https://user@rdap.example.com/domain/x").is_err());
+        assert!(vet_redirect_port("https://rdap.example.com:8443/domain/x", false).is_err());
+        vet_redirect_port("https://rdap.example.com/domain/x", false).unwrap();
+        vet_redirect_port("https://rdap.example.com:443/domain/x", false).unwrap();
+        // A bootstrap base URL may name its own port.
+        assert_eq!(
+            parse_rdap_url("https://rdap.example.com:8443/").unwrap().1,
+            8443
+        );
+    }
+
+    /// Regression: a reply nested ~125 levels deep parsed in core and then
+    /// overflowed the Python bindings' conversion limit, failing a whole
+    /// bulk call instead of one row.
+    #[test]
+    fn nesting_depth_is_measured_outside_strings() {
+        assert_eq!(json_nesting_depth(b"{}"), 1);
+        assert_eq!(json_nesting_depth(br#"{"a":[{"b":[1]}]}"#), 4);
+        assert_eq!(json_nesting_depth(br#"{"a":"[[[[\"[[{{"}"#), 1);
+        let deep = format!(
+            r#"{{"objectClassName":"domain","x":{}1{}}}"#,
+            "[".repeat(100),
+            "]".repeat(100)
+        );
+        assert_eq!(json_nesting_depth(deep.as_bytes()), 101);
+        assert!(json_nesting_depth(deep.as_bytes()) > MAX_RDAP_JSON_DEPTH);
+        // serde_json itself still takes it, which is why the check exists.
+        assert!(serde_json::from_str::<RdapResponse>(&deep).is_ok());
     }
 }

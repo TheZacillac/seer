@@ -192,6 +192,12 @@ pub struct DanePolicy {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub records: Vec<TlsaRecord>,
     pub verdict: PostureVerdict,
+    /// Whether a lookup behind the SMTP scope failed (the MX set, or a
+    /// `_25._tcp` TLSA set). `verdict` covers the SMTP and HTTPS scopes
+    /// together, so on its own it cannot say whether "no SMTP TLSA record"
+    /// was answered or merely not seen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub smtp_lookup_failed: bool,
 }
 
 /// The aggregate email/DNS security posture for a domain.
@@ -429,9 +435,11 @@ enum RedirectOutcome {
         target: String,
         qualifier: Option<String>,
     },
-    /// The chain cannot be evaluated (a permerror, or a macro seer does not
-    /// expand).
+    /// The chain is a permerror: receivers cannot evaluate it either.
     Failed { target: String, reason: String },
+    /// The chain is valid but seer cannot evaluate it (an RFC 7208 §7 macro
+    /// in the target, which only a receiver can expand).
+    Unevaluated { target: String, reason: String },
     /// A DNS lookup on the chain failed: the effective policy is unknown.
     LookupFailed { target: String, reason: String },
 }
@@ -549,6 +557,16 @@ fn build_spf(apex_txt: &[String], follow_up: &SpfFollowUp) -> Assessed<SpfPolicy
                 format!(
                     "SPF redirect={target} could not be evaluated ({reason}) — receivers get \
                      no usable SPF result."
+                ),
+            );
+        }
+        (SpfTerminal::Redirect(_), Some(RedirectOutcome::Unevaluated { target, reason })) => {
+            return settled(
+                PostureVerdict::Unknown,
+                None,
+                format!(
+                    "SPF redirect={target} was not evaluated ({reason}) — the effective SPF \
+                     policy is unknown."
                 ),
             );
         }
@@ -806,6 +824,9 @@ fn build_bimi(txt: &TxtLookup) -> BimiPolicy {
 struct TlsaSets {
     sets: Vec<(String, Vec<crate::dns::DnsRecord>)>,
     lookup_failed: bool,
+    /// A lookup behind the SMTP scope failed (see
+    /// [`DanePolicy::smtp_lookup_failed`]).
+    smtp_lookup_failed: bool,
 }
 
 /// Assembles the DANE policy from the TLSA sets. Records found are
@@ -843,6 +864,7 @@ fn build_dane(tlsa: &TlsaSets) -> DanePolicy {
         present: !records.is_empty(),
         verdict,
         records,
+        smtp_lookup_failed: tlsa.smtp_lookup_failed,
     }
 }
 
@@ -931,7 +953,7 @@ async fn follow_spf_redirect(dns: Dns<'_>, first_target: String) -> RedirectOutc
     let mut target = first_target;
     for _ in 0..MAX_SPF_LOOKUPS {
         if target.contains('%') {
-            return RedirectOutcome::Failed {
+            return RedirectOutcome::Unevaluated {
                 target,
                 reason: "it uses SPF macros, which seer does not expand".to_string(),
             };
@@ -1041,8 +1063,9 @@ async fn assess_spf(dns: Dns<'_>, apex_txt: &TxtLookup) -> Assessed<SpfPolicy> {
 
 /// Finds the DMARC record set that applies to `domain`: its own
 /// `_dmarc.<domain>`, or — when that has no DMARC record — the nearest parent
-/// that has one, walking one label at a time (at most [`MAX_DMARC_WALK`])
-/// but never above the Organizational Domain (RFC 7489 §3.2: the registrable
+/// that has one, walking one label at a time (at most [`MAX_DMARC_WALK`]
+/// queries, the last always being the Organizational Domain) but never
+/// above the Organizational Domain (RFC 7489 §3.2: the registrable
 /// domain under the Public Suffix List). RFC 7489 §6.6.3 falls back to the
 /// Organizational Domain itself; the nearest publishing ancestor below it is
 /// what the DMARCbis tree walk adds. A query error stops the walk rather than
@@ -1064,14 +1087,23 @@ async fn discover_dmarc(dns: Dns<'_>, domain: &str, own: TxtLookup) -> DmarcDisc
     let Some(org) = crate::psl::registrable_parent(domain) else {
         return DmarcDiscovery::NotFound;
     };
+    // Every ancestor from the parent up to the Organizational Domain, nearest
+    // first. A name deeper than the cap skips its middle ancestors, never the
+    // Organizational Domain: that is the one RFC 7489 §6.6.3 always consults.
+    let mut parents: Vec<&str> = Vec::new();
     let mut current = domain;
-    for _ in 0..MAX_DMARC_WALK {
-        let Some((_, parent)) = current.split_once('.') else {
-            break;
-        };
+    while let Some((_, parent)) = current.split_once('.') {
         if parent.len() < org.len() {
             break;
         }
+        parents.push(parent);
+        current = parent;
+    }
+    if parents.len() > MAX_DMARC_WALK {
+        parents.truncate(MAX_DMARC_WALK - 1);
+        parents.push(org);
+    }
+    for parent in parents {
         let name = format!("_dmarc.{parent}");
         let txts = match dns.txt(&name).await {
             Ok(txts) => txts,
@@ -1084,7 +1116,6 @@ async fn discover_dmarc(dns: Dns<'_>, domain: &str, own: TxtLookup) -> DmarcDisc
                 inherited: true,
             });
         }
-        current = parent;
     }
     DmarcDiscovery::NotFound
 }
@@ -1133,6 +1164,7 @@ async fn smtp_tlsa_records(
         return TlsaSets {
             sets: Vec::new(),
             lookup_failed: true,
+            smtp_lookup_failed: true,
         };
     };
     let mut hosts: Vec<String> = Vec::new();
@@ -1170,7 +1202,10 @@ async fn smtp_tlsa_records(
     for ((scope, _), result) in owners.into_iter().zip(results) {
         match result {
             Ok(set) => tlsa.sets.push((scope, set)),
-            Err(_) => tlsa.lookup_failed = true,
+            Err(_) => {
+                tlsa.lookup_failed = true;
+                tlsa.smtp_lookup_failed = true;
+            }
         }
     }
     tlsa
@@ -1885,5 +1920,38 @@ mod tests {
             .unwrap();
         assert_eq!(posture.spf.verdict, PostureVerdict::Strict);
         assert_eq!(posture.dmarc.verdict, PostureVerdict::Strict);
+    }
+
+    /// Regression: the walk cap was counted from the left, so a name eight
+    /// or more labels below the Organizational Domain never queried it and
+    /// its inherited policy read as absent.
+    #[tokio::test]
+    async fn a_deep_name_still_reaches_the_organizational_dmarc() {
+        let port = spawn_mock_dns_fn(|q, t| match (q, t) {
+            ("_dmarc.example.com", WireType::TXT) => txt("v=DMARC1; p=reject"),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let resolver = mock_dns_resolver_default(port);
+        for host in ["a.b.example.com", "a.b.c.d.e.f.g.h.i.j.example.com"] {
+            let posture = lookup_email_posture(&resolver, host, None).await.unwrap();
+            assert_eq!(posture.dmarc.verdict, PostureVerdict::Strict, "{host}");
+        }
+    }
+
+    /// Regression: a legal `redirect=` with a macro (RFC 7208 §6.1) was
+    /// graded a permerror ("receivers get no usable SPF result").
+    #[tokio::test]
+    async fn a_macro_redirect_is_unknown_not_a_permerror() {
+        let port = spawn_mock_dns_fn(|q, t| match (q, t) {
+            ("macro.test", WireType::TXT) => txt("v=spf1 redirect=%{d}._spf.esp.test"),
+            _ => MockReply::NxDomain,
+        })
+        .await;
+        let posture = lookup_email_posture(&mock_dns_resolver_default(port), "macro.test", None)
+            .await
+            .unwrap();
+        assert_eq!(posture.spf.verdict, PostureVerdict::Unknown);
+        assert_eq!(posture.spf.permerror, None);
     }
 }

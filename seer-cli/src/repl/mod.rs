@@ -122,7 +122,11 @@ impl Repl {
                             // shape the CLI emits.
                             match crate::utils::machine_error(self.context.output_format, &e) {
                                 Some(structured) => eprintln!("{}", structured),
-                                None => eprintln!("{} {}", "Error:".ctp_red().bold(), e),
+                                None => eprintln!(
+                                    "{} {}",
+                                    "Error:".ctp_red().bold(),
+                                    crate::utils::sanitize_error(&e)
+                                ),
                             }
                         }
                     }

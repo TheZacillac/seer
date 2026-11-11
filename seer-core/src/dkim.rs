@@ -150,7 +150,10 @@ pub async fn probe_dkim(
     })
 }
 
-/// Parses one TXT record; `None` when it is not a DKIM key record (no `p=`).
+/// Parses one TXT record; `None` when it is not a DKIM key record: no `p=`,
+/// or a `v=` other than `DKIM1` (RFC 6376 §3.6.1 — `v=` is optional, but a
+/// record carrying another version must be discarded, which also keeps a
+/// wildcard TXT such as `v=DMARC1; p=reject` from reading as a key).
 pub(crate) fn parse_record(txt: &str) -> Option<SelectorState> {
     let mut key_type = DkimKeyType::Rsa;
     let mut public_key: Option<String> = None;
@@ -168,6 +171,7 @@ pub(crate) fn parse_record(txt: &str) -> Option<SelectorState> {
                     _ => DkimKeyType::Other,
                 }
             }
+            "v" if value != "DKIM1" => return None,
             "p" => public_key = Some(value),
             "t" => testing = value.split(':').any(|flag| flag.eq_ignore_ascii_case("y")),
             _ => {}
@@ -301,5 +305,14 @@ mod tests {
         assert_eq!(key(&by_name("google").unwrap()).1, Some(1024));
         assert!(matches!(by_name("k1"), Some(SelectorState::Unknown { .. })));
         assert_eq!(by_name("s1"), None, "absent selectors are not listed");
+    }
+
+    /// Regression: any TXT with a `p=` tag was a key, whatever its `v=`.
+    #[test]
+    fn a_record_of_another_version_is_not_a_dkim_key() {
+        assert_eq!(parse_record("v=DMARC1; p=reject"), None);
+        assert_eq!(parse_record("v=spf1; p=abc"), None);
+        assert!(parse_record("v=DKIM1; p=").is_some());
+        assert!(parse_record("p=").is_some(), "v= is optional");
     }
 }

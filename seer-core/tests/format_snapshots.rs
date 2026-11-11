@@ -414,6 +414,7 @@ fn fixture_posture() -> EmailPosture {
                 cert_data: "ABCDEF0123".into(),
             }],
             verdict: PostureVerdict::Present,
+            smtp_lookup_failed: false,
         },
         mx: MailExchangers::Hosts(vec!["mx.example.com".into()]),
         notes: vec![

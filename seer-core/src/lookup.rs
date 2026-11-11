@@ -65,22 +65,33 @@ static_regex! {
     /// addresses cheaply; each match is then validated by `Ipv6Addr::from_str`
     /// before redaction, so MAC fragments, hex hashes, and similar colon-laden
     /// tokens are left alone.
-    IPV6_CANDIDATE_RE = r"\b[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*\b";
+    ///
+    /// No `\b` anchors: `:` is not a word character, so they could never
+    /// match a literal that starts or ends with `::` (`::1`, `fe80::`). The
+    /// token boundaries are checked in `strip_ipv6` instead.
+    IPV6_CANDIDATE_RE = r"[0-9a-fA-F:]*(?:::|(?:[0-9a-fA-F]{1,4}:){3,})[0-9a-fA-F:]*";
 }
 
 /// Redact substrings that parse as valid IPv6 addresses, leaving non-IPv6
 /// tokens (e.g. `af:ba:12`) untouched.
 fn strip_ipv6(msg: &str) -> String {
-    IPV6_CANDIDATE_RE
-        .replace_all(msg, |caps: &regex::Captures| {
-            let candidate = &caps[0];
-            if Ipv6Addr::from_str(candidate).is_ok() {
-                "[ip-redacted]".to_string()
-            } else {
-                candidate.to_string()
-            }
-        })
-        .into_owned()
+    let mut out = String::with_capacity(msg.len());
+    let mut copied = 0;
+    for found in IPV6_CANDIDATE_RE.find_iter(msg) {
+        // A candidate glued to a letter or digit is part of a longer token
+        // (`std::io`, a hash), not an address.
+        let glued = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        let before = msg[..found.start()].chars().next_back();
+        let after = msg[found.end()..].chars().next();
+        if glued(before) || glued(after) || Ipv6Addr::from_str(found.as_str()).is_err() {
+            continue;
+        }
+        out.push_str(&msg[copied..found.start()]);
+        out.push_str("[ip-redacted]");
+        copied = found.end();
+    }
+    out.push_str(&msg[copied..]);
+    out
 }
 
 /// Test-only hook: counts the number of times `lookup_concurrent` is actually
@@ -2145,5 +2156,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Regression: the `\\b`-anchored pattern could not match a literal that
+    /// starts or ends with `::`.
+    #[test]
+    fn sanitize_strips_ipv6_that_starts_or_ends_with_a_double_colon() {
+        for (msg, want) in [
+            (
+                "blocked: resolves to ::1",
+                "blocked: resolves to [ip-redacted]",
+            ),
+            (
+                "connect [::1]:43 refused",
+                "connect [[ip-redacted]]:43 refused",
+            ),
+            ("via fe80:: failed", "via [ip-redacted] failed"),
+            ("via 2001:db8::1 failed", "via [ip-redacted] failed"),
+            // Not addresses.
+            ("std::io::Error at 12:30:45", "std::io::Error at 12:30:45"),
+            ("mac af:ba:12:00:11:22", "mac af:ba:12:00:11:22"),
+        ] {
+            assert_eq!(sanitize_error_for_public(msg), want);
+        }
     }
 }

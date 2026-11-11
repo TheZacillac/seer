@@ -295,7 +295,10 @@ mod tests {
         };
         for p in crate::takeover::PROVIDERS {
             let suffixes = p.cname_suffixes.iter().map(|s| format!("gone{s}"));
-            let infixes = p.cname_infixes.iter().map(|i| format!("gone{i}.example"));
+            let infixes = p
+                .cname_infixes
+                .iter()
+                .map(|(infix, suffix)| format!("gone{infix}-region{suffix}"));
             for cname in suffixes.chain(infixes) {
                 assert_eq!(dangling(&cname).as_deref(), Some(p.provider), "{cname}");
             }

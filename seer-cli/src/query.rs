@@ -152,7 +152,11 @@ impl Outcome {
         for error in &self.errors {
             match crate::utils::machine_error(format, error) {
                 Some(structured) => eprintln!("{structured}"),
-                None => eprintln!("{} {}", "Error:".ctp_red(), error),
+                None => eprintln!(
+                    "{} {}",
+                    "Error:".ctp_red(),
+                    crate::utils::sanitize_error(error)
+                ),
             }
         }
     }

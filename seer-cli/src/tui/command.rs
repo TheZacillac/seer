@@ -88,35 +88,46 @@ pub fn parse(raw: &str) -> CmdOutcome {
             return CmdOutcome::BadTheme;
         }
         "lookup" | "info" => {
-            return match parts.get(1) {
-                Some(t) => CmdOutcome::Lookup((*t).to_string()),
-                None => CmdOutcome::Unknown(line.to_string()),
+            return match parts[1..] {
+                [t] => CmdOutcome::Lookup(t.to_string()),
+                [] => CmdOutcome::Unknown(line.to_string()),
+                _ => CmdOutcome::Invalid(format!("usage: {head} <domain>")),
             };
         }
         _ => {}
     }
 
     if head == "diff" {
-        return match (parts.get(1), parts.get(2)) {
-            (Some(a), Some(b)) => CmdOutcome::Diff {
+        return match parts[1..] {
+            [a, b] => CmdOutcome::Diff {
                 a: a.to_string(),
                 b: b.to_string(),
             },
+            [_, _, ..] => CmdOutcome::Invalid("usage: diff <domain-a> <domain-b>".to_string()),
             _ => CmdOutcome::Unknown(line.to_string()),
         };
     }
     if head == "compare" {
-        return match (parts.get(1), parts.get(2), parts.get(3)) {
-            (Some(d), Some(a), Some(b)) => CmdOutcome::Compare {
+        // Two servers, with or without the CLI's `@`. Anything more (a
+        // record type, a third server) is refused rather than dropped: the
+        // lens would silently compare A records.
+        let server = |s: &str| s.strip_prefix('@').unwrap_or(s).to_string();
+        let plain = |s: &str| !s.starts_with('@');
+        return match parts[1..] {
+            [d, a, b] if plain(d) && (plain(a) == plain(b)) => CmdOutcome::Compare {
                 domain: d.to_string(),
-                a: a.to_string(),
-                b: b.to_string(),
+                a: server(a),
+                b: server(b),
             },
             // Bare `compare` opens the lens on the session target.
-            (None, _, _) => CmdOutcome::Lens {
+            [] => CmdOutcome::Lens {
                 lens: head,
                 target: None,
             },
+            [_, _, _, ..] => CmdOutcome::Invalid(
+                "usage: compare <domain> <server-a> <server-b> — set the record type in Options (3)"
+                    .to_string(),
+            ),
             _ => CmdOutcome::Unknown(line.to_string()),
         };
     }
@@ -168,6 +179,13 @@ pub fn parse(raw: &str) -> CmdOutcome {
 
     // A known lens command (whois, ssl, status, prop, rdap, ...).
     if lenses::find_by_cmd_or_key(&head).is_some() {
+        // One target at most: a trailing record type or flag would be
+        // dropped without a word, and the lens would run with its defaults.
+        if parts.len() > 2 {
+            return CmdOutcome::Invalid(format!(
+                "usage: {head} [domain] — set its other settings in Options (3)"
+            ));
+        }
         return CmdOutcome::Lens {
             lens: head,
             target: parts.get(1).map(|s| s.to_string()),
@@ -492,5 +510,29 @@ mod tests {
                 b: "1.1.1.1".into()
             }
         );
+    }
+
+    /// Regression: trailing arguments were dropped, so `:prop example.com MX`
+    /// ran an A lookup, and the CLI's `compare` form parsed `MX` as a server.
+    #[test]
+    fn extra_arguments_are_refused_not_dropped() {
+        for line in [
+            "prop example.com MX",
+            "compare example.com 8.8.8.8 1.1.1.1 MX",
+            "compare example.com MX @8.8.8.8 @1.1.1.1",
+            "diff a.com b.com c.com",
+            "lookup a.com b.com",
+        ] {
+            assert!(matches!(parse(line), CmdOutcome::Invalid(_)), "{line}");
+        }
+        assert_eq!(
+            parse("compare example.com @8.8.8.8 @1.1.1.1"),
+            CmdOutcome::Compare {
+                domain: "example.com".into(),
+                a: "8.8.8.8".into(),
+                b: "1.1.1.1".into(),
+            }
+        );
+        assert!(matches!(parse("prop example.com"), CmdOutcome::Lens { .. }));
     }
 }

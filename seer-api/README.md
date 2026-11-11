@@ -57,7 +57,9 @@ Server runs on `http://127.0.0.1:8000` (loopback-only by default).
   `SEER_API_KEY`, a request carrying an `Origin` header is refused (403)
   unless the origin is a loopback one or listed in `SEER_CORS_ORIGINS` —
   so a web page cannot drive a local API from your browser. Clients that
-  send no `Origin` (curl, SDKs) are unaffected. No CORS headers are sent
+  send no `Origin` (curl, SDKs) are unaffected. A browser request with no
+  `Origin` but `Sec-Fetch-Site: cross-site` (an `<img>` or a link on another
+  site) is refused the same way. No CORS headers are sent
   unless `SEER_CORS_ORIGINS` is set.
 - **No DNS rebinding without a key.** With no `SEER_API_KEY`, a request
   whose `Host` is not a loopback name (`localhost`, `127.0.0.0/8`, `[::1]`,
@@ -358,7 +360,8 @@ limiting, SSRF guards) is mapped in the repository's
 | Concurrent bulk jobs per worker (`SEER_MAX_CONCURRENT_BULK`) | 8 |
 
 Every bulk job — a `/bulk` or `/bulk/stream` request, or an MCP
-`seer_bulk_*` call — takes one of `SEER_MAX_CONCURRENT_BULK` slots for as
+`seer_bulk_*` call — and every fan-out scan (takeover, confusables,
+`subdomains?resolve=true` and their MCP tools) takes one of `SEER_MAX_CONCURRENT_BULK` slots for as
 long as it runs, even after its client has gone (a running job cannot be
 cancelled). A job that finds every slot busy waits; with
 `SEER_REQUEST_TIMEOUT` set it gives up at the deadline with a `503` (MCP: a

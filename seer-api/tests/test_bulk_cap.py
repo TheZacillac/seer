@@ -116,6 +116,61 @@ def test_mcp_bulk_tool_shares_the_cap(tool, one_bulk_slot):
     assert "busy" in out.content[0].text.lower()
 
 
+_SCAN_PATHS = (
+    "/takeover/example.com",
+    "/confusables/example.com",
+    "/subdomains/example.com?resolve=true",
+)
+_SCAN_TOOLS = (
+    ("seer_takeover", {"domain": "example.com"}),
+    ("seer_confusables", {"domain": "example.com"}),
+    ("seer_subdomains", {"domain": "example.com", "resolve": True}),
+)
+
+
+@pytest.fixture
+def scan_bindings(monkeypatch):
+    for name in ("takeover", "confusables", "subdomains_classify"):
+        monkeypatch.setattr(seer, name, lambda *a, **k: {}, raising=False)
+
+
+@pytest.mark.parametrize("path", _SCAN_PATHS)
+def test_fan_out_scan_route_takes_a_bulk_slot(path, one_bulk_slot, scan_bindings):
+    """Regression: a fan-out scan (up to 2000 hosts, client-chosen
+    concurrency, no overall deadline) holds a dispatch thread like a bulk
+    job but took no slot, so scans alone could pin the whole pool."""
+    release, started = threading.Event(), threading.Event()
+
+    async def scenario() -> httpx.Response:
+        held = await _hold_the_slot(release, started)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
+            resp = await c.get(path)
+        release.set()
+        await held
+        return resp
+
+    resp = asyncio.run(scenario())
+    assert resp.status_code == 503, resp.text
+
+
+@pytest.mark.parametrize(("tool", "arguments"), _SCAN_TOOLS)
+def test_mcp_fan_out_scan_takes_a_bulk_slot(tool, arguments, one_bulk_slot, scan_bindings):
+    release, started = threading.Event(), threading.Event()
+
+    async def scenario():
+        held = await _hold_the_slot(release, started)
+        try:
+            return await mcp_server._TOOLS[tool].run(arguments)
+        except ServerBusy as exc:
+            return exc
+        finally:
+            release.set()
+            await held
+
+    assert isinstance(asyncio.run(scenario()), ServerBusy)
+
+
 def test_slot_is_freed_when_the_job_ends_not_when_the_client_leaves(one_bulk_slot):
     """A job that outlives the deadline keeps its slot (it is still running on
     a dispatch thread); the slot comes back only once the job itself ends."""

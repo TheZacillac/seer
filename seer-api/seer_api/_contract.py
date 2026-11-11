@@ -48,11 +48,13 @@ NAMESERVER_MAX_LENGTH = 512
 # A domain path parameter.
 Domain = Annotated[str, Path(min_length=1, max_length=DOMAIN_MAX_LENGTH)]
 
+# One contract with the MCP tools (`_require_domains`, `_get_concurrency`):
+# no blank domain, and concurrency a real integer (JSON `true` is not 1).
 _DomainList = Annotated[
-    list[Annotated[str, Field(max_length=DOMAIN_MAX_LENGTH)]],
+    list[Annotated[str, Field(max_length=DOMAIN_MAX_LENGTH, pattern=r"\S")]],
     Field(min_length=1, max_length=MAX_BULK_DOMAINS),
 ]
-_Concurrency = Annotated[int, Field(ge=1, le=MAX_CONCURRENCY)]
+_Concurrency = Annotated[int, Field(strict=True, ge=1, le=MAX_CONCURRENCY)]
 _RecordType = Annotated[
     str, Field(max_length=RECORD_TYPE_MAX_LENGTH, pattern=RECORD_TYPE_PATTERN)
 ]

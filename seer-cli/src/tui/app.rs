@@ -545,6 +545,18 @@ impl App {
             None => match key {
                 LensKey::History => Some(FetchReq::History),
                 LensKey::Watch => Some(FetchReq::Watch),
+                // An ad-hoc `:compare` / `:diff` carries its own domain, so
+                // its options still decide the request with no session one.
+                LensKey::Compare => self
+                    .panes
+                    .compare
+                    .domain
+                    .clone()
+                    .and_then(|domain| self.default_req(key, &domain)),
+                LensKey::Diff if !self.panes.diff.a.is_empty() => {
+                    let a = self.panes.diff.a.clone();
+                    self.default_req(key, &a)
+                }
                 _ => None,
             },
         };
@@ -4510,5 +4522,40 @@ mod tests {
             app.state_of(LensKey::Rdap.index()),
             LensState::Loaded(_)
         ));
+    }
+
+    /// Regression: with no session domain, an ad-hoc `:diff` / `:compare`
+    /// result was never stale, so changing the lens's options re-ran nothing
+    /// and Details kept showing the old answer under the new option value.
+    #[test]
+    fn an_ad_hoc_diff_or_compare_reruns_when_its_options_change() {
+        let mut app = idle_app();
+        let actions = app.exec_command("diff a.com b.com");
+        answer(&mut app, &actions, LensKey::Diff, empty_dig());
+        assert!(app.fetch_current(true).is_none(), "unchanged: cached");
+        app.options
+            .commit_text(LensKey::Diff, OptId::SecondDomain, "c.com")
+            .unwrap();
+        assert!(app.fetch_current(true).is_some(), "Compare-with changed");
+
+        let mut app = idle_app();
+        let actions = app.exec_command("compare example.com 8.8.8.8 1.1.1.1");
+        answer(&mut app, &actions, LensKey::Compare, empty_dig());
+        assert!(app.fetch_current(true).is_none(), "unchanged: cached");
+        assert!(app.options.cycle(LensKey::Compare, OptId::ServerA, true));
+        assert!(app.fetch_current(true).is_some(), "server A changed");
+    }
+
+    /// Regression: the Compare page advertised `a cycle A  b cycle B`, keys
+    /// that no longer do anything (the servers moved to the Options box).
+    #[test]
+    fn compare_keys_a_and_b_are_not_advertised_because_they_do_nothing() {
+        let mut app = idle_app();
+        let actions = app.exec_command("compare example.com 8.8.8.8 1.1.1.1");
+        answer(&mut app, &actions, LensKey::Compare, empty_dig());
+        app.set_section(Section::Details);
+        let before = app.options.server(LensKey::Compare, OptId::ServerA);
+        assert!(key(&mut app, KeyCode::Char('a')).is_empty());
+        assert_eq!(app.options.server(LensKey::Compare, OptId::ServerA), before);
     }
 }

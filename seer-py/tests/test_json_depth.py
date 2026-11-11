@@ -28,16 +28,25 @@ def test_depth_at_limit_succeeds():
     assert result is not None
 
 
-def test_depth_over_limit_raises_value_error():
-    """200 levels of nesting must raise ValueError, not crash the process."""
-    with pytest.raises(ValueError) as exc_info:
+def test_depth_over_limit_raises_upstream_error():
+    """200 levels of nesting must raise, not crash the process.
+
+    Regression: it raised ValueError, which the API maps to 400 "invalid
+    input" although the depth comes from response data, never the caller.
+    """
+    import seer
+
+    with pytest.raises(seer.UpstreamError) as exc_info:
         _json_to_python_nested_for_test(200)
     assert "max depth" in str(exc_info.value).lower()
+    assert not isinstance(exc_info.value, ValueError)
 
 
 def test_depth_just_over_limit_raises():
     """MAX_JSON_DEPTH + 1 is the boundary that must trip the guard."""
-    with pytest.raises(ValueError):
+    import seer
+
+    with pytest.raises(seer.UpstreamError):
         _json_to_python_nested_for_test(MAX_JSON_DEPTH + 1)
 
 

@@ -452,6 +452,16 @@ impl DnsTracer {
     pub async fn trace(&self, name: &str, record_type: RecordType) -> Result<DnsTrace> {
         let qtype = trace_wire_type(record_type)?;
         let (name, qname) = query_target(name, record_type)?;
+        // A name hickory answers itself (`.onion`, `.invalid`, `localhost`)
+        // must not be sent to a root server — RFC 7686 forbids leaking
+        // `.onion` names into the DNS. `DnsResolver::query` holds the same
+        // line.
+        if crate::dns::query::answered_locally(&name) {
+            return Err(SeerError::InvalidInput(format!(
+                "{name} is a special-use name (RFC 6761) that is never sent to DNS servers, \
+                 so there is nothing to trace"
+            )));
+        }
 
         let mut zone = Name::root();
         let mut servers = self.root_servers();
@@ -2417,5 +2427,31 @@ mod tests {
         assert!(last.authoritative);
         assert_eq!(trace.status, DnsStatus::NoError);
         assert!(!trace.answers.is_empty());
+    }
+
+    /// Regression: `trace` sent a special-use name straight to a root
+    /// server, though RFC 7686 forbids leaking `.onion` names into the DNS
+    /// (`query()` already answered them locally).
+    #[tokio::test]
+    async fn a_special_use_name_is_never_sent_on_the_wire() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let root = spawn_mock_dns_fn(move |name, _| {
+            seen.lock().unwrap().push(name.to_string());
+            MockReply::NxDomain
+        })
+        .await;
+        let result = tracer(&["a.root.test"], &[("a.root.test", root)])
+            .trace("facebookcorewwwi.onion", RecordType::A)
+            .await;
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "{:?}",
+            asked.lock().unwrap()
+        );
+        assert!(
+            matches!(result, Err(SeerError::InvalidInput(_))),
+            "{result:?}"
+        );
     }
 }
