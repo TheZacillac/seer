@@ -153,6 +153,19 @@ impl BulkState {
         self.detail_scroll = 0;
     }
 
+    /// Index of the last line of the open detail (0 when there is none), as
+    /// the lens renders it — the one definition of the detail's lines.
+    fn last_detail_line(&self) -> u16 {
+        let lines = self
+            .effective_selected()
+            .and_then(|idx| self.rows.get(idx))
+            .map_or(0, |row| {
+                crate::tui::lenses::bulk::detail_lines(&crate::tui::theme::Theme::frappe(), row)
+                    .len()
+            });
+        u16::try_from(lines.saturating_sub(1)).unwrap_or(u16::MAX)
+    }
+
     /// Handle a key event for the Bulk pane. `Some(_)` = consumed; never `Esc`.
     pub fn handle_key(
         &mut self,
@@ -167,7 +180,12 @@ impl BulkState {
             }
             // Scroll the open detail panel.
             KeyCode::PageDown if self.detail => {
-                self.detail_scroll = self.detail_scroll.saturating_add(DETAIL_PAGE);
+                // Never past the last line: the panel would go blank, and
+                // each extra press would need a PgUp to undo.
+                self.detail_scroll = self
+                    .detail_scroll
+                    .saturating_add(DETAIL_PAGE)
+                    .min(self.last_detail_line());
                 Some(PaneOutcome::None)
             }
             KeyCode::PageUp if self.detail => {
@@ -552,8 +570,23 @@ mod tests {
     #[test]
     fn page_keys_scroll_the_open_detail_and_reset_on_move() {
         let mut s = BulkState::default();
-        s.rows.push(make_lookup_result("a.com"));
-        s.rows.push(make_lookup_result("b.com"));
+        // Rows with enough detail lines to page through.
+        let long = |domain: &str| BulkResult {
+            data: Some(seer_core::bulk::BulkResultData::Dns(vec![
+                seer_core::DnsRecord {
+                    name: "a.com".into(),
+                    record_type: seer_core::RecordType::A,
+                    ttl: 300,
+                    data: seer_core::dns::RecordData::A {
+                        address: "192.0.2.1".into(),
+                    },
+                };
+                4
+            ])),
+            ..make_lookup_result(domain)
+        };
+        s.rows.push(long("a.com"));
+        s.rows.push(long("b.com"));
         // Closed detail: PgDn is not the pane's.
         assert!(s.handle_key(key(KeyCode::PageDown), None).is_none());
         s.handle_key(key(KeyCode::Char('v')), None);
@@ -564,5 +597,22 @@ mod tests {
         assert_eq!(s.detail_scroll, DETAIL_PAGE);
         s.handle_key(key(KeyCode::Char('k')), None);
         assert_eq!(s.detail_scroll, 0, "another row starts at its top");
+    }
+
+    /// Regression: PgDn had no upper bound, so one press on a two-line
+    /// detail scrolled every line away and left an empty panel.
+    #[test]
+    fn page_down_never_scrolls_the_detail_past_its_last_line() {
+        let mut s = BulkState::default();
+        s.rows.push(BulkResult {
+            success: false,
+            error: Some("Invalid domain name".into()),
+            ..make_lookup_result("bad..name")
+        });
+        s.handle_key(key(KeyCode::Char('v')), None);
+        for _ in 0..3 {
+            s.handle_key(key(KeyCode::PageDown), None);
+        }
+        assert!(s.detail_scroll <= 1, "scrolled to {}", s.detail_scroll);
     }
 }

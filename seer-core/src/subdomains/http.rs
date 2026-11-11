@@ -10,7 +10,6 @@
 use std::time::Duration;
 
 use reqwest::StatusCode;
-use std::sync::LazyLock;
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -48,31 +47,55 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Maximum response size for CT log queries (10 MB).
 const MAX_CT_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
-/// Shared HTTP client for CT log queries (connection pooling).
+/// Builds the HTTP client for one CT log request, pinned to the addresses the
+/// SSRF guard vetted for `url`.
 ///
-/// Redirects are disabled: a compromised or hijacked CT aggregator could
-/// otherwise issue a 30x response that reqwest would follow by default, turning
-/// the hardcoded CT-log fetch into an SSRF primitive. With `Policy::none()` any
-/// redirect surfaces as a non-success status instead of a silent re-target.
-/// Its timeout is the configurable ceiling; each request sets its own, shorter
-/// one from its [`Budget`].
+/// The CT hosts are constants, but a constant hostname still resolves through
+/// DNS: every outbound leg goes through [`crate::net::validate_http_url`]
+/// (http/https, no credentials, ports 80/443, reserved ranges refused) and
+/// connects to the vetted addresses, so a poisoned or rebinding answer cannot
+/// point the fetch at an internal host. Pinning is per address set, so the
+/// client is built per request (the TLS config is shared, see
+/// `net::client_builder`).
 ///
-/// Wrapped in `Option` so a reqwest builder failure surfaces as a typed
-/// `SeerError::HttpError` via `client()` instead of a process panic at first
-/// use (library code must not `.expect()` on shared state).
-static HTTP_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
-    crate::net::client_builder(Duration::from_secs(crate::config::MAX_CT_SECS))
-        .user_agent(crate::net::USER_AGENT)
+/// Redirects are disabled (`net::client_builder`): a compromised or hijacked
+/// CT aggregator could otherwise answer 30x and re-target the fetch; any
+/// redirect surfaces as a non-success status instead. The client's timeout
+/// is the configurable ceiling; each request sets its own, shorter one from
+/// its [`Budget`].
+async fn client_for(url: &str) -> Result<reqwest::Client> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| SeerError::HttpError(format!("invalid CT log URL: {e}")))?;
+    let mut builder = crate::net::client_builder(Duration::from_secs(crate::config::MAX_CT_SECS))
+        .user_agent(crate::net::USER_AGENT);
+    if !is_test_fixture(&parsed) {
+        let addrs = crate::net::validate_http_url(&parsed).await?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| SeerError::HttpError("CT log URL has no host".into()))?;
+        builder = builder.resolve_to_addrs(host, &addrs);
+    }
+    builder
         .build()
-        .ok()
-});
+        .map_err(|e| SeerError::HttpError(format!("failed to build HTTP client: {e}")))
+}
 
-/// Returns a reference to the shared CT-log HTTP client, or a typed error if
-/// the builder failed at initialization time.
-fn client() -> Result<&'static reqwest::Client> {
-    HTTP_CLIENT
-        .as_ref()
-        .ok_or_else(|| SeerError::HttpError("failed to initialize HTTP client".into()))
+/// Test seam: a loopback IP literal (the wiremock fixtures) is fetched
+/// unvalidated. Always `false` outside `#[cfg(test)]` builds.
+fn is_test_fixture(url: &reqwest::Url) -> bool {
+    #[cfg(test)]
+    {
+        match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = url;
+        false
+    }
 }
 
 /// How a CT-log HTTP status should be treated by the retry loop.
@@ -172,7 +195,8 @@ pub(crate) async fn fetch_with_retry(url: &str, budget: Budget) -> Result<Vec<u8
 /// terminal so `fetch_with_retry` can decide whether another attempt is worth
 /// making.
 async fn fetch_once(url: &str, timeout: Duration) -> std::result::Result<Vec<u8>, FetchOutcome> {
-    let response = client()
+    let response = client_for(url)
+        .await
         .map_err(FetchOutcome::Terminal)?
         .get(url)
         .timeout(timeout)
@@ -310,5 +334,26 @@ mod tests {
         assert_eq!(parse_retry_after("not-a-number"), None);
         // Capped at MAX_RETRY_AFTER.
         assert_eq!(parse_retry_after("99999"), Some(MAX_RETRY_AFTER));
+    }
+
+    /// Regression: CT log fetches went straight to a shared client, the one
+    /// outbound leg that skipped the SSRF guard and address pinning.
+    #[tokio::test]
+    async fn ct_urls_go_through_the_ssrf_guard() {
+        for url in [
+            "https://10.0.0.1/?q=example.com",
+            "https://169.254.169.254/latest",
+            "https://crt.sh:8443/?q=example.com",
+            "https://user:pw@crt.sh/?q=example.com",
+            "ftp://crt.sh/x",
+        ] {
+            assert!(client_for(url).await.is_err(), "{url}");
+        }
+        // A public literal needs no DNS and passes; so does the loopback
+        // fixture seam.
+        client_for("https://192.0.43.8/?q=example.com")
+            .await
+            .unwrap();
+        client_for("http://127.0.0.1:9/x").await.unwrap();
     }
 }

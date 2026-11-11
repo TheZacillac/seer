@@ -344,6 +344,25 @@ def test_a_scoped_address_is_not_resolved_by_the_precheck(monkeypatch):
     ssrf.vet_host("fe80::1%lo")
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"domains": ["", "   "]},
+        {"domains": ["example.com", " "]},
+        {"domains": ["example.com"], "concurrency": True},
+    ],
+)
+def test_rest_bulk_body_holds_the_contract_mcp_enforces(monkeypatch, client, body):
+    """Regression: REST accepted blank domains and a boolean concurrency
+    that the MCP bulk tools reject, though both claim one contract."""
+    _no_key(monkeypatch)
+    calls = []
+    monkeypatch.setattr(seer, "bulk_lookup", lambda *a, **k: calls.append(a) or [], raising=False)
+    resp = client.post("/lookup/bulk", json=body)
+    assert resp.status_code == 422, resp.text
+    assert calls == []
+
+
 def test_cors_allowlist_admits_its_origins(monkeypatch):
     import importlib
 

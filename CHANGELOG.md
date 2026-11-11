@@ -66,6 +66,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default. Control characters are stripped from logged error text and
   request paths. A scoped IPv6 address (`fe80::1%eth0`) is no longer
   resolved by the SSRF pre-check.
+- **Special-use names.** `dig +trace` and the DNSSEC check refuse a name
+  that is never sent to DNS servers (`.onion`, `.invalid`) instead of
+  sending it to a root server or the upstream (RFC 7686).
+- **CAA.** The tree climb has one overall deadline (three resolver
+  timeouts); a silent resolver used to cost a full timeout per label, which
+  stalled `ssl` and `status` on deep names.
+- **Audit.** The DANE check is judged on the SMTP scope alone: a failed
+  `_25._tcp` lookup is incomplete even when an HTTPS TLSA record exists, and
+  a failed HTTPS lookup no longer hides a clean SMTP answer.
+- **Subdomains.** CT log fetches go through the SSRF guard and connect to
+  the vetted addresses, like every other outbound request.
+- **RDAP.** A reply nested more than 64 levels deep is refused (it could
+  pass core and then fail a whole Python bulk call).
+- **TUI.** An ad-hoc `:diff` / `:compare` re-runs when its options change
+  with no session domain; a Follow run that cannot start says why; PgDn in
+  the Bulk detail stops at the last line; the Compare page no longer
+  advertises the removed `a` / `b` keys.
+- **seer-api.** Fan-out scans (takeover, confusables, subdomain
+  classification, REST and MCP) take a slot from the bulk cap, so they can
+  no longer pin every dispatch thread. A REST bulk body with a blank domain
+  or a boolean `concurrency` is a 422, as MCP already refused.
+- **seer-py.** An over-deep result raises `UpstreamError`, not `ValueError`.
 
 ### Changed
 - `-q` / `--fields` with `bulk` or `follow` is a usage error (they were

@@ -10,7 +10,9 @@ Pure-data bindings (``all_tlds``, ``record_types``) are called directly instead.
 The pool is shared by single calls and bulk jobs. A bulk job holds one
 dispatch thread for its whole batch and cannot be cancelled, so every bulk
 job — sync ``/bulk``, ``/bulk/stream`` (``streaming.py``) and the MCP
-``seer_bulk_*`` tools — first takes a slot from one shared cap,
+``seer_bulk_*`` tools — and every fan-out scan (takeover, confusables,
+subdomain classification, which walk up to thousands of hosts in one call)
+first takes a slot from one shared cap,
 ``SEER_MAX_CONCURRENT_BULK``, kept below the pool size: a client staying
 inside its rate limits cannot pin every thread with batches and stall the
 single-domain routes. There is no separate pool per operation class: every

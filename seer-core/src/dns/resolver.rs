@@ -481,8 +481,8 @@ impl DnsResolver {
         Self::with_timeout_only(config.dns_timeout())
     }
 
-    /// Test-only: the per-query timeout, for asserting config plumbing.
-    #[cfg(test)]
+    /// The per-query timeout, for callers that budget a walk of several
+    /// lookups in multiples of it.
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
     }

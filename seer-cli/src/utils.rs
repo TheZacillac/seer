@@ -1116,6 +1116,7 @@ mod tests {
                 present: false,
                 records: vec![],
                 verdict: PostureVerdict::Absent,
+                smtp_lookup_failed: false,
             },
             mx: MailExchangers::Hosts(vec!["mx.example.com".to_string()]),
             notes: vec!["strong posture".to_string()],

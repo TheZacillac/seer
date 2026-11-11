@@ -893,6 +893,17 @@ async fn read_and_parse_rdap_body(
             )),
         })?;
 
+    // Refuse absurd nesting before parsing. serde_json accepts ~127 levels,
+    // and unknown members are kept (`RdapResponse::extra`), so a hostile
+    // reply could otherwise parse here and then overflow the depth limit of
+    // a consumer that wraps the record further (the Python bindings convert
+    // a whole bulk result in one pass, so one such row failed the batch).
+    let depth = json_nesting_depth(&body);
+    if depth > MAX_RDAP_JSON_DEPTH {
+        return Err(SeerError::RdapError(format!(
+            "RDAP response nests {depth} levels deep (max {MAX_RDAP_JSON_DEPTH})"
+        )));
+    }
     let rdap: RdapResponse = serde_json::from_slice(&body)?;
     // Bound attacker-controlled payload post-deserialization. The 10MB
     // body cap prevents unbounded download, but a well-formed response
@@ -901,6 +912,41 @@ async fn read_and_parse_rdap_body(
     // recursive walkers to stack-overflow. See RdapResponse::validate.
     rdap.validate()?;
     Ok(rdap)
+}
+
+/// Deepest nesting an RDAP reply may have. A real record needs about forty
+/// levels at the very most (sixteen nested entities, each an array and an
+/// object, plus a jCard), so this leaves room and still sits far below what
+/// any consumer of the parsed record can take.
+const MAX_RDAP_JSON_DEPTH: usize = 64;
+
+/// The deepest `[`/`{` nesting in a JSON document, by one pass over its
+/// bytes (brackets inside strings do not count). Malformed input gets some
+/// answer; the parser that runs next rejects it.
+fn json_nesting_depth(body: &[u8]) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in body {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// Whether `url` targets a loopback IP literal — the only hosts the
@@ -2384,5 +2430,24 @@ mod tests {
             parse_rdap_url("https://rdap.example.com:8443/").unwrap().1,
             8443
         );
+    }
+
+    /// Regression: a reply nested ~125 levels deep parsed in core and then
+    /// overflowed the Python bindings' conversion limit, failing a whole
+    /// bulk call instead of one row.
+    #[test]
+    fn nesting_depth_is_measured_outside_strings() {
+        assert_eq!(json_nesting_depth(b"{}"), 1);
+        assert_eq!(json_nesting_depth(br#"{"a":[{"b":[1]}]}"#), 4);
+        assert_eq!(json_nesting_depth(br#"{"a":"[[[[\"[[{{"}"#), 1);
+        let deep = format!(
+            r#"{{"objectClassName":"domain","x":{}1{}}}"#,
+            "[".repeat(100),
+            "]".repeat(100)
+        );
+        assert_eq!(json_nesting_depth(deep.as_bytes()), 101);
+        assert!(json_nesting_depth(deep.as_bytes()) > MAX_RDAP_JSON_DEPTH);
+        // serde_json itself still takes it, which is why the check exists.
+        assert!(serde_json::from_str::<RdapResponse>(&deep).is_ok());
     }
 }

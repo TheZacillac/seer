@@ -1029,7 +1029,9 @@ fn record_types() -> Vec<String> {
 /// An adversarial WHOIS or RDAP response could nest arrays or objects
 /// deeply enough to overflow the thread stack during conversion, which
 /// aborts the process unrecoverably. The cap surfaces the failure as a
-/// catchable `ValueError` instead. 128 levels is well above anything any
+/// catchable `UpstreamError` instead — the depth comes from response data,
+/// never from the caller's input, so it is not a `ValueError` (which REST
+/// would answer with 400 and MCP with "invalid input"). 128 levels is well above anything any
 /// real-world registry response has ever contained.
 const MAX_JSON_DEPTH: usize = 128;
 
@@ -1053,7 +1055,7 @@ fn json_to_python_inner<'py>(
     // beyond that are rejected (`tests/test_json_depth.py` pins both
     // boundaries).
     if depth > MAX_JSON_DEPTH {
-        return Err(PyValueError::new_err(format!(
+        return Err(exceptions::UpstreamError::new_err(format!(
             "JSON structure exceeds max depth {MAX_JSON_DEPTH}"
         )));
     }
@@ -1099,7 +1101,7 @@ const MAX_TEST_NESTING: usize = 1024;
 /// nested arrays and runs it through [`json_to_python`].
 ///
 /// Used by `tests/test_json_depth.py` to verify the [`MAX_JSON_DEPTH`]
-/// guard raises `ValueError` instead of overflowing the thread stack on
+/// guard raises `UpstreamError` instead of overflowing the thread stack on
 /// an adversarial payload.
 ///
 /// This is a `#[pyfunction]` rather than a `#[cfg(test)]` Rust unit test

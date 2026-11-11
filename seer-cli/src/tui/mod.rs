@@ -511,7 +511,7 @@ impl Tasks {
                             it: Box::new(it.clone()),
                         });
                     });
-                let _ = follower
+                let outcome = follower
                     .follow(
                         &p.domain,
                         seer_core::RecordType::A,
@@ -521,15 +521,45 @@ impl Tasks {
                         Some(cancel_rx),
                     )
                     .await;
+                // A run that could not start (a name `follow` rejects, a bad
+                // nameserver) would otherwise just end, with nothing said.
+                if let Some(msg) = follow_failure(&outcome) {
+                    let _ = tx.send(Msg::Toast { tone: "fail", msg });
+                }
             }
             let _ = tx.send(Msg::FollowDone { gen });
         });
     }
 }
 
+/// The toast for a follow run that ended in an error, sanitized (the text
+/// can echo remote data); `None` for a run that completed or was cancelled.
+fn follow_failure<T>(outcome: &seer_core::Result<T>) -> Option<String> {
+    let error = outcome.as_ref().err()?;
+    Some(format!(
+        "follow failed: {}",
+        seer_core::output::sanitize_line(&error.to_string())
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the Follow task discarded `follow()`'s error, so a run
+    /// that could not start ended silently.
+    #[test]
+    fn a_failed_follow_run_is_reported() {
+        let failed: seer_core::Result<()> = Err(seer_core::SeerError::InvalidDomain(
+            "2001:db8:\x1b[2J".into(),
+        ));
+        let msg = follow_failure(&failed).unwrap();
+        assert!(
+            msg.contains("follow failed") && !msg.contains('\x1b'),
+            "{msg}"
+        );
+        assert!(follow_failure(&Ok(())).is_none());
+    }
 
     #[test]
     fn watchlist_add_of_an_invalid_domain_reports_why() {

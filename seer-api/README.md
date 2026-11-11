@@ -360,7 +360,8 @@ limiting, SSRF guards) is mapped in the repository's
 | Concurrent bulk jobs per worker (`SEER_MAX_CONCURRENT_BULK`) | 8 |
 
 Every bulk job — a `/bulk` or `/bulk/stream` request, or an MCP
-`seer_bulk_*` call — takes one of `SEER_MAX_CONCURRENT_BULK` slots for as
+`seer_bulk_*` call — and every fan-out scan (takeover, confusables,
+`subdomains?resolve=true` and their MCP tools) takes one of `SEER_MAX_CONCURRENT_BULK` slots for as
 long as it runs, even after its client has gone (a running job cannot be
 cancelled). A job that finds every slot busy waits; with
 `SEER_REQUEST_TIMEOUT` set it gives up at the deadline with a `503` (MCP: a

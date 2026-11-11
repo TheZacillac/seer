@@ -192,6 +192,12 @@ pub struct DanePolicy {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub records: Vec<TlsaRecord>,
     pub verdict: PostureVerdict,
+    /// Whether a lookup behind the SMTP scope failed (the MX set, or a
+    /// `_25._tcp` TLSA set). `verdict` covers the SMTP and HTTPS scopes
+    /// together, so on its own it cannot say whether "no SMTP TLSA record"
+    /// was answered or merely not seen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub smtp_lookup_failed: bool,
 }
 
 /// The aggregate email/DNS security posture for a domain.
@@ -818,6 +824,9 @@ fn build_bimi(txt: &TxtLookup) -> BimiPolicy {
 struct TlsaSets {
     sets: Vec<(String, Vec<crate::dns::DnsRecord>)>,
     lookup_failed: bool,
+    /// A lookup behind the SMTP scope failed (see
+    /// [`DanePolicy::smtp_lookup_failed`]).
+    smtp_lookup_failed: bool,
 }
 
 /// Assembles the DANE policy from the TLSA sets. Records found are
@@ -855,6 +864,7 @@ fn build_dane(tlsa: &TlsaSets) -> DanePolicy {
         present: !records.is_empty(),
         verdict,
         records,
+        smtp_lookup_failed: tlsa.smtp_lookup_failed,
     }
 }
 
@@ -1154,6 +1164,7 @@ async fn smtp_tlsa_records(
         return TlsaSets {
             sets: Vec::new(),
             lookup_failed: true,
+            smtp_lookup_failed: true,
         };
     };
     let mut hosts: Vec<String> = Vec::new();
@@ -1191,7 +1202,10 @@ async fn smtp_tlsa_records(
     for ((scope, _), result) in owners.into_iter().zip(results) {
         match result {
             Ok(set) => tlsa.sets.push((scope, set)),
-            Err(_) => tlsa.lookup_failed = true,
+            Err(_) => {
+                tlsa.lookup_failed = true;
+                tlsa.smtp_lookup_failed = true;
+            }
         }
     }
     tlsa

@@ -263,12 +263,17 @@ def _typed(binding: str) -> Handler:
 
 
 def _scan(binding: str) -> Handler:
-    """``seer.<binding>(domain, concurrency)``: a single-domain fan-out scan."""
+    """``seer.<binding>(domain, concurrency)``: a single-domain fan-out scan.
+
+    Dispatched with ``run_bulk``: a scan fans out over up to thousands of
+    hosts and holds its dispatch thread throughout, exactly like a bulk job,
+    so it takes a slot from the same cap (see seer_api/_run.py).
+    """
 
     async def run(arguments: dict[str, Any]) -> Any:
         domain = _require_str(arguments, "domain")
         concurrency = _get_concurrency(arguments, default=10)
-        return await run_seer(getattr(seer, binding), domain, concurrency)
+        return await run_bulk(getattr(seer, binding), domain, concurrency)
 
     return run
 
@@ -335,7 +340,7 @@ async def _subdomains(arguments: dict[str, Any]) -> Any:
         raise ValueError(f"'resolve' must be a boolean (got {type(resolve).__name__})")
     if resolve:
         concurrency = _get_concurrency(arguments, default=10)
-        return await run_seer(seer.subdomains_classify, domain, concurrency)
+        return await run_bulk(seer.subdomains_classify, domain, concurrency)
     return await run_seer(seer.subdomains, domain)
 
 

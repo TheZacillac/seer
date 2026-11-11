@@ -147,7 +147,7 @@ pub fn page(theme: &Theme, bulk: &BulkState, spin: usize) -> Page {
 
 /// Build the detail view lines for a single result: a header row of facts plus
 /// the error or a pretty-printed JSON dump of the returned data.
-fn detail_lines(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'static>> {
+pub(crate) fn detail_lines(theme: &Theme, r: &seer_core::bulk::BulkResult) -> Vec<Line<'static>> {
     let domain = sanitize_line(r.operation.domain());
     let status = if r.success { "ok" } else { "failed" };
     let status_fg = if r.success { theme.green } else { theme.red };

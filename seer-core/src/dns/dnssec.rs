@@ -384,6 +384,15 @@ impl DnssecChecker {
         // decides where the records live, so `www.` must not be pre-stripped
         // (a `www` zone cut, however rare, would otherwise be skipped).
         let domain = crate::validation::normalize_host(domain)?;
+        // The walk and the DS/DNSKEY reads go straight to the upstream; a
+        // special-use name (`.onion`, `.invalid`) must never be sent there
+        // (RFC 7686), and has no delegation to check.
+        if crate::dns::query::answered_locally(&domain) {
+            return Err(SeerError::InvalidInput(format!(
+                "{domain} is a special-use name (RFC 6761) that is never sent to DNS servers, \
+                 so it has no DNSSEC chain to check"
+            )));
+        }
         debug!(domain = %domain, "Checking DNSSEC");
 
         // One deadline for the whole check; the walk must end early enough
@@ -1536,5 +1545,27 @@ mod tests {
                 "ds_fails={ds_fails}: {result:?}"
             );
         }
+    }
+
+    /// Regression: the zone-apex walk sent a `.onion` name to the upstream.
+    #[tokio::test]
+    async fn a_special_use_name_is_never_sent_on_the_wire() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let port = spawn_mock_dns_fn(move |name, _| {
+            seen.lock().unwrap().push(name.to_string());
+            MockReply::NxDomain
+        })
+        .await;
+        let result = mock_checker(port).check("facebookcorewwwi.onion").await;
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "{:?}",
+            asked.lock().unwrap()
+        );
+        assert!(
+            matches!(result, Err(SeerError::InvalidInput(_))),
+            "{result:?}"
+        );
     }
 }
