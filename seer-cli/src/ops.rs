@@ -239,7 +239,7 @@ pub async fn follow_command(
         args.domain.ctp_green(),
         args.record_type.to_string().ctp_yellow(),
         args.iterations.to_string().ctp_yellow(),
-        crate::utils::format_interval(args.interval_minutes),
+        crate::utils::format_interval(follow_config.interval_secs),
         "Esc".ctp_yellow(),
         "Ctrl+C".ctp_yellow()
     );

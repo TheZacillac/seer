@@ -363,6 +363,47 @@ def test_rest_bulk_body_holds_the_contract_mcp_enforces(monkeypatch, client, bod
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    ["127.0.0.1", "127.0.0.1.", "127.0.0.1:443", "x@127.0.0.1", " 127.0.0.1", "https://127.0.0.1/"],
+)
+def test_every_spelling_of_a_reserved_literal_gets_the_precheck(monkeypatch, spelling):
+    """Regression: the literal test ran on the raw input while core
+    normalizes first, so `127.0.0.1.` and `127.0.0.1:443` skipped the
+    documented 400 and got whatever core answered instead."""
+    from seer_api import ssrf
+
+    def _normalize(host):
+        # What seer-core's `normalize_host` returns for these inputs.
+        return "127.0.0.1"
+
+    seen = []
+
+    def _refuse(host, port):
+        seen.append(host)
+        raise ValueError(f"Invalid input: refusing to connect to reserved address: {host}")
+
+    monkeypatch.setattr(seer, "normalize_host", _normalize, raising=False)
+    monkeypatch.setattr(seer, "validate_public_host", _refuse, raising=False)
+    with pytest.raises(ValueError, match="reserved"):
+        ssrf.vet_host(spelling)
+    assert seen == ["127.0.0.1"]
+
+
+def test_a_hostname_is_still_never_prechecked(monkeypatch):
+    from seer_api import ssrf
+
+    def _never(host, port):
+        raise AssertionError(f"pre-checked {host}")
+
+    monkeypatch.setattr(seer, "normalize_host", lambda h: h.lower(), raising=False)
+    monkeypatch.setattr(seer, "validate_public_host", _never, raising=False)
+    ssrf.vet_host("Internal.Corp.Example")
+    # Bindings without `normalize_host`: the plain-literal check only.
+    monkeypatch.delattr(seer, "normalize_host", raising=False)
+    ssrf.vet_host("127.0.0.1.")
+
+
 def test_cors_allowlist_admits_its_origins(monkeypatch):
     import importlib
 

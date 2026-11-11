@@ -546,6 +546,7 @@ results = seer.bulk_lookup(domains, progress=lambda done, total, domain: print(f
 # SSRF helpers (used by seer-api before any user-supplied connect target)
 seer.validate_public_host("example.com", 443)   # ValueError on reserved/private addresses
 seer.nameserver_target("tls://1.1.1.1")          # ("1.1.1.1", 853); None if the spec is invalid
+seer.normalize_host("https://WWW.Example.com/")  # "www.example.com"; None if it is not a valid host
 
 # Errors: ValueError (invalid input), TimeoutError, ConnectionError (WHOIS
 # connect), or a seer.SeerError subclass (a RuntimeError): RateLimitedError,

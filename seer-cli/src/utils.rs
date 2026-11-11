@@ -316,13 +316,15 @@ pub fn expand_tilde(s: &str) -> String {
     s.to_string()
 }
 
-pub fn format_interval(minutes: f64) -> String {
-    if minutes < 1.0 {
-        format!("{}s", (minutes * 60.0) as u64)
-    } else if minutes == 1.0 {
-        "1m".to_string()
-    } else {
-        format!("{}m", minutes)
+/// An interval of `secs` seconds as `45s`, `2m` or `2m 3s`. Takes the
+/// effective seconds (`FollowConfig::interval_secs`), not the minutes the
+/// user typed: the config rounds to the second and floors a looping follow
+/// at 1s, and the banner must say what will actually happen.
+pub fn format_interval(secs: u64) -> String {
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m {s}s"),
     }
 }
 
@@ -802,6 +804,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    /// Regression: the follow banner formatted the typed minutes (truncating)
+    /// while the run used the rounded, floored seconds: `follow x 5 0` said
+    /// "0s interval" and ran 1s apart.
+    #[test]
+    fn the_interval_shown_is_the_one_the_follow_runs_at() {
+        let shown = |iterations, minutes| {
+            format_interval(
+                seer_core::FollowConfig::new(iterations, minutes)
+                    .unwrap()
+                    .interval_secs,
+            )
+        };
+        assert_eq!(shown(5, 0.0), "1s");
+        assert_eq!(shown(1, 0.0), "0s");
+        assert_eq!(shown(5, 0.025), "2s");
+        assert_eq!(shown(5, 0.5), "30s");
+        assert_eq!(shown(5, 1.0), "1m");
+        assert_eq!(shown(5, 2.05), "2m 3s");
     }
 
     /// Regression: bulk found an unwritable CSV path only after the run.

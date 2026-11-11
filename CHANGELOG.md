@@ -88,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer pin every dispatch thread. A REST bulk body with a blank domain
   or a boolean `concurrency` is a 422, as MCP already refused.
 - **seer-py.** An over-deep result raises `UpstreamError`, not `ValueError`.
+- **Follow.** The banner shows the interval the run actually uses (rounded
+  to the second, at least 1s when looping), not the typed minutes.
+- **seer-py.** An integer argument too large for 64 bits raises
+  `ValueError` like any other out-of-range value, not `OverflowError`.
+- **seer-api.** The SSRF pre-check recognizes a reserved IP literal in any
+  spelling core reduces to one (`127.0.0.1.`, `127.0.0.1:443`,
+  `https://127.0.0.1/`), so they get the documented 400.
+
+### Added
+- `seer.normalize_host(host)` (Python): seer-core's probe-target
+  normalization, or `None` for invalid input.
 
 ### Changed
 - `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
