@@ -93,11 +93,11 @@ impl Call {
         let key = cache::key(&self.route, parts);
         let cache = &self.state.cache;
         if let Some(body) = cache.get(&key) {
-            return Ok(json(body, cache.cache_control()));
+            return Ok(json(body, cache.cache_control(self.caller)));
         }
         let body = self.run(work).await?;
         cache.put(key, body.clone());
-        Ok(json(body, cache.cache_control()))
+        Ok(json(body, cache.cache_control(self.caller)))
     }
 
     /// Runs `work` every time and marks the answer `no-store`. For answers

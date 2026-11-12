@@ -346,6 +346,11 @@ mod tests {
             Route::public("/flaky/{name}", CostClass::Light, routing::get(flaky)),
             Route::public("/hang", CostClass::Light, routing::get(hang)),
             Route::keyed("/heavy-count/{name}", CostClass::Heavy, routing::get(count)),
+            Route::keyed(
+                "/locked-count/{name}",
+                CostClass::Light,
+                routing::get(count),
+            ),
             Route::keyed("/heavy-hang", CostClass::Heavy, routing::get(hang)),
             Route::keyed("/slow-audit", CostClass::Light, routing::get(hang))
                 .within(Deadline::Audit),
@@ -753,6 +758,29 @@ mod tests {
         let (admitted, refusal) = until_refused(&app, "198.51.100.44", "/count/shared", &[]).await;
         assert_eq!(admitted, CostClass::Light.per_minute());
         assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_keyed_answer_is_private_and_an_anonymous_one_is_shared() {
+        let (app, _) = app_and_state(|_| {});
+        let keyed = get_with_key(&app, "/count/tiered", "k").await;
+        assert_eq!(keyed.headers[header::CACHE_CONTROL], "private, max-age=60");
+        // The same cached body, to a caller a CDN may serve from its store.
+        let anonymous = get(&app, "/count/tiered").await;
+        assert_eq!(anonymous.json, keyed.json);
+        assert_eq!(anonymous.headers[header::CACHE_CONTROL], "max-age=60");
+    }
+
+    #[tokio::test]
+    async fn a_cached_keyed_answer_is_never_served_to_an_anonymous_caller() {
+        let (app, _) = app_and_state(|_| {});
+        let keyed = get_with_key(&app, "/locked-count/secret", "k").await;
+        assert_eq!(keyed.status, StatusCode::OK);
+        assert_eq!(keyed.headers[header::CACHE_CONTROL], "private, max-age=60");
+        // It is in the cache now; the gate still answers first.
+        let anonymous = get(&app, "/locked-count/secret").await;
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers[header::CACHE_CONTROL], "no-store");
     }
 
     #[tokio::test]
