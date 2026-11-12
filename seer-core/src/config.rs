@@ -114,6 +114,9 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     /// Lookups allowed to run at once. Anonymous callers share half of it.
     pub max_in_flight: usize,
+    /// Lookups one anonymous client may have running at once, so a few
+    /// clients aiming at slow targets cannot hold every anonymous slot.
+    pub max_in_flight_per_client: u32,
     /// How long a successful response is reused, in seconds; `0` disables
     /// the response cache.
     pub cache_ttl_secs: u64,
@@ -129,6 +132,7 @@ impl Default for ServerConfig {
             keyed_rate_multiplier: 10,
             request_timeout_secs: 30,
             max_in_flight: 64,
+            max_in_flight_per_client: 4,
             cache_ttl_secs: 60,
         }
     }
@@ -329,7 +333,8 @@ impl SeerConfig {
     /// immediately. The bounds are per-protocol (a config file can't bypass
     /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
     /// http and CT 1–120s; audit 10–300s; server: key multiplier 1–100,
-    /// request timeout 1–120s, in-flight 2–1024, cache TTL 0–3600s.
+    /// request timeout 1–120s, in-flight 2–1024 (1–64 per client), cache
+    /// TTL 0–3600s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
         // A multi-day per-operation delay would stall bulk runs indefinitely;
@@ -347,6 +352,7 @@ impl SeerConfig {
         self.server.keyed_rate_multiplier = self.server.keyed_rate_multiplier.clamp(1, 100);
         self.server.request_timeout_secs = self.server.request_timeout_secs.clamp(1, 120);
         self.server.max_in_flight = self.server.max_in_flight.clamp(2, 1024);
+        self.server.max_in_flight_per_client = self.server.max_in_flight_per_client.clamp(1, 64);
         self.server.cache_ttl_secs = self.server.cache_ttl_secs.min(3600);
         self
     }
@@ -536,6 +542,23 @@ cors_origins = ["https://example.com"]
         let error = strict("typo", "[server]\npublc = true\n").unwrap_err();
         assert!(matches!(error, SeerError::ConfigError(_)), "{error:?}");
         assert!(error.to_string().contains("server.publc"), "{error}");
+    }
+
+    #[test]
+    fn per_client_in_flight_cap_defaults_parses_and_is_clamped() {
+        assert_eq!(SeerConfig::default().server.max_in_flight_per_client, 4);
+        let parse = |value: u32| {
+            SeerConfig::parse_or_default(
+                &format!("[server]\nmax_in_flight_per_client = {value}\n"),
+                std::path::Path::new("test.toml"),
+            )
+            .server
+            .max_in_flight_per_client
+        };
+        assert_eq!(parse(0), 1);
+        assert_eq!(parse(8), 8);
+        assert_eq!(parse(5000), 64);
+        assert!(SeerConfig::unknown_keys("[server]\nmax_in_flight_per_client = 2\n").is_empty());
     }
 
     #[test]

@@ -1,9 +1,16 @@
 //! The response cache: serialized success bodies, reused for a short time.
 //!
 //! One cache serves every route, because the value is the response body
-//! itself. Only successes are stored, so a transient upstream failure
-//! cannot stick. With a TTL of zero there is no cache and successes are
-//! marked `no-store`.
+//! itself. Only successes are stored, so an error response is never
+//! replayed. (A lookup that *succeeds* in reporting a problem — a DNS
+//! SERVFAIL, a status report with a failed part — is a success and is
+//! reused like any other.) With a TTL of zero there is no cache and
+//! successes are marked `no-store`.
+//!
+//! Memory is bounded by entries times body size: at most `CAPACITY`
+//! bodies of at most `MAX_BODY` bytes each. A larger body is served but
+//! not kept, so what a caller's own zone or registry returns cannot set
+//! this server's memory use.
 
 use std::time::Duration;
 
@@ -13,7 +20,15 @@ use seer_core::TtlCache;
 
 /// Most responses kept at once. Past it, expired entries are purged and
 /// then the oldest evicted (`TtlCache`'s policy).
-const CAPACITY: usize = 10_000;
+const CAPACITY: usize = 2_048;
+
+/// Largest body kept. Ordinary lookup, WHOIS, RDAP and DNS answers are a
+/// few kilobytes; with `CAPACITY` this caps the cache at 128 MiB.
+const MAX_BODY: usize = 64 * 1024;
+
+// Checked at compile time: raising either constant past a quarter of a
+// gigabyte in total has to be a deliberate edit here.
+const _: () = assert!(MAX_BODY * CAPACITY <= 256 * 1024 * 1024);
 
 /// Separates a route from its parts, and parts from each other, in a key.
 /// A control character, so it cannot occur in a normalized name.
@@ -51,8 +66,12 @@ impl ResponseCache {
         self.entries.as_ref()?.get(&key.to_string())
     }
 
-    /// Stores a success body. Does nothing when the cache is disabled.
+    /// Stores a success body. Does nothing when the cache is disabled or
+    /// the body is larger than `MAX_BODY`.
     pub fn put(&self, key: String, body: Bytes) {
+        if body.len() > MAX_BODY {
+            return;
+        }
         if let Some(entries) = &self.entries {
             entries.insert(key, body);
         }
@@ -106,5 +125,15 @@ mod tests {
         // Parts cannot run together into another request's key.
         assert_ne!(key("/a", &["ab", "c"]), key("/a", &["a", "bc"]));
         assert_ne!(key("/a", &["ab", ""]), key("/a", &["a", "b"]));
+    }
+    #[test]
+    fn an_oversized_body_is_not_stored() {
+        // The cache is bounded in bytes as well as entries: what a caller's
+        // own zone or registry returns must not set its memory use.
+        let cache = ResponseCache::new(Duration::from_secs(60));
+        cache.put("fits".to_string(), Bytes::from(vec![b'x'; MAX_BODY]));
+        cache.put("too-big".to_string(), Bytes::from(vec![b'x'; MAX_BODY + 1]));
+        assert!(cache.get("fits").is_some());
+        assert_eq!(cache.get("too-big"), None);
     }
 }

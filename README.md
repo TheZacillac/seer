@@ -694,9 +694,15 @@ address (IPv6 by /64), keyed callers at `keyed_rate_multiplier` times
 the limit. Over the limit is a 429 with `Retry-After`. Successful
 answers are cached for `cache_ttl_secs` and sent with a matching
 `Cache-Control`, so your proxy or CDN can reuse them too. At most
-`max_in_flight` lookups run at once (anonymous callers share half); a
+`max_in_flight` lookups run at once (anonymous callers share half, and
+one anonymous client may have `max_in_flight_per_client` of them); a
 request that cannot get a slot within `request_timeout_secs` is a 503,
 and a lookup still running at that deadline is a 504.
+
+List only your reverse proxies in `trusted_proxies`. Any address inside
+a trusted range can choose the address it is rate-limited as, so a
+private network such as `10.0.0.0/8` draws a startup warning and
+`0.0.0.0/0` is refused.
 
 Configure it in `~/.seer/config.toml`:
 
@@ -709,6 +715,7 @@ trusted_proxies = ["127.0.0.1"]          # whose X-Forwarded-For to believe (IPs
 keyed_rate_multiplier = 10               # keyed callers' limit, as a multiple (1-100)
 request_timeout_secs = 30                # one request's deadline (1-120)
 max_in_flight = 64                       # lookups at once (2-1024)
+max_in_flight_per_client = 4             # ... per anonymous client (1-64)
 cache_ttl_secs = 60                      # reuse successes this long; 0 = off (0-3600)
 ```
 

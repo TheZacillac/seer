@@ -127,7 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Client addresses come from `X-Forwarded-For` only behind a listed
   `trusted_proxies` entry. New `[server]` keys: `trusted_proxies`,
   `keyed_rate_multiplier`, `request_timeout_secs`, `max_in_flight`,
-  `cache_ttl_secs`.
+  `max_in_flight_per_client`, `cache_ttl_secs`. One anonymous client may
+  run only a few lookups at once, cached bodies are capped in size, and a
+  `trusted_proxies` entry that trusts every address is refused.
 - `SeerConfig::load_strict()` (Rust): a config load that fails on an
   unreadable or malformed file or an unknown setting. seer-server uses it.
 - `[server]` section in `~/.seer/config.toml`: `bind`, `public`,

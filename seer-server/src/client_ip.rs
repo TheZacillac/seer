@@ -17,8 +17,14 @@ use ipnet::IpNet;
 /// entries; the first other entry is the client as the innermost trusted
 /// proxy saw it. If that entry is not an IP address, or there is none, the
 /// answer is `peer` — never a value further left, which the client chose.
+///
+/// Every address is compared and returned in canonical form: an
+/// IPv4-mapped IPv6 address (`::ffff:10.0.0.1`, which is how a dual-stack
+/// listener reports an IPv4 peer) is the IPv4 address it stands for.
+/// Otherwise an IPv4 `trusted_proxies` entry would never match it.
 pub fn client_ip(peer: IpAddr, forwarded: &str, trusted: &[IpNet]) -> IpAddr {
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|net| net.contains(ip));
+    let peer = peer.to_canonical();
     if !is_trusted(&peer) {
         return peer;
     }
@@ -27,7 +33,7 @@ pub fn client_ip(peer: IpAddr, forwarded: &str, trusted: &[IpNet]) -> IpAddr {
         if entry.is_empty() {
             continue;
         }
-        match entry.parse::<IpAddr>() {
+        match entry.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
             Ok(ip) if is_trusted(&ip) => continue,
             Ok(ip) => return ip,
             Err(_) => return peer,
@@ -36,15 +42,27 @@ pub fn client_ip(peer: IpAddr, forwarded: &str, trusted: &[IpNet]) -> IpAddr {
     peer
 }
 
+/// The client address the gate decided on for an anonymous request, in the
+/// form it is rate-limited under. Read by `Call` to bound that client's
+/// lookups in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientAddr(pub IpAddr);
+
 /// Every `X-Forwarded-For` header line, in order, joined with commas. A
 /// proxy may add its hop as a separate line instead of extending the
 /// existing one; reading only the first line would let the client's own
-/// value win. A line that is not text contributes an empty entry.
+/// value win.
+///
+/// Bytes that are not text are replaced, not dropped with their line: a
+/// proxy often sends the client's value and its own appended entry as one
+/// line, and a client must not be able to erase the proxy's entry by
+/// putting a bad byte in front of it. The damaged entry is then simply not
+/// an address.
 pub fn forwarded_for(headers: &HeaderMap) -> String {
     headers
         .get_all("x-forwarded-for")
         .iter()
-        .map(|value| value.to_str().unwrap_or(""))
+        .map(|value| String::from_utf8_lossy(value.as_bytes()))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -136,10 +154,61 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_is_not_text_contributes_nothing() {
+    fn a_line_that_is_not_text_is_junk_not_an_address() {
+        let trusted = nets(&["10.0.0.1"]);
         let mut headers = HeaderMap::new();
         headers.append("x-forwarded-for", HeaderValue::from_bytes(b"\xff").unwrap());
+        // On its own it names nobody: the peer is the client.
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &forwarded_for(&headers), &trusted),
+            ip("10.0.0.1")
+        );
         headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
-        assert_eq!(forwarded_for(&headers), ",198.51.100.7");
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &forwarded_for(&headers), &trusted),
+            ip("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn a_bad_byte_does_not_blank_the_entry_the_proxy_appended() {
+        // nginx's `$proxy_add_x_forwarded_for` sends ONE line: the client's
+        // own value, then the address nginx saw. A client that puts a
+        // non-text byte in its value must not erase nginx's entry and so
+        // slip into the proxy's own bucket.
+        let trusted = nets(&["10.0.0.1"]);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff, 198.51.100.7").unwrap(),
+        );
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &forwarded_for(&headers), &trusted),
+            ip("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_are_the_ipv4_address_they_stand_for() {
+        // A dual-stack listener reports an IPv4 proxy as ::ffff:a.b.c.d.
+        let trusted = nets(&["10.0.0.1"]);
+        assert_eq!(
+            client_ip(ip("::ffff:10.0.0.1"), "198.51.100.7", &trusted),
+            ip("198.51.100.7")
+        );
+        // Mapped entries are trusted hops and clients like any other.
+        assert_eq!(
+            client_ip(
+                ip("10.0.0.1"),
+                "::ffff:198.51.100.7, ::ffff:10.0.0.1",
+                &trusted
+            ),
+            ip("198.51.100.7")
+        );
+        // An untrusted mapped peer is reported in its plain form.
+        assert_eq!(
+            client_ip(ip("::ffff:203.0.113.9"), "", &trusted),
+            ip("203.0.113.9")
+        );
     }
 }

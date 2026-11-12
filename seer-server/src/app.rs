@@ -24,9 +24,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::Instrument;
 
-use crate::client_ip::{client_ip, forwarded_for};
+use crate::client_ip::{client_ip, forwarded_for, ClientAddr};
 use crate::error::ApiError;
-use crate::limit::Subject;
+use crate::limit::{self, Subject};
 use crate::settings::{CorsOrigins, Settings};
 use crate::state::{AppState, Clients};
 use crate::tier::{self, Caller, Tier};
@@ -150,6 +150,12 @@ async fn gate(
         .check(route, meta.cost, subject)
         .map_err(ApiError::rate_limited)?;
 
+    if let Subject::Anonymous(ip) = subject {
+        // The identity this client is limited under, for `Call`.
+        request
+            .extensions_mut()
+            .insert(ClientAddr(limit::bucket(ip)));
+    }
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
 }
@@ -814,5 +820,42 @@ mod tests {
         let _b = state.permits.acquire(Caller::Keyed).await.unwrap();
         // Every slot is taken, yet the cached answer is served at once.
         assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn one_anonymous_client_cannot_hold_every_slot() {
+        let (app, state) = app_and_state(|s| s.max_in_flight_per_client = 1);
+        // The client already has its one lookup in flight.
+        let client: std::net::IpAddr = crate::test_support::PEER.parse().unwrap();
+        let held = state.per_client.enter(client).unwrap();
+        let refused = get(&app, "/fresh").await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers[header::RETRY_AFTER], "1");
+        // Other clients, keyed callers and cached answers are unaffected.
+        let other = send_from(&app, "198.51.100.9", Method::GET, "/fresh", &[]).await;
+        assert_eq!(other.status, StatusCode::OK);
+        assert_eq!(
+            get_with_key(&app, "/fresh", "k").await.status,
+            StatusCode::OK
+        );
+        drop(held);
+        assert_eq!(get(&app, "/fresh").await.status, StatusCode::OK);
+        assert_eq!(
+            state.per_client.clients(),
+            0,
+            "finished lookups are forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_call_frees_its_clients_slot() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight_per_client = 1;
+        });
+        for _ in 0..3 {
+            assert_eq!(get(&app, "/hang").await.status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        assert_eq!(state.per_client.clients(), 0);
     }
 }

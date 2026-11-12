@@ -86,8 +86,9 @@ in `seer-core`. The other four parse input, call core and present results.
 - `call.rs` — `Call::respond`: cache lookup → permit → core call, the
   last two under one deadline. `respond_fresh` skips the cache.
 - `limit.rs` (GCRA limits per route and caller), `client_ip.rs` (the
-  trusted-proxy rule), `cache.rs` (response bodies in a `TtlCache`),
-  `state.rs` (the shared core clients, `Permits`, `AppState::new`).
+  trusted-proxy rule), `cache.rs` (response bodies in a `TtlCache`, capped per body),
+  `state.rs` (the shared core clients, `Permits`, `PerClient`,
+  `AppState::new`).
 - `tier.rs` (anonymous vs keyed), `edge.rs` (edge checks, JSON-rejecting
   extractors), `error.rs` (`ApiError`: status from
   `ErrorCategory::http_status()`, `Retry-After` on 429/503).
@@ -335,7 +336,10 @@ step). The tables:
   The CLI keeps the tolerant `load()`.
 - **seer-server's rate-limit identity** is the socket peer unless that
   peer is in `[server] trusted_proxies`; only then is `X-Forwarded-For`
-  read, right to left. IPv6 callers are counted by /64. A handler must
+  read, right to left. IPv6 callers are counted by /64, and every
+  address is compared in canonical form (`::ffff:a.b.c.d` is `a.b.c.d`).
+  Any address inside a trusted range can choose its own identity, so
+  `trusted_proxies` lists proxies, never client networks. A handler must
   go through `Call::respond` / `respond_fresh` — returning `Json`
   directly skips the cache, the permits and the deadline.
 - **seer-server mirrors seer-api's paths and JSON, not its edge:**

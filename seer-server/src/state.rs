@@ -4,7 +4,8 @@
 //! nameserver) and shared by reference; none is rebuilt per request.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use seer_core::contract::CostClass;
 use seer_core::{
@@ -102,6 +103,74 @@ impl Permits {
     }
 }
 
+/// How many lookups each anonymous client has in flight.
+///
+/// The pools in [`Permits`] bound the server; this bounds one client. An
+/// anonymous caller chooses the target of an SSL, status or DNS lookup, so
+/// it chooses how slow that lookup is. Without a per-client bound, a few
+/// addresses aiming at slow targets could hold every anonymous slot.
+pub struct PerClient {
+    limit: u32,
+    in_flight: Mutex<HashMap<IpAddr, u32>>,
+}
+
+/// One client's lookup in flight; released when dropped.
+pub struct ClientSlot<'a> {
+    owner: &'a PerClient,
+    client: IpAddr,
+}
+
+impl PerClient {
+    /// At most `limit` lookups in flight per client.
+    pub fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records one more lookup for `client`, or `None` if it already has
+    /// the most allowed. Never waits: the caller is told to retry.
+    pub fn enter(&self, client: IpAddr) -> Option<ClientSlot<'_>> {
+        let mut in_flight = self.lock();
+        let count = in_flight.get(&client).copied().unwrap_or(0);
+        if count >= self.limit {
+            return None;
+        }
+        in_flight.insert(client, count + 1);
+        Some(ClientSlot {
+            owner: self,
+            client,
+        })
+    }
+
+    /// Clients with a lookup in flight right now.
+    pub fn clients(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// The map is plain counters, valid at every step, so a poisoned lock
+    /// is recovered rather than propagated.
+    fn lock(&self) -> MutexGuard<'_, HashMap<IpAddr, u32>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for ClientSlot<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.owner.lock();
+        if let Some(count) = in_flight.get_mut(&self.client) {
+            *count = count.saturating_sub(1);
+            // Forget idle clients, so the map holds only lookups in flight.
+            if *count == 0 {
+                in_flight.remove(&self.client);
+            }
+        }
+    }
+}
+
 /// What the gate needs to know about a route.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteMeta {
@@ -126,6 +195,8 @@ pub struct AppState {
     pub(crate) cache: Arc<ResponseCache>,
     /// Slots for lookups in flight.
     pub(crate) permits: Arc<Permits>,
+    /// Each anonymous client's lookups in flight.
+    pub(crate) per_client: Arc<PerClient>,
 }
 
 impl AppState {
@@ -146,6 +217,7 @@ impl AppState {
             limits: Arc::new(Limits::new(settings.keyed_rate_multiplier)),
             cache: Arc::new(ResponseCache::new(settings.cache_ttl)),
             permits: Arc::new(Permits::new(settings.max_in_flight)),
+            per_client: Arc::new(PerClient::new(settings.max_in_flight_per_client)),
             settings: Arc::new(settings),
             clients: Arc::new(clients),
         }
@@ -206,5 +278,21 @@ mod tests {
         assert_eq!(permits.available(), (0, 1));
         drop(held);
         assert_eq!(permits.available(), (1, 1));
+    }
+    #[test]
+    fn one_client_gets_only_so_many_lookups_at_once() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let per_client = PerClient::new(2);
+        let first = per_client.enter(ip("203.0.113.7")).unwrap();
+        let _second = per_client.enter(ip("203.0.113.7")).unwrap();
+        assert!(per_client.enter(ip("203.0.113.7")).is_none());
+        // Another client is not affected.
+        let other = per_client.enter(ip("203.0.113.8")).unwrap();
+        assert_eq!(per_client.clients(), 2);
+        // Finishing a lookup frees its slot, and idle clients are forgotten.
+        drop(first);
+        assert!(per_client.enter(ip("203.0.113.7")).is_some());
+        drop(other);
+        assert_eq!(per_client.clients(), 1);
     }
 }

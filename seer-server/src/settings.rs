@@ -43,6 +43,8 @@ pub struct Settings {
     pub request_timeout: Duration,
     /// Lookups allowed to run at once.
     pub max_in_flight: usize,
+    /// Lookups one anonymous client may have running at once.
+    pub max_in_flight_per_client: u32,
     /// How long a successful response is reused; zero disables the cache.
     pub cache_ttl: Duration,
 }
@@ -56,6 +58,8 @@ pub enum StartupError {
     InvalidOrigin(String),
     /// A `[server] trusted_proxies` entry is not an IP address or a range.
     InvalidProxy(String),
+    /// A `[server] trusted_proxies` entry covers every address.
+    ProxyRangeTooBroad(String),
     /// `public = false` and no API key: nobody could call anything.
     KeyRequired,
 }
@@ -76,6 +80,11 @@ impl fmt::Display for StartupError {
                 f,
                 "[server] trusted_proxies entry {entry:?} is not an IP address or \
                  a range (e.g. \"127.0.0.1\", \"10.0.0.0/8\")"
+            ),
+            StartupError::ProxyRangeTooBroad(entry) => write!(
+                f,
+                "[server] trusted_proxies entry {entry:?} trusts every address: any caller \
+                 could then claim any identity. List only your reverse proxies"
             ),
             StartupError::KeyRequired => write!(
                 f,
@@ -111,6 +120,7 @@ impl Settings {
             keyed_rate_multiplier: server.keyed_rate_multiplier,
             request_timeout: Duration::from_secs(server.request_timeout_secs),
             max_in_flight: server.max_in_flight,
+            max_in_flight_per_client: server.max_in_flight_per_client,
             cache_ttl: Duration::from_secs(server.cache_ttl_secs),
         })
     }
@@ -126,6 +136,15 @@ impl Settings {
                  proxy's address in trusted_proxies"
                     .to_string(),
             );
+        }
+        for net in &self.trusted_proxies {
+            if is_broad_private_range(net) {
+                warnings.push(format!(
+                    "[server] trusted_proxies entry {net} is a whole private network: any \
+                     client inside it can choose the address it is rate-limited as. List \
+                     only your reverse proxies"
+                ));
+            }
         }
         warnings
     }
@@ -166,8 +185,25 @@ fn parse_proxies(entries: &[String]) -> Result<Vec<IpNet>, StartupError> {
                 .parse::<IpNet>()
                 .or_else(|_| trimmed.parse::<IpAddr>().map(IpNet::from))
                 .map_err(|_| StartupError::InvalidProxy(entry.clone()))
+                .and_then(|net| {
+                    if net.prefix_len() == 0 {
+                        Err(StartupError::ProxyRangeTooBroad(entry.clone()))
+                    } else {
+                        Ok(net)
+                    }
+                })
         })
         .collect()
+}
+
+/// A private (RFC 1918 or unique-local) range wider than one subnet. A
+/// broad *public* range is not flagged: a CDN's published proxy blocks are
+/// broad on purpose, and no client sits inside them.
+fn is_broad_private_range(net: &IpNet) -> bool {
+    match net {
+        IpNet::V4(v4) => v4.prefix_len() < 24 && v4.network().is_private(),
+        IpNet::V6(v6) => v6.prefix_len() < 64 && v6.network().is_unique_local(),
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +372,43 @@ mod tests {
         // A private server limits by key, so the client IP does not matter.
         let private = Settings::new(&ServerConfig::default(), Some("k".into())).unwrap();
         assert!(private.warnings().is_empty());
+    }
+    #[test]
+    fn trusting_every_address_is_a_startup_error() {
+        // Under /0 every forwarded entry is "a proxy": callers could claim
+        // any identity, or none could be told apart.
+        for entry in ["0.0.0.0/0", "::/0"] {
+            let server = ServerConfig {
+                trusted_proxies: vec![entry.to_string()],
+                ..ServerConfig::default()
+            };
+            let error = Settings::new(&server, Some("k".into())).unwrap_err();
+            assert_eq!(error, StartupError::ProxyRangeTooBroad(entry.to_string()));
+            assert!(error.to_string().contains("every address"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_broad_private_proxy_range_is_warned_about() {
+        let warnings = |proxies: &[&str]| {
+            let server = ServerConfig {
+                public: true,
+                trusted_proxies: proxies.iter().map(|s| s.to_string()).collect(),
+                ..ServerConfig::default()
+            };
+            Settings::new(&server, None).unwrap().warnings()
+        };
+        // "Trust my whole network": a client inside it can choose its own
+        // identity.
+        for broad in ["10.0.0.0/8", "192.168.0.0/16", "fd00::/8"] {
+            let found = warnings(&[broad]);
+            assert_eq!(found.len(), 1, "{broad}: {found:?}");
+            assert!(found[0].contains(broad), "{found:?}");
+        }
+        // Single hosts, small private ranges and public ranges (a CDN's
+        // published blocks are broad on purpose) are not.
+        for fine in ["10.0.0.5", "10.0.0.0/24", "fd00::/64", "104.16.0.0/13"] {
+            assert!(warnings(&[fine]).is_empty(), "{fine}");
+        }
     }
 }

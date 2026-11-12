@@ -2,12 +2,15 @@
 //!
 //! A handler does its edge checks, then hands its lookup to
 //! [`Call::respond`], which runs it only if needed and only if allowed:
-//! the cache is consulted first, then a slot is taken, and the wait for the
-//! slot plus the lookup itself share one deadline. Dropping the future at
+//! the cache is consulted first, then the client's own share of lookups in
+//! flight is checked, then a slot is taken, and the wait for the slot plus
+//! the lookup itself share one deadline. Dropping the future at
 //! the deadline (or when the client disconnects) cancels the lookup and
 //! returns its slots.
 
 use std::future::Future;
+use std::net::IpAddr;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{FromRequestParts, MatchedPath};
@@ -19,6 +22,7 @@ use serde::Serialize;
 use tokio::time::{timeout_at, Instant};
 
 use crate::cache;
+use crate::client_ip::ClientAddr;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::tier::Caller;
@@ -30,6 +34,8 @@ pub struct Call {
     pub state: AppState,
     /// Who is calling, as the gate decided.
     pub caller: Caller,
+    /// The client an anonymous request is limited as; `None` when keyed.
+    client: Option<IpAddr>,
     route: String,
 }
 
@@ -52,9 +58,14 @@ impl FromRequestParts<AppState> for Call {
             .get::<MatchedPath>()
             .map(|path| path.as_str().to_string())
             .ok_or_else(ApiError::internal)?;
+        let client = parts.extensions.get::<ClientAddr>().map(|addr| addr.0);
+        if caller == Caller::Anonymous && client.is_none() {
+            return Err(ApiError::internal());
+        }
         Ok(Self {
             state: state.clone(),
             caller,
+            client,
             route,
         })
     }
@@ -98,6 +109,17 @@ impl Call {
         T: Serialize,
         F: Future<Output = seer_core::Result<T>> + Send,
     {
+        // One client may have only so many lookups running. This is checked
+        // first and never waits, so a client over its share costs nothing.
+        let _client_slot = match self.client {
+            Some(client) => Some(
+                self.state
+                    .per_client
+                    .enter(client)
+                    .ok_or_else(|| ApiError::rate_limited(Duration::from_secs(1)))?,
+            ),
+            None => None,
+        };
         let deadline = Instant::now() + self.state.settings.request_timeout;
         // No slot in time: nothing was started, so the caller may retry.
         let _held = timeout_at(deadline, self.state.permits.acquire(self.caller))
