@@ -345,6 +345,8 @@ mod tests {
             Route::public("/fresh", CostClass::Light, routing::get(fresh)),
             Route::public("/flaky/{name}", CostClass::Light, routing::get(flaky)),
             Route::public("/hang", CostClass::Light, routing::get(hang)),
+            Route::keyed("/heavy-count/{name}", CostClass::Heavy, routing::get(count)),
+            Route::keyed("/heavy-hang", CostClass::Heavy, routing::get(hang)),
             Route::keyed("/slow-audit", CostClass::Light, routing::get(hang))
                 .within(Deadline::Audit),
         ]
@@ -810,6 +812,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_heavy_route_waits_for_a_heavy_slot() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 4;
+        });
+        // Three heavy slots (one below the total); hold them all.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(
+                state
+                    .permits
+                    .acquire(Caller::Keyed, CostClass::Heavy)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let heavy = get_with_key(&app, "/heavy-count/a", "k").await;
+        assert_eq!(heavy.status, StatusCode::SERVICE_UNAVAILABLE);
+        // The fourth total slot is still there for a light lookup.
+        assert_eq!(
+            get_with_key(&app, "/count/light", "k").await.status,
+            StatusCode::OK
+        );
+        held.clear();
+        assert_eq!(
+            get_with_key(&app, "/heavy-count/a", "k").await.status,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_heavy_call_returns_its_heavy_slot() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 2;
+        });
+        let before = (state.permits.available(), state.permits.heavy_available());
+        for _ in 0..3 {
+            let reply = get_with_key(&app, "/heavy-hang", "k").await;
+            assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        // Dropped mid-flight three times with one heavy slot: none stuck.
+        assert_eq!(
+            (state.permits.available(), state.permits.heavy_available()),
+            before
+        );
+    }
+
+    #[tokio::test]
     async fn a_timed_out_call_returns_its_permits() {
         let (app, state) = app_and_state(|s| {
             s.request_timeout = Duration::from_millis(100);
@@ -831,7 +882,11 @@ mod tests {
             s.max_in_flight = 2;
         });
         // Hold the one anonymous slot, as a lookup in flight would.
-        let held = state.permits.acquire(Caller::Anonymous).await.unwrap();
+        let held = state
+            .permits
+            .acquire(Caller::Anonymous, CostClass::Light)
+            .await
+            .unwrap();
         let anonymous = get(&app, "/fresh").await;
         assert_eq!(anonymous.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -852,8 +907,16 @@ mod tests {
     async fn a_cache_hit_needs_no_slot() {
         let (app, state) = app_and_state(|s| s.max_in_flight = 2);
         assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
-        let _a = state.permits.acquire(Caller::Keyed).await.unwrap();
-        let _b = state.permits.acquire(Caller::Keyed).await.unwrap();
+        let _a = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let _b = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
         // Every slot is taken, yet the cached answer is served at once.
         assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
     }

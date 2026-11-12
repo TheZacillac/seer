@@ -136,10 +136,13 @@ impl Call {
         };
         let deadline = Instant::now() + budget;
         // No slot in time: nothing was started, so the caller may retry.
-        let _held = timeout_at(deadline, self.state.permits.acquire(self.caller))
-            .await
-            .map_err(|_| ApiError::busy())?
-            .map_err(|_| ApiError::internal())?;
+        let _held = timeout_at(
+            deadline,
+            self.state.permits.acquire(self.caller, self.meta.cost),
+        )
+        .await
+        .map_err(|_| ApiError::busy())?
+        .map_err(|_| ApiError::internal())?;
         let value = timeout_at(deadline, work)
             .await
             .map_err(|_| ApiError::timeout())??;
