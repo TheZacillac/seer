@@ -5,9 +5,13 @@
 //! anonymous (the public routes, when `[server] public = true`) or keyed
 //! (`Authorization: Bearer $SEER_API_KEY`).
 //!
-//! Module map: [`error`] turns failures into `{"detail": …}` responses.
+//! Module map: [`settings`] validates the config and runs the startup
+//! checks; [`tier`] decides who may call what; [`error`] turns failures
+//! into `{"detail": …}` responses.
 
 pub mod error;
+pub mod settings;
+pub mod tier;
 
 #[cfg(test)]
 mod test_support;
