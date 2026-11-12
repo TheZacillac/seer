@@ -548,6 +548,11 @@ seer.validate_public_host("example.com", 443)   # ValueError on reserved/private
 seer.nameserver_target("tls://1.1.1.1")          # ("1.1.1.1", 853); None if the spec is invalid
 seer.normalize_host("https://WWW.Example.com/")  # "www.example.com"; None if it is not a valid host
 
+# seer-core's shared contract (what seer-api enforces, read rather than copied)
+seer.error_status_table()                        # [(ValueError, 400), (TimeoutError, 504), ...]
+seer.contract()                                  # input limits and per-minute rate-limit classes
+seer.clean_message("bad\x1b[31m text")            # control characters removed, length capped
+
 # Errors: ValueError (invalid input), TimeoutError, ConnectionError (WHOIS
 # connect), or a seer.SeerError subclass (a RuntimeError): RateLimitedError,
 # WhoisServerNotFoundError, DnsError, UpstreamError, LookupFailedError,
