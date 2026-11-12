@@ -28,7 +28,7 @@ use crate::client_ip::{client_ip, forwarded_for, ClientAddr};
 use crate::error::ApiError;
 use crate::limit::{self, Subject};
 use crate::settings::{CorsOrigins, Settings};
-use crate::state::{AppState, Clients};
+use crate::state::{AppState, Clients, Deadline};
 use crate::tier::{self, Caller, Tier};
 
 /// The response header carrying the id that also tags the request's log
@@ -36,7 +36,7 @@ use crate::tier::{self, Caller, Tier};
 const X_REQUEST_ID: &str = "x-request-id";
 
 /// One row of the route table: a path, who may call it, what it costs,
-/// and its handler.
+/// its deadline and its handler.
 pub struct Route {
     /// The path pattern, as Axum spells it (`/lookup/{domain}`).
     pub path: &'static str,
@@ -44,6 +44,8 @@ pub struct Route {
     pub tier: Tier,
     /// How expensive it is to serve, which sets its rate limit.
     pub cost: CostClass,
+    /// Which deadline its requests run under.
+    pub deadline: Deadline,
     /// The handler, already wrapped in its HTTP method.
     pub handler: MethodRouter<AppState>,
 }
@@ -55,6 +57,7 @@ impl Route {
             path,
             tier: Tier::Public,
             cost,
+            deadline: Deadline::Default,
             handler,
         }
     }
@@ -65,8 +68,17 @@ impl Route {
             path,
             tier: Tier::Keyed,
             cost,
+            deadline: Deadline::Default,
             handler,
         }
+    }
+}
+
+impl Route {
+    /// The same route under another deadline.
+    pub fn within(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
@@ -301,6 +313,14 @@ mod tests {
 
     /// A public stub server whose key is `k`, and its state.
     fn app_and_state(adjust: impl FnOnce(&mut Settings)) -> (Router, AppState) {
+        app_and_state_with(adjust, |_| {})
+    }
+
+    /// [`app_and_state`], with the clients adjusted too.
+    fn app_and_state_with(
+        adjust: impl FnOnce(&mut Settings),
+        adjust_clients: impl FnOnce(&mut Clients),
+    ) -> (Router, AppState) {
         let server = ServerConfig {
             public: true,
             ..ServerConfig::default()
@@ -308,7 +328,8 @@ mod tests {
         let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
         adjust(&mut settings);
         let routes = stub_routes();
-        let clients = Clients::from_config(&SeerConfig::default());
+        let mut clients = Clients::from_config(&SeerConfig::default());
+        adjust_clients(&mut clients);
         let state = AppState::new(settings, clients, &routes);
         (assemble(state.clone(), routes), state)
     }
@@ -324,6 +345,8 @@ mod tests {
             Route::public("/fresh", CostClass::Light, routing::get(fresh)),
             Route::public("/flaky/{name}", CostClass::Light, routing::get(flaky)),
             Route::public("/hang", CostClass::Light, routing::get(hang)),
+            Route::keyed("/slow-audit", CostClass::Light, routing::get(hang))
+                .within(Deadline::Audit),
         ]
     }
 
@@ -771,6 +794,19 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the deadline did not fire"
         );
+    }
+
+    #[tokio::test]
+    async fn an_audit_row_runs_under_the_audit_deadline_not_the_request_timeout() {
+        let (app, _) = app_and_state_with(
+            |s| s.request_timeout = Duration::from_millis(50),
+            |c| c.audit_deadline = Duration::from_millis(400),
+        );
+        let started = Instant::now();
+        let reply = get_with_key(&app, "/slow-audit", "k").await;
+        assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        // A lower bound only: it outlived the 50 ms request timeout.
+        assert!(started.elapsed() >= Duration::from_millis(350));
     }
 
     #[tokio::test]

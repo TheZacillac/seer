@@ -2,14 +2,14 @@
 source: seer-server/src/routes/mod.rs
 expression: table
 ---
-/lookup/{domain}                 Public  standard
-/whois/{domain}                  Public  standard
-/rdap/domain/{domain}            Public  standard
-/rdap/ip/{ip}                    Public  standard
-/rdap/asn/{asn}                  Public  standard
-/availability/{domain}           Public  light
-/tld/                            Public  standard
-/tld/{tld}                       Public  light
-/dns/{domain}/{record_type}      Public  light
-/ssl/{domain}                    Public  standard
-/status/{domain}                 Public  moderate
+/lookup/{domain}                     Public  standard  Default
+/whois/{domain}                      Public  standard  Default
+/rdap/domain/{domain}                Public  standard  Default
+/rdap/ip/{ip}                        Public  standard  Default
+/rdap/asn/{asn}                      Public  standard  Default
+/availability/{domain}               Public  light     Default
+/tld/                                Public  standard  Default
+/tld/{tld}                           Public  light     Default
+/dns/{domain}/{record_type}          Public  light     Default
+/ssl/{domain}                        Public  standard  Default
+/status/{domain}                     Public  moderate  Default

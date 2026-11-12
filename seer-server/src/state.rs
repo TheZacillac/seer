@@ -6,11 +6,14 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use seer_core::contract::CostClass;
+use seer_core::dns::{DelegationChecker, PropagationChecker};
 use seer_core::{
-    AvailabilityChecker, DnsResolver, RdapClient, SeerConfig, SmartLookup, SslChecker,
-    StatusClient, WhoisClient,
+    Auditor, AvailabilityChecker, DnsComparator, DnsResolver, DnsTracer, DnssecChecker,
+    DomainDiffer, RdapClient, SeerConfig, SmartLookup, SslChecker, StatusClient,
+    SubdomainEnumerator, WhoisClient,
 };
 
 use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
@@ -20,6 +23,10 @@ use crate::cache::ResponseCache;
 use crate::limit::Limits;
 use crate::settings::Settings;
 use crate::tier::{Caller, Tier};
+
+/// How much longer than the audit's own timeout its request may run, so
+/// the request deadline never cuts a finishing audit short.
+const AUDIT_GRACE: Duration = Duration::from_secs(5);
 
 /// One of each seer-core client the routes call.
 pub struct Clients {
@@ -37,6 +44,27 @@ pub struct Clients {
     pub status: StatusClient,
     /// Registration availability.
     pub availability: AvailabilityChecker,
+    /// Subdomains from Certificate Transparency logs.
+    pub subdomains: SubdomainEnumerator,
+    /// DNSSEC chain checks.
+    pub dnssec: DnssecChecker,
+    /// Parent-versus-child NS delegation checks.
+    pub delegation: DelegationChecker,
+    /// Side-by-side comparison of two domains.
+    pub differ: DomainDiffer,
+    /// The graded security audit.
+    pub auditor: Auditor,
+    /// One query fanned out to public resolvers.
+    pub propagation: PropagationChecker,
+    /// The walk from the root servers down.
+    pub tracer: DnsTracer,
+    /// One query asked of two named servers.
+    pub comparator: DnsComparator,
+    /// Timeout for the HTTP probes that take one per call (headers,
+    /// takeover).
+    pub http_timeout: Duration,
+    /// Deadline for an audit request: the audit timeout plus a grace.
+    pub audit_deadline: Duration,
 }
 
 impl Clients {
@@ -50,6 +78,16 @@ impl Clients {
             ssl: SslChecker::from_config(config),
             status: StatusClient::from_config(config),
             availability: AvailabilityChecker::from_config(config),
+            subdomains: SubdomainEnumerator::from_config(config),
+            dnssec: DnssecChecker::from_config(config),
+            delegation: DelegationChecker::from_config(config),
+            differ: DomainDiffer::from_config(config),
+            auditor: Auditor::from_config(config),
+            propagation: PropagationChecker::from_config(config),
+            tracer: DnsTracer::from_config(config),
+            comparator: DnsComparator::from_config(config),
+            http_timeout: config.http_timeout(),
+            audit_deadline: config.audit_timeout() + AUDIT_GRACE,
         }
     }
 }
@@ -171,13 +209,25 @@ impl Drop for ClientSlot<'_> {
     }
 }
 
-/// What the gate needs to know about a route.
+/// Which deadline a route's requests run under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deadline {
+    /// `[server] request_timeout_secs`.
+    Default,
+    /// The audit timeout plus a grace: an audit is allowed far longer than
+    /// one lookup.
+    Audit,
+}
+
+/// What the gate and `Call` need to know about a route.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteMeta {
     /// Who may call it.
     pub tier: Tier,
     /// How expensive it is, which sets its rate limit.
     pub cost: CostClass,
+    /// Which deadline its requests run under.
+    pub deadline: Deadline,
 }
 
 /// The state Axum hands to handlers and middleware. Cheap to clone.
@@ -208,6 +258,7 @@ impl AppState {
                 let meta = RouteMeta {
                     tier: route.tier,
                     cost: route.cost,
+                    deadline: route.deadline,
                 };
                 (route.path, meta)
             })
@@ -227,7 +278,6 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::time::timeout;
 
     const SOON: Duration = Duration::from_millis(50);
@@ -279,6 +329,15 @@ mod tests {
         drop(held);
         assert_eq!(permits.available(), (1, 1));
     }
+
+    #[test]
+    fn the_audit_deadline_is_the_audit_timeout_plus_five_seconds() {
+        // An audit may take its whole timeout (60 s by default); the request
+        // deadline must not cut it short.
+        let clients = Clients::from_config(&SeerConfig::default());
+        assert_eq!(clients.audit_deadline, Duration::from_secs(65));
+    }
+
     #[test]
     fn one_client_gets_only_so_many_lookups_at_once() {
         let ip = |text: &str| text.parse::<IpAddr>().unwrap();

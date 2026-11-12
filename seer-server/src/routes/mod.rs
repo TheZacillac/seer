@@ -93,13 +93,18 @@ mod tests {
 
     #[test]
     fn the_whole_table_is_snapshotted() {
-        // Path, tier and cost class of every route: any change to what the
+        // Path, tier, cost class and deadline of every route: any change to what the
         // server exposes, or how it is limited, shows up in review.
         let table: String = routes()
             .iter()
             .map(|r| {
                 let tier = format!("{:?}", r.tier);
-                format!("{:<32} {tier:<7} {}\n", r.path, r.cost.name())
+                format!(
+                    "{:<36} {tier:<7} {:<9} {:?}\n",
+                    r.path,
+                    r.cost.name(),
+                    r.deadline
+                )
             })
             .collect();
         insta::assert_snapshot!(table);

@@ -4,7 +4,7 @@
 //! [`Call::respond`], which runs it only if needed and only if allowed:
 //! the cache is consulted first, then the client's own share of lookups in
 //! flight is checked, then a slot is taken, and the wait for the slot plus
-//! the lookup itself share one deadline. Dropping the future at
+//! the lookup itself share one deadline, the row's. Dropping the future at
 //! the deadline (or when the client disconnects) cancels the lookup and
 //! returns its slots.
 
@@ -24,7 +24,7 @@ use tokio::time::{timeout_at, Instant};
 use crate::cache;
 use crate::client_ip::ClientAddr;
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, Deadline, RouteMeta};
 use crate::tier::Caller;
 
 /// The context of one gated request: the shared state, who is calling, and
@@ -37,6 +37,8 @@ pub struct Call {
     /// The client an anonymous request is limited as; `None` when keyed.
     client: Option<IpAddr>,
     route: String,
+    /// The matched route's row.
+    meta: RouteMeta,
 }
 
 impl FromRequestParts<AppState> for Call {
@@ -58,6 +60,13 @@ impl FromRequestParts<AppState> for Call {
             .get::<MatchedPath>()
             .map(|path| path.as_str().to_string())
             .ok_or_else(ApiError::internal)?;
+        // The gate found this row already; missing here means a handler
+        // was mounted outside the table. Fail closed.
+        let meta = state
+            .rows
+            .get(route.as_str())
+            .copied()
+            .ok_or_else(ApiError::internal)?;
         let client = parts.extensions.get::<ClientAddr>().map(|addr| addr.0);
         if caller == Caller::Anonymous && client.is_none() {
             return Err(ApiError::internal());
@@ -67,6 +76,7 @@ impl FromRequestParts<AppState> for Call {
             caller,
             client,
             route,
+            meta,
         })
     }
 }
@@ -103,7 +113,7 @@ impl Call {
     }
 
     /// Takes a slot, runs `work` and serializes its result, all within the
-    /// request deadline.
+    /// row's deadline.
     async fn run<T, F>(&self, work: F) -> Result<Bytes, ApiError>
     where
         T: Serialize,
@@ -120,7 +130,11 @@ impl Call {
             ),
             None => None,
         };
-        let deadline = Instant::now() + self.state.settings.request_timeout;
+        let budget = match self.meta.deadline {
+            Deadline::Default => self.state.settings.request_timeout,
+            Deadline::Audit => self.state.clients.audit_deadline,
+        };
+        let deadline = Instant::now() + budget;
         // No slot in time: nothing was started, so the caller may retry.
         let _held = timeout_at(deadline, self.state.permits.acquire(self.caller))
             .await
