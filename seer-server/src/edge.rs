@@ -80,6 +80,12 @@ pub fn record_type(value: &str) -> Result<RecordType, ApiError> {
     Ok(value.parse::<RecordType>()?)
 }
 
+/// An optional `record_type` query parameter: `A` when absent, as
+/// seer-api defaults it.
+pub fn record_type_or_a(value: Option<&str>) -> Result<RecordType, ApiError> {
+    record_type(value.unwrap_or("A"))
+}
+
 /// A TLD path parameter.
 pub fn tld(value: &str) -> Result<(), ApiError> {
     if contract::is_tld_token(value) {
@@ -131,4 +137,18 @@ pub async fn nameserver(spec: &str) -> Result<(), ApiError> {
         public_literal(&parsed.host, parsed.port).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn a_missing_record_type_means_a() {
+        assert_eq!(record_type_or_a(None).unwrap(), RecordType::A);
+        assert_eq!(record_type_or_a(Some("MX")).unwrap(), RecordType::MX);
+        let refused = record_type_or_a(Some("mx")).err().unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
 }

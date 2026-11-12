@@ -13,3 +13,9 @@ expression: table
 /dns/{domain}/{record_type}          Public  light     Default
 /ssl/{domain}                        Public  standard  Default
 /status/{domain}                     Public  moderate  Default
+/info/{domain}                       Keyed   light     Default
+/dnssec/{domain}                     Keyed   light     Default
+/delegation/{domain}                 Keyed   standard  Default
+/propagation/{domain}/{record_type}  Keyed   moderate  Default
+/dns/trace/{domain}                  Keyed   heavy     Default
+/dns/compare/{domain}                Keyed   standard  Default
