@@ -205,6 +205,45 @@ impl SeerConfig {
         }
     }
 
+    /// Loads `~/.seer/config.toml` for a long-running service, refusing a
+    /// file [`load`](Self::load) would paper over. A missing file is the
+    /// defaults. A file that cannot be read, does not parse, or names a
+    /// setting seer does not know is an error: a server must not start on
+    /// defaults its operator did not choose because of a typo.
+    pub fn load_strict() -> crate::error::Result<Self> {
+        match Self::config_path() {
+            Some(path) => Self::load_strict_from(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// [`load_strict`](Self::load_strict) for a given path.
+    fn load_strict_from(path: &std::path::Path) -> crate::error::Result<Self> {
+        use crate::error::SeerError;
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(SeerError::ConfigError(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| SeerError::ConfigError(format!("{} is not valid: {e}", path.display())))?;
+        let unknown = Self::unknown_keys(&content);
+        if !unknown.is_empty() {
+            return Err(SeerError::ConfigError(format!(
+                "{} has unknown settings: {}",
+                path.display(),
+                unknown.join(", ")
+            )));
+        }
+        Ok(config.clamped())
+    }
+
     /// Parses config file content, falling back to defaults on malformed
     /// TOML. The failure is reported on stderr in addition to `tracing` —
     /// at the default log level a `warn!` is invisible, and `seer config`
@@ -369,6 +408,7 @@ impl SeerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SeerError;
 
     #[test]
     fn server_section_defaults_are_private_and_loopback() {
@@ -454,6 +494,48 @@ cors_origins = ["https://example.com"]
             "[server]\ntrusted_proxies = []\nkeyed_rate_multiplier = 2\nrequest_timeout_secs = 5\nmax_in_flight = 8\ncache_ttl_secs = 0\n",
         );
         assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    /// Writes `content` to a fresh temp file and strict-loads it.
+    fn strict(name: &str, content: &str) -> crate::error::Result<SeerConfig> {
+        let path =
+            std::env::temp_dir().join(format!("seer-strict-{}-{name}.toml", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        let result = SeerConfig::load_strict_from(&path);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn strict_load_of_a_missing_file_is_the_defaults() {
+        let path = std::env::temp_dir().join(format!("seer-absent-{}.toml", std::process::id()));
+        let config = SeerConfig::load_strict_from(&path).unwrap();
+        assert_eq!(config.server.bind, "127.0.0.1:8001");
+    }
+
+    #[test]
+    fn strict_load_accepts_and_clamps_a_valid_file() {
+        let config = strict("valid", "[server]\npublic = true\nmax_in_flight = 1\n").unwrap();
+        assert!(config.server.public);
+        assert_eq!(config.server.max_in_flight, 2);
+    }
+
+    #[test]
+    fn strict_load_rejects_malformed_toml() {
+        // The tolerant loader would start on defaults; a server must not.
+        let error = strict("malformed", "[server]\nbind = 8001\n").unwrap_err();
+        assert!(matches!(error, SeerError::ConfigError(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("seer-strict-"),
+            "names the file: {error}"
+        );
+    }
+
+    #[test]
+    fn strict_load_rejects_unknown_settings() {
+        let error = strict("typo", "[server]\npublc = true\n").unwrap_err();
+        assert!(matches!(error, SeerError::ConfigError(_)), "{error:?}");
+        assert!(error.to_string().contains("server.publc"), "{error}");
     }
 
     #[test]
