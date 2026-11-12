@@ -1,8 +1,9 @@
-//! Registration data: lookup, WHOIS, RDAP, availability and TLD info.
+//! Registration data: lookup, merged info, WHOIS, RDAP, availability and
+//! TLD info.
 
 use axum::response::Response;
 use seer_core::validation::normalize_domain;
-use seer_core::SeerError;
+use seer_core::{DomainInfo, SeerError};
 
 use crate::call::Call;
 use crate::edge::{self, PathParams};
@@ -17,6 +18,21 @@ pub async fn lookup(
     let name = normalize_domain(&domain)?;
     call.respond(&[&name], call.state.clients.lookup.lookup(&domain))
         .await
+}
+
+/// `GET /info/{domain}`: the lookup's RDAP and WHOIS data merged into flat
+/// fields.
+pub async fn info(
+    call: Call,
+    PathParams(domain): PathParams<String>,
+) -> Result<Response, ApiError> {
+    edge::domain(&domain)?;
+    let name = normalize_domain(&domain)?;
+    call.respond(&[&name], async {
+        let result = call.state.clients.lookup.lookup(&domain).await?;
+        Ok::<_, SeerError>(DomainInfo::from_lookup_result(&result))
+    })
+    .await
 }
 
 /// `GET /whois/{domain}`.

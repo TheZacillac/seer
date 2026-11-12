@@ -4,7 +4,9 @@
 //! [`Call::respond`], which runs it only if needed and only if allowed:
 //! the cache is consulted first, then the client's own share of lookups in
 //! flight is checked, then a slot is taken, and the wait for the slot plus
-//! the lookup itself share one deadline. Dropping the future at
+//! the lookup itself share one deadline. (The audit row differs: its wait
+//! is bounded the same way, then the audit gets its own, longer deadline
+//! from the moment it starts.) Dropping the future at
 //! the deadline (or when the client disconnects) cancels the lookup and
 //! returns its slots.
 
@@ -24,7 +26,7 @@ use tokio::time::{timeout_at, Instant};
 use crate::cache;
 use crate::client_ip::ClientAddr;
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, Deadline, RouteMeta};
 use crate::tier::Caller;
 
 /// The context of one gated request: the shared state, who is calling, and
@@ -37,6 +39,8 @@ pub struct Call {
     /// The client an anonymous request is limited as; `None` when keyed.
     client: Option<IpAddr>,
     route: String,
+    /// The matched route's row.
+    meta: RouteMeta,
 }
 
 impl FromRequestParts<AppState> for Call {
@@ -58,6 +62,13 @@ impl FromRequestParts<AppState> for Call {
             .get::<MatchedPath>()
             .map(|path| path.as_str().to_string())
             .ok_or_else(ApiError::internal)?;
+        // The gate found this row already; missing here means a handler
+        // was mounted outside the table. Fail closed.
+        let meta = state
+            .rows
+            .get(route.as_str())
+            .copied()
+            .ok_or_else(ApiError::internal)?;
         let client = parts.extensions.get::<ClientAddr>().map(|addr| addr.0);
         if caller == Caller::Anonymous && client.is_none() {
             return Err(ApiError::internal());
@@ -67,6 +78,7 @@ impl FromRequestParts<AppState> for Call {
             caller,
             client,
             route,
+            meta,
         })
     }
 }
@@ -83,11 +95,11 @@ impl Call {
         let key = cache::key(&self.route, parts);
         let cache = &self.state.cache;
         if let Some(body) = cache.get(&key) {
-            return Ok(json(body, cache.cache_control()));
+            return Ok(json(body, cache.cache_control(self.caller)));
         }
         let body = self.run(work).await?;
         cache.put(key, body.clone());
-        Ok(json(body, cache.cache_control()))
+        Ok(json(body, cache.cache_control(self.caller)))
     }
 
     /// Runs `work` every time and marks the answer `no-store`. For answers
@@ -103,7 +115,7 @@ impl Call {
     }
 
     /// Takes a slot, runs `work` and serializes its result, all within the
-    /// request deadline.
+    /// row's deadline.
     async fn run<T, F>(&self, work: F) -> Result<Bytes, ApiError>
     where
         T: Serialize,
@@ -120,12 +132,24 @@ impl Call {
             ),
             None => None,
         };
-        let deadline = Instant::now() + self.state.settings.request_timeout;
-        // No slot in time: nothing was started, so the caller may retry.
-        let _held = timeout_at(deadline, self.state.permits.acquire(self.caller))
-            .await
-            .map_err(|_| ApiError::busy())?
-            .map_err(|_| ApiError::internal())?;
+        // The wait for a slot is bounded the same way on every route. No
+        // slot in time: nothing was started, so the caller may retry.
+        let slot_by = Instant::now() + self.state.settings.request_timeout;
+        let _held = timeout_at(
+            slot_by,
+            self.state.permits.acquire(self.caller, self.meta.cost),
+        )
+        .await
+        .map_err(|_| ApiError::busy())?
+        .map_err(|_| ApiError::internal())?;
+        let deadline = match self.meta.deadline {
+            // One budget for the wait and the lookup.
+            Deadline::Default => slot_by,
+            // An audit returns a useful report at its own timeout, so its
+            // budget starts once it runs: time spent queued must not turn
+            // that report into a 504.
+            Deadline::Audit => Instant::now() + self.state.clients.audit_deadline,
+        };
         let value = timeout_at(deadline, work)
             .await
             .map_err(|_| ApiError::timeout())??;

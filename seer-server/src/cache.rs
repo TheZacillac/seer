@@ -7,6 +7,10 @@
 //! reused like any other.) With a TTL of zero there is no cache and
 //! successes are marked `no-store`.
 //!
+//! A keyed caller's success is marked `private`: this cache serves both
+//! tiers (the gate runs first), but a shared cache in front must not store
+//! what only keyed callers may have.
+//!
 //! Memory is bounded by entries times body size: at most `CAPACITY`
 //! bodies of at most `MAX_BODY` bytes each. A larger body is served but
 //! not kept, so what a caller's own zone or registry returns cannot set
@@ -17,6 +21,8 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::http::HeaderValue;
 use seer_core::TtlCache;
+
+use crate::tier::Caller;
 
 /// Most responses kept at once. Past it, expired entries are purged and
 /// then the oldest evicted (`TtlCache`'s policy).
@@ -38,26 +44,34 @@ const SEPARATOR: char = '\u{1f}';
 pub struct ResponseCache {
     /// `None` when the cache is disabled (a TTL of zero).
     entries: Option<TtlCache<String, Bytes>>,
-    cache_control: HeaderValue,
+    /// `Cache-Control` for an anonymous caller's success.
+    shared: HeaderValue,
+    /// `Cache-Control` for a keyed caller's success.
+    private: HeaderValue,
 }
 
 impl ResponseCache {
     /// A cache whose entries live for `ttl`; zero disables it.
     pub fn new(ttl: Duration) -> Self {
+        let no_store = || HeaderValue::from_static("no-store");
         if ttl.is_zero() {
             return Self {
                 entries: None,
-                cache_control: HeaderValue::from_static("no-store"),
+                shared: no_store(),
+                private: no_store(),
             };
         }
+        // The same lifetime as the entry, so whoever may reuse the
+        // response reuses it for as long as this server would. Digits
+        // always form a valid header value; the fallbacks exist only
+        // because library code may not `unwrap`.
+        let secs = ttl.as_secs();
         Self {
             entries: Some(TtlCache::with_max_capacity(ttl, CAPACITY)),
-            // The same lifetime, so a proxy or CDN in front can reuse the
-            // response for as long as this server would. Digits always
-            // form a valid header value; the fallback exists only because
-            // library code may not `unwrap`.
-            cache_control: HeaderValue::from_str(&format!("max-age={}", ttl.as_secs()))
-                .unwrap_or_else(|_| HeaderValue::from_static("no-store")),
+            shared: HeaderValue::from_str(&format!("max-age={secs}"))
+                .unwrap_or_else(|_| no_store()),
+            private: HeaderValue::from_str(&format!("private, max-age={secs}"))
+                .unwrap_or_else(|_| no_store()),
         }
     }
 
@@ -77,10 +91,16 @@ impl ResponseCache {
         }
     }
 
-    /// The `Cache-Control` value for a success: `max-age=<ttl>`, or
-    /// `no-store` when the cache is disabled.
-    pub fn cache_control(&self) -> HeaderValue {
-        self.cache_control.clone()
+    /// The `Cache-Control` value for a success sent to `caller`. An
+    /// anonymous caller's may be stored by a proxy or CDN in front
+    /// (`max-age=<ttl>`); a keyed caller's only by that caller
+    /// (`private, max-age=<ttl>`), because it may be an answer anonymous
+    /// callers are not allowed. `no-store` when the cache is disabled.
+    pub fn cache_control(&self, caller: Caller) -> HeaderValue {
+        match caller {
+            Caller::Anonymous => self.shared.clone(),
+            Caller::Keyed => self.private.clone(),
+        }
     }
 }
 
@@ -106,7 +126,7 @@ mod tests {
         cache.put("k".to_string(), Bytes::from_static(b"{\"a\":1}"));
         assert_eq!(cache.get("k"), Some(Bytes::from_static(b"{\"a\":1}")));
         assert_eq!(cache.get("other"), None);
-        assert_eq!(cache.cache_control(), "max-age=60");
+        assert_eq!(cache.cache_control(Caller::Anonymous), "max-age=60");
     }
 
     #[test]
@@ -114,7 +134,17 @@ mod tests {
         let cache = ResponseCache::new(Duration::ZERO);
         cache.put("k".to_string(), Bytes::from_static(b"1"));
         assert_eq!(cache.get("k"), None);
-        assert_eq!(cache.cache_control(), "no-store");
+        assert_eq!(cache.cache_control(Caller::Anonymous), "no-store");
+    }
+
+    #[test]
+    fn a_keyed_callers_answer_is_private() {
+        let cache = ResponseCache::new(Duration::from_secs(60));
+        assert_eq!(cache.cache_control(Caller::Anonymous), "max-age=60");
+        assert_eq!(cache.cache_control(Caller::Keyed), "private, max-age=60");
+        // Disabled: nobody stores anything.
+        let off = ResponseCache::new(Duration::ZERO);
+        assert_eq!(off.cache_control(Caller::Keyed), "no-store");
     }
 
     #[test]

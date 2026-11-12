@@ -16,7 +16,9 @@ from pydantic import BaseModel, Field
 from ._core import CONTRACT
 
 MAX_BULK_DOMAINS = 100
-MAX_CONCURRENCY = 50
+# The widest fan-out a caller may ask for: seer-core's ceiling, shared with
+# seer-server and the bindings.
+MAX_CONCURRENCY: int = CONTRACT["concurrency_max"]
 
 # Per-route limits by cost class. The numbers are seer-core's
 # (`contract::CostClass`), shared with seer-server.

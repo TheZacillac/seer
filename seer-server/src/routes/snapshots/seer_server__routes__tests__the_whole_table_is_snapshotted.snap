@@ -2,14 +2,28 @@
 source: seer-server/src/routes/mod.rs
 expression: table
 ---
-/lookup/{domain}                 Public  standard
-/whois/{domain}                  Public  standard
-/rdap/domain/{domain}            Public  standard
-/rdap/ip/{ip}                    Public  standard
-/rdap/asn/{asn}                  Public  standard
-/availability/{domain}           Public  light
-/tld/                            Public  standard
-/tld/{tld}                       Public  light
-/dns/{domain}/{record_type}      Public  light
-/ssl/{domain}                    Public  standard
-/status/{domain}                 Public  moderate
+/lookup/{domain}                     Public  standard  Default
+/whois/{domain}                      Public  standard  Default
+/rdap/domain/{domain}                Public  standard  Default
+/rdap/ip/{ip}                        Public  standard  Default
+/rdap/asn/{asn}                      Public  standard  Default
+/availability/{domain}               Public  light     Default
+/tld/                                Public  standard  Default
+/tld/{tld}                           Public  light     Default
+/dns/{domain}/{record_type}          Public  light     Default
+/ssl/{domain}                        Public  standard  Default
+/status/{domain}                     Public  moderate  Default
+/info/{domain}                       Keyed   light     Default
+/dnssec/{domain}                     Keyed   light     Default
+/delegation/{domain}                 Keyed   standard  Default
+/propagation/{domain}/{record_type}  Keyed   moderate  Default
+/dns/trace/{domain}                  Keyed   heavy     Default
+/dns/compare/{domain}                Keyed   standard  Default
+/subdomains/{domain}                 Keyed   heavy     Default
+/diff/{domain_a}/{domain_b}          Keyed   standard  Default
+/caa/{domain}                        Keyed   light     Default
+/posture/{domain}                    Keyed   standard  Default
+/headers/{domain}                    Keyed   moderate  Default
+/audit/{domain}                      Keyed   heavy     Audit
+/takeover/{domain}                   Keyed   heavy     Default
+/confusables/{domain}                Keyed   heavy     Default

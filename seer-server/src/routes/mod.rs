@@ -6,18 +6,20 @@
 //! seer-core call handed to `Call::respond`, which caches, bounds and times
 //! it. Paths and JSON match seer-api's.
 
+mod assessment;
 mod dns;
 mod probes;
 mod registration;
 
 use axum::routing::get;
-use seer_core::contract::CostClass::{Light, Moderate, Standard};
+use seer_core::contract::CostClass::{Heavy, Light, Moderate, Standard};
 
 use crate::app::Route;
+use crate::state::Deadline;
 
 /// Every route the server exposes. Each cost class is the one whose limit
-/// seer-api declares on the same route. The keyed-only operations (audit,
-/// trace, propagation and the rest) join this table in the next release.
+/// seer-api declares on the same route. Routes built with `Route::keyed`
+/// need the API key; the rest are open when the server is public.
 pub fn routes() -> Vec<Route> {
     vec![
         Route::public("/lookup/{domain}", Standard, get(registration::lookup)),
@@ -39,21 +41,44 @@ pub fn routes() -> Vec<Route> {
         Route::public("/dns/{domain}/{record_type}", Light, get(dns::dig)),
         Route::public("/ssl/{domain}", Standard, get(probes::ssl)),
         Route::public("/status/{domain}", Moderate, get(probes::status)),
+        Route::keyed("/info/{domain}", Light, get(registration::info)),
+        Route::keyed("/dnssec/{domain}", Light, get(dns::dnssec)),
+        Route::keyed("/delegation/{domain}", Standard, get(dns::delegation)),
+        Route::keyed(
+            "/propagation/{domain}/{record_type}",
+            Moderate,
+            get(dns::propagation),
+        ),
+        Route::keyed("/dns/trace/{domain}", Heavy, get(dns::trace)),
+        Route::keyed("/dns/compare/{domain}", Standard, get(dns::compare)),
+        Route::keyed("/subdomains/{domain}", Heavy, get(assessment::subdomains)),
+        Route::keyed(
+            "/diff/{domain_a}/{domain_b}",
+            Standard,
+            get(assessment::diff),
+        ),
+        Route::keyed("/caa/{domain}", Light, get(assessment::caa)),
+        Route::keyed("/posture/{domain}", Standard, get(assessment::posture)),
+        Route::keyed("/headers/{domain}", Moderate, get(assessment::headers)),
+        Route::keyed("/audit/{domain}", Heavy, get(assessment::audit)).within(Deadline::Audit),
+        Route::keyed("/takeover/{domain}", Heavy, get(assessment::takeover)),
+        Route::keyed("/confusables/{domain}", Heavy, get(assessment::confusables)),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::router;
+    use crate::app::{assemble, router};
     use crate::settings::Settings;
-    use crate::state::Clients;
+    use crate::state::{AppState, Clients};
     use crate::test_support::{get, get_with_key};
-    use crate::tier::Tier;
+    use crate::tier::{Caller, Tier};
     use axum::http::StatusCode;
     use axum::Router;
     use seer_core::config::ServerConfig;
     use seer_core::SeerConfig;
+    use std::time::{Duration, Instant};
 
     /// The real routes on a public server whose key is `k`.
     fn app() -> Router {
@@ -70,36 +95,469 @@ mod tests {
     }
 
     #[test]
-    fn the_table_is_exactly_the_public_routes() {
-        // Making a route public, or adding one, is a deliberate edit here.
-        let table: Vec<(&str, Tier)> = routes().iter().map(|r| (r.path, r.tier)).collect();
+    fn only_these_routes_are_public() {
+        // Making a route public is a deliberate edit here.
+        let public: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.tier == Tier::Public)
+            .map(|r| r.path)
+            .collect();
         assert_eq!(
-            table,
+            public,
             [
-                ("/lookup/{domain}", Tier::Public),
-                ("/whois/{domain}", Tier::Public),
-                ("/rdap/domain/{domain}", Tier::Public),
-                ("/rdap/ip/{ip}", Tier::Public),
-                ("/rdap/asn/{asn}", Tier::Public),
-                ("/availability/{domain}", Tier::Public),
-                ("/tld/", Tier::Public),
-                ("/tld/{tld}", Tier::Public),
-                ("/dns/{domain}/{record_type}", Tier::Public),
-                ("/ssl/{domain}", Tier::Public),
-                ("/status/{domain}", Tier::Public),
+                "/lookup/{domain}",
+                "/whois/{domain}",
+                "/rdap/domain/{domain}",
+                "/rdap/ip/{ip}",
+                "/rdap/asn/{asn}",
+                "/availability/{domain}",
+                "/tld/",
+                "/tld/{tld}",
+                "/dns/{domain}/{record_type}",
+                "/ssl/{domain}",
+                "/status/{domain}",
             ]
         );
     }
 
+    /// One well-formed request per route. No test sends these to the
+    /// network unless it is marked live.
+    const SAMPLES: &[(&str, &str)] = &[
+        ("/lookup/{domain}", "/lookup/example.com"),
+        ("/whois/{domain}", "/whois/example.com"),
+        ("/rdap/domain/{domain}", "/rdap/domain/example.com"),
+        ("/rdap/ip/{ip}", "/rdap/ip/1.1.1.1"),
+        ("/rdap/asn/{asn}", "/rdap/asn/13335"),
+        ("/availability/{domain}", "/availability/example.com"),
+        ("/tld/", "/tld/"),
+        ("/tld/{tld}", "/tld/com"),
+        ("/dns/{domain}/{record_type}", "/dns/example.com/A"),
+        ("/ssl/{domain}", "/ssl/example.com"),
+        ("/status/{domain}", "/status/example.com"),
+        ("/info/{domain}", "/info/example.com"),
+        ("/dnssec/{domain}", "/dnssec/example.com"),
+        ("/delegation/{domain}", "/delegation/example.com"),
+        (
+            "/propagation/{domain}/{record_type}",
+            "/propagation/example.com/A",
+        ),
+        ("/dns/trace/{domain}", "/dns/trace/example.com"),
+        (
+            "/dns/compare/{domain}",
+            "/dns/compare/example.com?server_a=8.8.8.8&server_b=1.1.1.1",
+        ),
+        ("/subdomains/{domain}", "/subdomains/example.com"),
+        (
+            "/diff/{domain_a}/{domain_b}",
+            "/diff/example.com/example.org",
+        ),
+        ("/caa/{domain}", "/caa/example.com"),
+        ("/posture/{domain}", "/posture/example.com"),
+        ("/headers/{domain}", "/headers/example.com"),
+        ("/audit/{domain}", "/audit/example.com"),
+        ("/takeover/{domain}", "/takeover/example.com"),
+        ("/confusables/{domain}", "/confusables/example.com"),
+    ];
+
+    #[test]
+    fn every_route_has_a_sample() {
+        let mut table: Vec<&str> = routes().iter().map(|r| r.path).collect();
+        let mut sampled: Vec<&str> = SAMPLES.iter().map(|(pattern, _)| *pattern).collect();
+        table.sort_unstable();
+        sampled.sort_unstable();
+        assert_eq!(table, sampled);
+    }
+
+    #[tokio::test]
+    async fn anonymous_callers_get_a_401_on_every_keyed_route() {
+        let app = app();
+        let keyed: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.tier == Tier::Keyed)
+            .map(|r| r.path)
+            .collect();
+        assert!(!keyed.is_empty());
+        for (pattern, uri) in SAMPLES {
+            if keyed.contains(pattern) {
+                let reply = get(&app, uri).await;
+                assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{pattern}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_route_waits_for_a_slot_and_leaves_none_held() {
+        // Every slot is taken before any request is sent, so no lookup
+        // starts and nothing here touches the network. A 503 from each
+        // route proves its lookup runs inside `Call`: bounded, under the
+        // deadline, and cancelled with it.
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        settings.request_timeout = Duration::from_millis(100);
+        settings.max_in_flight = 2;
+        let mut clients = Clients::from_config(&SeerConfig::default());
+        clients.audit_deadline = Duration::from_millis(100);
+        let table = routes();
+        let state = AppState::new(settings, clients, &table);
+        let app = assemble(state.clone(), table);
+        let heavy = state.permits.heavy_available();
+        let _a = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
+        let _b = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
+        for (pattern, uri) in SAMPLES {
+            let reply = get_with_key(&app, uri, "k").await;
+            assert_eq!(
+                reply.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{pattern} did not wait for a slot: {}",
+                reply.json
+            );
+        }
+        assert_eq!(state.permits.heavy_available(), heavy);
+        assert_eq!(state.permits.available().0, 0);
+        assert_eq!(state.per_client.clients(), 0);
+    }
+
+    #[tokio::test]
+    async fn each_cached_route_reads_the_cache_under_its_normalized_key() {
+        // Seeds the cache under the key each handler should build, then
+        // asks in another spelling. Every slot is held and the deadline is
+        // short, so a handler that builds a different key gets a 503
+        // instead of the seeded body, and nothing touches the network.
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        settings.request_timeout = Duration::from_millis(100);
+        settings.max_in_flight = 2;
+        let table = routes();
+        let state = AppState::new(
+            settings,
+            Clients::from_config(&SeerConfig::default()),
+            &table,
+        );
+        let app = assemble(state.clone(), table);
+        let _a = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
+        let _b = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
+        // (route, key parts, a request that must hit, one that must miss)
+        let cases: &[(&str, &[&str], &str, &str)] = &[
+            // Registration-level names drop `www.`; per-host ones keep it.
+            (
+                "/info/{domain}",
+                &["example.com"],
+                "/info/WWW.Example.com",
+                "/info/example.org",
+            ),
+            (
+                "/delegation/{domain}",
+                &["example.com"],
+                "/delegation/www.example.com",
+                "/delegation/example.org",
+            ),
+            (
+                "/posture/{domain}",
+                &["example.com"],
+                "/posture/www.EXAMPLE.com",
+                "/posture/example.org",
+            ),
+            (
+                "/takeover/{domain}",
+                &["example.com"],
+                "/takeover/www.example.com?concurrency=3",
+                "/takeover/example.org",
+            ),
+            (
+                "/confusables/{domain}",
+                &["example.com"],
+                "/confusables/Example.com?concurrency=50",
+                "/confusables/example.org",
+            ),
+            (
+                "/dnssec/{domain}",
+                &["www.example.com"],
+                "/dnssec/WWW.example.com",
+                "/dnssec/example.com",
+            ),
+            (
+                "/caa/{domain}",
+                &["www.example.com"],
+                "/caa/www.Example.com",
+                "/caa/example.com",
+            ),
+            (
+                "/headers/{domain}",
+                &["www.example.com"],
+                "/headers/www.example.COM",
+                "/headers/example.com",
+            ),
+            (
+                "/audit/{domain}",
+                &["www.example.com"],
+                "/audit/WWW.example.com",
+                "/audit/example.com",
+            ),
+            // Order matters in a diff.
+            (
+                "/diff/{domain_a}/{domain_b}",
+                &["a.example", "b.example"],
+                "/diff/A.example/b.example",
+                "/diff/b.example/a.example",
+            ),
+            // The two shapes of a subdomain answer never share an entry.
+            (
+                "/subdomains/{domain}",
+                &["example.com", "names"],
+                "/subdomains/www.example.com",
+                "/subdomains/example.com?resolve=true",
+            ),
+            (
+                "/subdomains/{domain}",
+                &["example.org", "resolved"],
+                "/subdomains/example.org?resolve=true&concurrency=2",
+                "/subdomains/example.org?resolve=false",
+            ),
+            // The record type is part of the answer.
+            (
+                "/propagation/{domain}/{record_type}",
+                &["example.com", "MX"],
+                "/propagation/Example.COM/MX",
+                "/propagation/example.com/A",
+            ),
+            (
+                "/dns/trace/{domain}",
+                &["example.com", "A"],
+                "/dns/trace/EXAMPLE.com",
+                "/dns/trace/example.com?record_type=MX",
+            ),
+        ];
+        for (index, (route, parts, hit, miss)) in cases.iter().enumerate() {
+            let body = format!("{{\"seeded\":{index}}}");
+            state
+                .cache
+                .put(crate::cache::key(route, parts), body.into());
+            let reply = get_with_key(&app, hit, "k").await;
+            assert_eq!(reply.status, StatusCode::OK, "{hit} missed its entry");
+            assert_eq!(reply.json["seeded"], index, "{hit} read another entry");
+            let other = get_with_key(&app, miss, "k").await;
+            assert_eq!(
+                other.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{miss} shared {hit}'s entry"
+            );
+        }
+        // Compare is never cached: nothing is read, whatever is stored.
+        let compare = "/dns/compare/example.com?server_a=8.8.8.8&server_b=1.1.1.1";
+        state.cache.put(
+            crate::cache::key("/dns/compare/{domain}", &["example.com", "A"]),
+            "{}".into(),
+        );
+        assert_eq!(
+            get_with_key(&app, compare, "k").await.status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keyed_dns_routes_check_their_record_type() {
+        for path in [
+            "/dns/trace/example.com?record_type=a",
+            "/dns/trace/example.com?record_type=ZZZ",
+            "/dns/compare/example.com?server_a=8.8.8.8&server_b=1.1.1.1&record_type=A-B",
+            "/propagation/example.com/a",
+            "/propagation/example.com/ZZZ",
+        ] {
+            let reply = get_with_key(&app(), path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_refuses_reserved_and_missing_servers() {
+        for query in [
+            "",
+            "?server_a=8.8.8.8",
+            "?server_b=8.8.8.8",
+            "?server_a=127.0.0.1&server_b=1.1.1.1",
+            "?server_a=8.8.8.8&server_b=tls://192.168.1.1",
+        ] {
+            let path = format!("/dns/compare/example.com{query}");
+            let reply = get_with_key(&app(), &path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        let missing = get_with_key(&app(), "/dns/compare/example.com", "k").await;
+        assert_eq!(missing.json["detail"], "server_a and server_b are required");
+        let long = format!(
+            "/dns/compare/example.com?server_a={}&server_b=1.1.1.1",
+            "a".repeat(513)
+        );
+        assert_eq!(
+            get_with_key(&app(), &long, "k").await.status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_name_on_a_keyed_route_is_a_400_before_a_slot() {
+        for path in [
+            "/info/not_a_domain",
+            "/dnssec/bad..host",
+            "/delegation/-x-.com",
+        ] {
+            let reply = get_with_key(&app(), path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+        let long = format!("/info/{}", "a".repeat(254));
+        assert_eq!(
+            get_with_key(&app(), &long, "k").await.status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn only_the_audit_runs_under_the_audit_deadline() {
+        let audit: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.deadline == Deadline::Audit)
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(audit, ["/audit/{domain}"]);
+    }
+
+    #[test]
+    fn the_fan_outs_are_heavy() {
+        // These take a slot from the small pool; seer-api limits the same
+        // five at its heavy rate.
+        let mut heavy: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.cost == Heavy)
+            .map(|r| r.path)
+            .collect();
+        heavy.sort_unstable();
+        assert_eq!(
+            heavy,
+            [
+                "/audit/{domain}",
+                "/confusables/{domain}",
+                "/dns/trace/{domain}",
+                "/subdomains/{domain}",
+                "/takeover/{domain}",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_concurrency_outside_1_to_50_is_a_400() {
+        for route in ["/subdomains", "/takeover", "/confusables"] {
+            for value in ["0", "51", "100000", "-1", "ten"] {
+                let path = format!("{route}/example.com?concurrency={value}");
+                let reply = get_with_key(&app(), &path, "k").await;
+                assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_must_be_true_or_false() {
+        let reply = get_with_key(&app(), "/subdomains/example.com?resolve=maybe", "k").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reserved_literals_are_refused_on_the_keyed_probes() {
+        // The host is a connect target on these routes.
+        for path in [
+            "/headers/127.0.0.1",
+            "/headers/127.0.0.1:443",
+            "/audit/10.0.0.1",
+            "/diff/169.254.169.254/example.com",
+            "/diff/example.com/192.168.1.1",
+        ] {
+            let reply = get_with_key(&app(), path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_name_on_an_assessment_route_is_a_400_before_a_slot() {
+        for path in [
+            "/subdomains/not_a_domain",
+            "/diff/example.com/bad..host",
+            "/caa/bad..host",
+            "/posture/-x-.com",
+            "/headers/bad..host",
+            "/audit/bad..host",
+            "/takeover/not_a_domain",
+            "/confusables/not_a_domain",
+        ] {
+            let reply = get_with_key(&app(), path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_every_keyed_route_answers() {
+        let app = app();
+        let keyed: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.tier == Tier::Keyed)
+            .map(|r| r.path)
+            .collect();
+        for (pattern, uri) in SAMPLES {
+            if keyed.contains(pattern) {
+                let reply = get_with_key(&app, uri, "k").await;
+                assert_eq!(reply.status, StatusCode::OK, "{pattern}: {}", reply.json);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_a_request_dropped_mid_flight_holds_nothing() {
+        // The spec's cancellation test, with real lookups in flight.
+        let table = routes();
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let clients = Clients::from_config(&SeerConfig::default());
+        let state = AppState::new(settings, clients, &table);
+        let app = assemble(state.clone(), table);
+        let full = (state.permits.available(), state.permits.heavy_available());
+        for (pattern, uri) in SAMPLES {
+            let request = tokio::spawn({
+                let app = app.clone();
+                async move { get_with_key(&app, uri, "k").await }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            request.abort();
+            let _ = request.await;
+            assert_eq!(
+                (state.permits.available(), state.permits.heavy_available()),
+                full,
+                "{pattern} left a slot held"
+            );
+        }
+    }
+
     #[test]
     fn the_whole_table_is_snapshotted() {
-        // Path, tier and cost class of every route: any change to what the
+        // Path, tier, cost class and deadline of every route: any change to what the
         // server exposes, or how it is limited, shows up in review.
         let table: String = routes()
             .iter()
             .map(|r| {
                 let tier = format!("{:?}", r.tier);
-                format!("{:<32} {tier:<7} {}\n", r.path, r.cost.name())
+                format!(
+                    "{:<36} {tier:<7} {:<9} {:?}\n",
+                    r.path,
+                    r.cost.name(),
+                    r.deadline
+                )
             })
             .collect();
         insta::assert_snapshot!(table);
@@ -258,11 +716,11 @@ mod tests {
         ] {
             let first = get(&app, path).await;
             assert_eq!(first.status, StatusCode::OK, "{path}: {}", first.json);
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let second = get(&app, path).await;
             assert_eq!(second.json, first.json, "{path}");
             assert!(
-                started.elapsed() < std::time::Duration::from_millis(50),
+                started.elapsed() < Duration::from_millis(50),
                 "{path} was not served from the cache"
             );
         }

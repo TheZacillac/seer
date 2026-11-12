@@ -80,6 +80,25 @@ pub fn record_type(value: &str) -> Result<RecordType, ApiError> {
     Ok(value.parse::<RecordType>()?)
 }
 
+/// An optional `record_type` query parameter: `A` when absent, as
+/// seer-api defaults it.
+pub fn record_type_or_a(value: Option<&str>) -> Result<RecordType, ApiError> {
+    record_type(value.unwrap_or("A"))
+}
+
+/// A `concurrency` query parameter: how wide a fan-out runs. The default
+/// and the ceiling are core's, shared with seer-api and the bindings.
+pub fn concurrency(value: Option<usize>) -> Result<usize, ApiError> {
+    match value {
+        None => Ok(contract::CONCURRENCY_DEFAULT),
+        Some(width) if (1..=contract::CONCURRENCY_MAX).contains(&width) => Ok(width),
+        Some(_) => Err(ApiError::invalid(format!(
+            "concurrency must be between 1 and {}",
+            contract::CONCURRENCY_MAX
+        ))),
+    }
+}
+
 /// A TLD path parameter.
 pub fn tld(value: &str) -> Result<(), ApiError> {
     if contract::is_tld_token(value) {
@@ -131,4 +150,27 @@ pub async fn nameserver(spec: &str) -> Result<(), ApiError> {
         public_literal(&parsed.host, parsed.port).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn concurrency_defaults_to_ten_and_stops_at_fifty() {
+        assert_eq!(concurrency(None).unwrap(), contract::CONCURRENCY_DEFAULT);
+        assert_eq!(concurrency(Some(1)).unwrap(), 1);
+        assert_eq!(concurrency(Some(50)).unwrap(), 50);
+        assert!(concurrency(Some(0)).is_err());
+        assert!(concurrency(Some(51)).is_err());
+    }
+
+    #[test]
+    fn a_missing_record_type_means_a() {
+        assert_eq!(record_type_or_a(None).unwrap(), RecordType::A);
+        assert_eq!(record_type_or_a(Some("MX")).unwrap(), RecordType::MX);
+        let refused = record_type_or_a(Some("mx")).err().unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
 }

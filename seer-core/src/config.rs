@@ -178,7 +178,7 @@ impl Default for TimeoutConfig {
 impl Default for BulkConfig {
     fn default() -> Self {
         Self {
-            concurrency: 10,
+            concurrency: crate::contract::CONCURRENCY_DEFAULT,
             rate_limit_ms: 100,
         }
     }
@@ -336,7 +336,10 @@ impl SeerConfig {
     /// request timeout 1–120s, in-flight 2–1024 (1–64 per client), cache
     /// TTL 0–3600s.
     fn clamped(mut self) -> Self {
-        self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
+        self.bulk.concurrency = self
+            .bulk
+            .concurrency
+            .clamp(1, crate::contract::CONCURRENCY_MAX);
         // A multi-day per-operation delay would stall bulk runs indefinitely;
         // cap at 60s (0 is valid — no inter-operation delay).
         self.bulk.rate_limit_ms = self.bulk.rate_limit_ms.min(60_000);

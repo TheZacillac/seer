@@ -28,7 +28,7 @@ use crate::client_ip::{client_ip, forwarded_for, ClientAddr};
 use crate::error::ApiError;
 use crate::limit::{self, Subject};
 use crate::settings::{CorsOrigins, Settings};
-use crate::state::{AppState, Clients};
+use crate::state::{AppState, Clients, Deadline};
 use crate::tier::{self, Caller, Tier};
 
 /// The response header carrying the id that also tags the request's log
@@ -36,7 +36,7 @@ use crate::tier::{self, Caller, Tier};
 const X_REQUEST_ID: &str = "x-request-id";
 
 /// One row of the route table: a path, who may call it, what it costs,
-/// and its handler.
+/// its deadline and its handler.
 pub struct Route {
     /// The path pattern, as Axum spells it (`/lookup/{domain}`).
     pub path: &'static str,
@@ -44,6 +44,8 @@ pub struct Route {
     pub tier: Tier,
     /// How expensive it is to serve, which sets its rate limit.
     pub cost: CostClass,
+    /// Which deadline its requests run under.
+    pub deadline: Deadline,
     /// The handler, already wrapped in its HTTP method.
     pub handler: MethodRouter<AppState>,
 }
@@ -55,6 +57,7 @@ impl Route {
             path,
             tier: Tier::Public,
             cost,
+            deadline: Deadline::Default,
             handler,
         }
     }
@@ -65,8 +68,17 @@ impl Route {
             path,
             tier: Tier::Keyed,
             cost,
+            deadline: Deadline::Default,
             handler,
         }
+    }
+}
+
+impl Route {
+    /// The same route under another deadline.
+    pub fn within(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
@@ -301,6 +313,14 @@ mod tests {
 
     /// A public stub server whose key is `k`, and its state.
     fn app_and_state(adjust: impl FnOnce(&mut Settings)) -> (Router, AppState) {
+        app_and_state_with(adjust, |_| {})
+    }
+
+    /// [`app_and_state`], with the clients adjusted too.
+    fn app_and_state_with(
+        adjust: impl FnOnce(&mut Settings),
+        adjust_clients: impl FnOnce(&mut Clients),
+    ) -> (Router, AppState) {
         let server = ServerConfig {
             public: true,
             ..ServerConfig::default()
@@ -308,7 +328,8 @@ mod tests {
         let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
         adjust(&mut settings);
         let routes = stub_routes();
-        let clients = Clients::from_config(&SeerConfig::default());
+        let mut clients = Clients::from_config(&SeerConfig::default());
+        adjust_clients(&mut clients);
         let state = AppState::new(settings, clients, &routes);
         (assemble(state.clone(), routes), state)
     }
@@ -324,6 +345,15 @@ mod tests {
             Route::public("/fresh", CostClass::Light, routing::get(fresh)),
             Route::public("/flaky/{name}", CostClass::Light, routing::get(flaky)),
             Route::public("/hang", CostClass::Light, routing::get(hang)),
+            Route::keyed("/heavy-count/{name}", CostClass::Heavy, routing::get(count)),
+            Route::keyed(
+                "/locked-count/{name}",
+                CostClass::Light,
+                routing::get(count),
+            ),
+            Route::keyed("/heavy-hang", CostClass::Heavy, routing::get(hang)),
+            Route::keyed("/slow-audit", CostClass::Light, routing::get(hang))
+                .within(Deadline::Audit),
         ]
     }
 
@@ -731,6 +761,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_keyed_answer_is_private_and_an_anonymous_one_is_shared() {
+        let (app, _) = app_and_state(|_| {});
+        let keyed = get_with_key(&app, "/count/tiered", "k").await;
+        assert_eq!(keyed.headers[header::CACHE_CONTROL], "private, max-age=60");
+        // The same cached body, to a caller a CDN may serve from its store.
+        let anonymous = get(&app, "/count/tiered").await;
+        assert_eq!(anonymous.json, keyed.json);
+        assert_eq!(anonymous.headers[header::CACHE_CONTROL], "max-age=60");
+    }
+
+    #[tokio::test]
+    async fn a_cached_keyed_answer_is_never_served_to_an_anonymous_caller() {
+        let (app, _) = app_and_state(|_| {});
+        let keyed = get_with_key(&app, "/locked-count/secret", "k").await;
+        assert_eq!(keyed.status, StatusCode::OK);
+        assert_eq!(keyed.headers[header::CACHE_CONTROL], "private, max-age=60");
+        // It is in the cache now; the gate still answers first.
+        let anonymous = get(&app, "/locked-count/secret").await;
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
     async fn a_zero_ttl_runs_the_lookup_every_time_and_says_no_store() {
         let (app, _) = app_and_state(|s| s.cache_ttl = Duration::ZERO);
         let first = get(&app, "/count/uncached").await;
@@ -774,6 +827,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_audit_row_runs_under_the_audit_deadline_not_the_request_timeout() {
+        let (app, _) = app_and_state_with(
+            |s| s.request_timeout = Duration::from_millis(50),
+            |c| c.audit_deadline = Duration::from_millis(400),
+        );
+        let started = Instant::now();
+        let reply = get_with_key(&app, "/slow-audit", "k").await;
+        assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        // A lower bound only: it outlived the 50 ms request timeout.
+        assert!(started.elapsed() >= Duration::from_millis(350));
+    }
+
+    #[tokio::test]
+    async fn a_heavy_route_waits_for_a_heavy_slot() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 4;
+        });
+        // Three heavy slots (one below the total); hold them all.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(
+                state
+                    .permits
+                    .acquire(Caller::Keyed, CostClass::Heavy)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let heavy = get_with_key(&app, "/heavy-count/a", "k").await;
+        assert_eq!(heavy.status, StatusCode::SERVICE_UNAVAILABLE);
+        // The fourth total slot is still there for a light lookup.
+        assert_eq!(
+            get_with_key(&app, "/count/light", "k").await.status,
+            StatusCode::OK
+        );
+        held.clear();
+        assert_eq!(
+            get_with_key(&app, "/heavy-count/a", "k").await.status,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_heavy_call_returns_its_heavy_slot() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 2;
+        });
+        let before = (state.permits.available(), state.permits.heavy_available());
+        for _ in 0..3 {
+            let reply = get_with_key(&app, "/heavy-hang", "k").await;
+            assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        // Dropped mid-flight three times with one heavy slot: none stuck.
+        assert_eq!(
+            (state.permits.available(), state.permits.heavy_available()),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audit_waits_for_a_slot_no_longer_than_any_other_request() {
+        let (app, state) = app_and_state_with(
+            |s| {
+                s.request_timeout = Duration::from_millis(100);
+                s.max_in_flight = 2;
+            },
+            |c| c.audit_deadline = Duration::from_secs(30),
+        );
+        let _a = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let _b = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let reply = get_with_key(&app, "/slow-audit", "k").await;
+        // Busy after the request timeout, not after the audit's deadline.
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn an_audit_that_waited_for_a_slot_still_gets_its_whole_deadline() {
+        let (app, state) = app_and_state_with(
+            |s| {
+                s.request_timeout = Duration::from_millis(350);
+                s.max_in_flight = 2;
+            },
+            |c| c.audit_deadline = Duration::from_millis(400),
+        );
+        let a = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let _b = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let request = get_with_key(&app, "/slow-audit", "k");
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(a);
+        };
+        let (reply, ()) = tokio::join!(request, release);
+        assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        // 250 ms queued, then the full 400 ms: the wait was not charged
+        // to the audit. (Charged, it would end at 400 ms.)
+        assert!(started.elapsed() >= Duration::from_millis(600));
+    }
+
+    #[tokio::test]
     async fn a_timed_out_call_returns_its_permits() {
         let (app, state) = app_and_state(|s| {
             s.request_timeout = Duration::from_millis(100);
@@ -795,7 +968,11 @@ mod tests {
             s.max_in_flight = 2;
         });
         // Hold the one anonymous slot, as a lookup in flight would.
-        let held = state.permits.acquire(Caller::Anonymous).await.unwrap();
+        let held = state
+            .permits
+            .acquire(Caller::Anonymous, CostClass::Light)
+            .await
+            .unwrap();
         let anonymous = get(&app, "/fresh").await;
         assert_eq!(anonymous.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -816,8 +993,16 @@ mod tests {
     async fn a_cache_hit_needs_no_slot() {
         let (app, state) = app_and_state(|s| s.max_in_flight = 2);
         assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
-        let _a = state.permits.acquire(Caller::Keyed).await.unwrap();
-        let _b = state.permits.acquire(Caller::Keyed).await.unwrap();
+        let _a = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let _b = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
         // Every slot is taken, yet the cached answer is served at once.
         assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
     }

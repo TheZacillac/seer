@@ -130,6 +130,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_in_flight_per_client`, `cache_ttl_secs`. One anonymous client may
   run only a few lookups at once, cached bodies are capped in size, and a
   `trusted_proxies` entry that trusts every address is refused.
+- **seer-server keyed routes.** With the key, the server now answers
+  every single-domain operation: info, subdomains, DNSSEC, delegation,
+  diff, CAA, posture, headers, audit, takeover, confusables, propagation,
+  DNS trace and DNS compare, on seer-api's paths. The heaviest share a
+  pool of 8 slots, the audit runs under the audit timeout plus 5 seconds,
+  and answers to keyed requests are `Cache-Control: private`.
+- `seer.contract()` (Python) carries `concurrency_default` and
+  `concurrency_max`; the fan-out ceiling of 50 is now defined once, in
+  seer-core.
 - `SeerConfig::load_strict()` (Rust): a config load that fails on an
   unreadable or malformed file or an unknown setting. seer-server uses it.
 - `[server]` section in `~/.seer/config.toml`: `bind`, `public`,
