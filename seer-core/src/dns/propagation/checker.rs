@@ -917,11 +917,31 @@ mod tests {
         let elapsed = started.elapsed();
 
         // NS phase (answered at once) + one enrichment budget, with slack.
-        assert!(elapsed < budget * 2 + timeout, "took {elapsed:?}");
-        assert_eq!(result.servers_responding, SERVERS);
+        let bound = budget * 2 + timeout;
+        assert!(elapsed < bound, "took {elapsed:?}");
+        // The bound only proves the deadline if, without it, the phase
+        // would have run past it: one timeout per wave of lookups, so
+        // enough servers must have answered to queue that many waves. Not
+        // every server need answer: a query is one attempt by design, and
+        // a loaded machine can lose a reply (seen on a Windows CI runner).
+        let waves_past_bound =
+            usize::try_from(bound.as_millis() / timeout.as_millis()).unwrap() + 1;
+        let needed =
+            (waves_past_bound * MAX_CONCURRENT_NS_LOOKUPS).div_ceil(MAX_ENRICHED_NAMESERVERS);
+        assert!(
+            needed < SERVERS,
+            "the fixture is too small to prove anything"
+        );
+        assert!(
+            result.servers_responding >= needed,
+            "only {} of {SERVERS} servers answered; {needed} are needed",
+            result.servers_responding
+        );
+        // Every NS answer that arrived is kept whole.
         assert!(result
             .results
             .iter()
+            .filter(|r| r.success)
             .all(|r| r.records.len() == MAX_ENRICHED_NAMESERVERS));
         let details = result.nameserver_details.expect("NS details");
         assert!(details.per_vantage.is_empty(), "{:?}", details.per_vantage);
