@@ -18,8 +18,6 @@ from ._core import CONTRACT
 MAX_BULK_DOMAINS = 100
 MAX_CONCURRENCY = 50
 
-# Limits for the expensive fan-out operations, applied per REST route and per
-# MCP tool alike so neither surface can outrun the other.
 # Per-route limits by cost class. The numbers are seer-core's
 # (`contract::CostClass`), shared with seer-server.
 _RATE_LIMITS: dict[str, int] = CONTRACT["rate_limits"]
@@ -27,6 +25,8 @@ LIGHT_LIMIT = f"{_RATE_LIMITS['light']}/minute"
 STANDARD_LIMIT = f"{_RATE_LIMITS['standard']}/minute"
 MODERATE_LIMIT = f"{_RATE_LIMITS['moderate']}/minute"
 
+# Limits for the expensive fan-out operations, applied per REST route and per
+# MCP tool alike so neither surface can outrun the other.
 # Bulk jobs exist only in seer-api, so their limit is defined here.
 BULK_LIMIT = "10/minute"
 # Bulk SSL/status/propagation, confusables and takeover fan out hardest. A DNS

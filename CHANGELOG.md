@@ -122,9 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contract` module) and are read by the Python bindings and seer-api
   instead of being defined again there. Behaviour is unchanged. New
   bindings: `seer.error_status_table()`, `seer.contract()`,
-  `seer.clean_message()`. **Release note:** seer-api now needs these
-  bindings — raise its `domain-seer>=` floor to this version when cutting
-  the release.
+  `seer.clean_message()`. seer-api needs bindings from this release or
+  later; with older ones it refuses to start and says to rebuild them.
 - `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
   silently ignored); use `--format json`.
 - TUI: a `:` command with extra arguments (`:prop example.com MX`,
