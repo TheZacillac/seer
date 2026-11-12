@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   View.
 
 ### Fixed
+- **seer-core.** A lookup or status check no longer needs a very large
+  stack. Their futures were 45 KB and 65 KB, and on a 2 MiB Tokio worker
+  thread a debug build overflowed the stack and aborted the process. The
+  stages are boxed; both are now under 4 KB.
 - **Availability.** A WHOIS record whose status affirms the registration
   (DENIC `Status: connect`, `ok`, an EPP code) but carries no registrar,
   dates or nameservers is registered — it used to fall to the DNS tie-break

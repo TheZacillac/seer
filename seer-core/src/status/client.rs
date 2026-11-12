@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use futures::FutureExt;
 use tracing::{debug, instrument};
 
 use super::types::{CertificateInfo, DnsResolution, DomainExpiration, StatusResponse};
@@ -92,12 +93,19 @@ impl StatusClient {
         // resolution, and CAA policy concurrently. HTTP and SSL checks
         // include SSRF protection internally; CAA never fails the request
         // (a resolver error yields an empty policy).
+        //
+        // Each sub-check is boxed. Inline, their futures made this one 65 KB
+        // (the registration lookup alone is 45 KB), and a future's bytes
+        // are carried by every caller up the stack: a debug build
+        // overflowed a 2 MiB Tokio worker stack and aborted the process.
+        // On the heap they cost this future five pointers. `boxed()` also
+        // erases each type, so a caller's `Send` proof stops here.
         let (http_result, cert_result, expiry_result, dns_result, caa_policy) = tokio::join!(
-            self.fetch_http_info(&domain),
-            self.fetch_certificate_info(&domain),
-            self.fetch_domain_expiration(&domain),
-            self.fetch_dns_resolution(&domain),
-            caa::lookup_caa(&self.dns_resolver, &domain, None),
+            self.fetch_http_info(&domain).boxed(),
+            self.fetch_certificate_info(&domain).boxed(),
+            self.fetch_domain_expiration(&domain).boxed(),
+            self.fetch_dns_resolution(&domain).boxed(),
+            caa::lookup_caa(&self.dns_resolver, &domain, None).boxed(),
         );
 
         // Apply HTTP info
@@ -472,6 +480,18 @@ fn extract_attr_string(value: &x509_parser::der_parser::asn1_rs::Any) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_check_future_stays_small() {
+        // `check` runs five sub-checks at once. Held inline, their futures
+        // made this one 65 KB, and every caller up the stack carried those
+        // bytes too: on a 2 MiB Tokio worker thread a debug build overflowed
+        // its stack and aborted the process (seer-server's `/status`). Each
+        // sub-check is boxed, so this future is a handful of pointers.
+        let client = StatusClient::new();
+        let size = size_of_val(&client.check("example.com"));
+        assert!(size <= 4096, "check future grew to {size} bytes");
+    }
 
     #[test]
     fn from_config_applies_http_timeout() {
