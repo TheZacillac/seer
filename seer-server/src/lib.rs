@@ -9,13 +9,15 @@
 //! checks; [`state`] holds the shared seer-core clients; [`routes`] is the
 //! route table and its handlers; [`edge`] holds the checks handlers run
 //! before calling core; [`app`] builds the router and its layers; [`tier`]
-//! decides who may call what; [`error`] turns failures into
+//! decides who may call what; [`client_ip`] works out who the client is
+//! behind a proxy; [`error`] turns failures into
 //! `{"detail": …}` responses.
 //!
 //! [`serve`] is the whole server: bind, route, and run until SIGTERM or
 //! Ctrl-C, letting in-flight requests finish.
 
 pub mod app;
+pub mod client_ip;
 pub mod edge;
 pub mod error;
 pub mod routes;
