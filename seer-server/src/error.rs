@@ -15,6 +15,8 @@ use seer_core::{contract, SeerError};
 pub struct ApiError {
     status: StatusCode,
     detail: String,
+    /// Seconds for the `Retry-After` header, when retrying will help.
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -22,6 +24,7 @@ impl ApiError {
         Self {
             status,
             detail: contract::clean_message(&detail.into()),
+            retry_after: None,
         }
     }
 
@@ -43,6 +46,35 @@ impl ApiError {
     /// 405: the route exists but only answers `GET`.
     pub fn method_not_allowed() -> Self {
         Self::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+    }
+
+    /// 429: this caller is over a route's rate limit. `retry_after` is how
+    /// long until the limiter would admit another request.
+    pub fn rate_limited(retry_after: std::time::Duration) -> Self {
+        // Whole seconds, rounded up, and at least one: `Retry-After: 0`
+        // invites an immediate retry that would be refused again.
+        let seconds = retry_after.as_millis().div_ceil(1000).max(1);
+        Self {
+            retry_after: Some(u64::try_from(seconds).unwrap_or(u64::MAX)),
+            ..Self::new(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded")
+        }
+    }
+
+    /// 503: every slot stayed busy until the request's deadline. Nothing
+    /// was started, so retrying is safe.
+    pub fn busy() -> Self {
+        Self {
+            retry_after: Some(1),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server busy; retry shortly",
+            )
+        }
+    }
+
+    /// 504: the lookup did not finish before the request's deadline.
+    pub fn timeout() -> Self {
+        Self::new(StatusCode::GATEWAY_TIMEOUT, "Request timed out")
     }
 
     /// 500: a fault in the server itself. Carries no detail.
@@ -85,6 +117,9 @@ impl IntoResponse for ApiError {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         if self.status == StatusCode::UNAUTHORIZED {
             headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if let Some(seconds) = self.retry_after {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
     }
@@ -187,5 +222,40 @@ mod tests {
         let reply = reply(ApiError::unauthorized("API key required").into_response()).await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
         assert_eq!(reply.headers[header::WWW_AUTHENTICATE], "Bearer");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_refusal_says_when_to_retry() {
+        // Rounded up to whole seconds, and never zero.
+        for (wait, expected) in [(11_200, "12"), (60_000, "60"), (1, "1"), (0, "1")] {
+            let error = ApiError::rate_limited(std::time::Duration::from_millis(wait));
+            assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+            let reply = reply(error.into_response()).await;
+            assert_eq!(reply.headers[header::RETRY_AFTER], expected, "{wait} ms");
+            assert_eq!(
+                reply.json,
+                serde_json::json!({ "detail": "Rate limit exceeded" })
+            );
+            assert_eq!(reply.headers[header::CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_and_timeout_have_their_own_statuses() {
+        let busy = reply(ApiError::busy().into_response()).await;
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers[header::RETRY_AFTER], "1");
+        assert_eq!(
+            busy.json,
+            serde_json::json!({ "detail": "Server busy; retry shortly" })
+        );
+
+        let timeout = reply(ApiError::timeout().into_response()).await;
+        assert_eq!(timeout.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(timeout.headers.get(header::RETRY_AFTER).is_none());
+        assert_eq!(
+            timeout.json,
+            serde_json::json!({ "detail": "Request timed out" })
+        );
     }
 }

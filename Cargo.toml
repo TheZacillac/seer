@@ -54,6 +54,12 @@ tower-http = { version = "0.6", default-features = false, features = ["catch-pan
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Constant-time comparison of the API key (already in the tree via rustls).
 subtle = "2"
+# Rate limiting (GCRA) with a keyed in-memory store. Default features are
+# off: no jitter or quanta clock is used, which keeps `rand` and `quanta`
+# out of this dependency's tree.
+governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
+# CIDR ranges for `[server] trusted_proxies` (already in the tree via reqwest).
+ipnet = "2"
 
 # DNS resolution.
 # `tokio` is the runtime glue (the only default feature we keep —
