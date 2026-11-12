@@ -27,12 +27,15 @@ pub mod state;
 pub mod tier;
 
 use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use seer_core::SeerConfig;
 use tokio::net::TcpListener;
 
 use crate::settings::Settings;
-use crate::state::Clients;
+use crate::state::{AppState, Clients};
 
 /// Binds `settings.bind` and serves until SIGTERM or Ctrl-C. In-flight
 /// requests finish before it returns.
@@ -54,10 +57,38 @@ pub async fn serve_on(
         keyed = settings.api_key.is_some(),
         "seer-server listening"
     );
-    let app = app::router(settings, Clients::from_config(config), routes::routes());
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    for warning in settings.warnings() {
+        tracing::warn!("{warning}");
+    }
+    let routes = routes::routes();
+    let state = AppState::new(settings, Clients::from_config(config), &routes);
+    sweep_limits_periodically(&state);
+    let app = app::assemble(state, routes);
+    // Connect info gives the gate each request's socket peer, which is the
+    // client's identity for rate limiting (or the proxy that names it).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}
+
+/// Forgets idle rate-limit entries once a minute, for as long as the
+/// server's state is alive.
+fn sweep_limits_periodically(state: &AppState) {
+    let limits = Arc::downgrade(&state.limits);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match limits.upgrade() {
+                Some(limits) => limits.sweep(),
+                // The server has stopped and dropped its state.
+                None => break,
+            }
+        }
+    });
 }
 
 /// Completes on Ctrl-C, or on SIGTERM where there is one.

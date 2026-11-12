@@ -1,0 +1,15 @@
+---
+source: seer-server/src/routes/mod.rs
+expression: table
+---
+/lookup/{domain}                 Public  standard
+/whois/{domain}                  Public  standard
+/rdap/domain/{domain}            Public  standard
+/rdap/ip/{ip}                    Public  standard
+/rdap/asn/{asn}                  Public  standard
+/availability/{domain}           Public  light
+/tld/                            Public  standard
+/tld/{tld}                       Public  light
+/dns/{domain}/{record_type}      Public  light
+/ssl/{domain}                    Public  standard
+/status/{domain}                 Public  moderate

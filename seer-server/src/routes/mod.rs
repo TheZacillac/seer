@@ -10,24 +10,34 @@ mod probes;
 mod registration;
 
 use axum::routing::get;
+use seer_core::contract::CostClass::{Light, Moderate, Standard};
 
 use crate::app::Route;
 
-/// Every route the server exposes. The keyed-only operations (audit,
+/// Every route the server exposes. Each cost class is the one whose limit
+/// seer-api declares on the same route. The keyed-only operations (audit,
 /// trace, propagation and the rest) join this table in the next release.
 pub fn routes() -> Vec<Route> {
     vec![
-        Route::public("/lookup/{domain}", get(registration::lookup)),
-        Route::public("/whois/{domain}", get(registration::whois)),
-        Route::public("/rdap/domain/{domain}", get(registration::rdap_domain)),
-        Route::public("/rdap/ip/{ip}", get(registration::rdap_ip)),
-        Route::public("/rdap/asn/{asn}", get(registration::rdap_asn)),
-        Route::public("/availability/{domain}", get(registration::availability)),
-        Route::public("/tld/", get(registration::tld_list)),
-        Route::public("/tld/{tld}", get(registration::tld_info)),
-        Route::public("/dns/{domain}/{record_type}", get(dns::dig)),
-        Route::public("/ssl/{domain}", get(probes::ssl)),
-        Route::public("/status/{domain}", get(probes::status)),
+        Route::public("/lookup/{domain}", Standard, get(registration::lookup)),
+        Route::public("/whois/{domain}", Standard, get(registration::whois)),
+        Route::public(
+            "/rdap/domain/{domain}",
+            Standard,
+            get(registration::rdap_domain),
+        ),
+        Route::public("/rdap/ip/{ip}", Standard, get(registration::rdap_ip)),
+        Route::public("/rdap/asn/{asn}", Standard, get(registration::rdap_asn)),
+        Route::public(
+            "/availability/{domain}",
+            Light,
+            get(registration::availability),
+        ),
+        Route::public("/tld/", Standard, get(registration::tld_list)),
+        Route::public("/tld/{tld}", Light, get(registration::tld_info)),
+        Route::public("/dns/{domain}/{record_type}", Light, get(dns::dig)),
+        Route::public("/ssl/{domain}", Standard, get(probes::ssl)),
+        Route::public("/status/{domain}", Moderate, get(probes::status)),
     ]
 }
 
@@ -78,6 +88,20 @@ mod tests {
                 ("/status/{domain}", Tier::Public),
             ]
         );
+    }
+
+    #[test]
+    fn the_whole_table_is_snapshotted() {
+        // Path, tier and cost class of every route: any change to what the
+        // server exposes, or how it is limited, shows up in review.
+        let table: String = routes()
+            .iter()
+            .map(|r| {
+                let tier = format!("{:?}", r.tier);
+                format!("{:<32} {tier:<7} {}\n", r.path, r.cost.name())
+            })
+            .collect();
+        insta::assert_snapshot!(table);
     }
 
     #[test]

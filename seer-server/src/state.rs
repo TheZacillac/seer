@@ -6,11 +6,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use seer_core::contract::CostClass;
 use seer_core::{
     AvailabilityChecker, DnsResolver, RdapClient, SeerConfig, SmartLookup, SslChecker,
     StatusClient, WhoisClient,
 };
 
+use crate::app::Route;
+use crate::limit::Limits;
 use crate::settings::Settings;
 use crate::tier::Tier;
 
@@ -47,6 +50,15 @@ impl Clients {
     }
 }
 
+/// What the gate needs to know about a route.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteMeta {
+    /// Who may call it.
+    pub tier: Tier,
+    /// How expensive it is, which sets its rate limit.
+    pub cost: CostClass,
+}
+
 /// The state Axum hands to handlers and middleware. Cheap to clone.
 #[derive(Clone)]
 pub struct AppState {
@@ -54,6 +66,30 @@ pub struct AppState {
     pub settings: Arc<Settings>,
     /// The seer-core clients.
     pub clients: Arc<Clients>,
-    /// Each route pattern's tier, for the gate.
-    pub(crate) tiers: Arc<HashMap<&'static str, Tier>>,
+    /// Each route pattern's tier and cost class, for the gate.
+    pub(crate) rows: Arc<HashMap<&'static str, RouteMeta>>,
+    /// The rate limiters.
+    pub(crate) limits: Arc<Limits>,
+}
+
+impl AppState {
+    /// Builds the shared state for a server exposing `routes`.
+    pub fn new(settings: Settings, clients: Clients, routes: &[Route]) -> Self {
+        let rows = routes
+            .iter()
+            .map(|route| {
+                let meta = RouteMeta {
+                    tier: route.tier,
+                    cost: route.cost,
+                };
+                (route.path, meta)
+            })
+            .collect();
+        Self {
+            rows: Arc::new(rows),
+            limits: Arc::new(Limits::new(settings.keyed_rate_multiplier)),
+            settings: Arc::new(settings),
+            clients: Arc::new(clients),
+        }
+    }
 }
