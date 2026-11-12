@@ -29,9 +29,14 @@ subtle = { workspace = true }
 getrandom = { workspace = true }
 governor = { workspace = true }
 ipnet = { workspace = true }
+# The accept loop is built on hyper directly: `axum::serve` offers no
+# header timeout or connection limit. Both crates are already in the tree
+# under axum.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["http1", "server-graceful", "service", "tokio"] }
+tower = { workspace = true }
 
 [dev-dependencies]
-tower = { workspace = true }
 insta = { workspace = true }
 
 [lints]

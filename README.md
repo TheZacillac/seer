@@ -733,7 +733,13 @@ large zone may still not finish; that is a 504, and nothing is cached.
 List only your reverse proxies in `trusted_proxies`. Any address inside
 a trusted range can choose the address it is rate-limited as, so a
 private network such as `10.0.0.0/8` draws a startup warning and
-`0.0.0.0/0` is refused.
+a range broader than a `/8` (IPv4) or a `/16` (IPv6) is refused.
+
+`SEER_API_KEY` must be at least 16 characters (`openssl rand -hex 32`
+makes a good one); a shorter key stops the server. A client that presents
+ten wrong keys in a minute gets a 429 until the minute ends. A connection
+that does not send a complete request within `header_timeout_secs` is
+closed, and at most `max_connections` are open at once.
 
 Configure it in `~/.seer/config.toml`:
 
@@ -748,6 +754,8 @@ request_timeout_secs = 30                # one request's deadline (1-120)
 max_in_flight = 64                       # lookups at once (2-1024)
 max_in_flight_per_client = 4             # ... per anonymous client (1-64)
 cache_ttl_secs = 60                      # reuse successes this long; 0 = off (0-3600)
+header_timeout_secs = 10                 # close a connection that sends no full request in this time (1-60)
+max_connections = 1024                   # connections open at once (16-65536)
 ```
 
 ---
@@ -836,7 +844,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting which domains may be queried | — |
 | `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` (without it, requests arriving on a non-loopback interface get a 503 however the server was started) | `127.0.0.1` |
 | `SEER_PORT` | API bind port | `8000` |
-| `SEER_API_KEY` | Bearer token. seer-api: required for all non-`/health` requests. seer-server: the keyed tier's key, and required to start unless `[server] public = true` | — |
+| `SEER_API_KEY` | Bearer token. seer-api: required for all non-`/health` requests. seer-server: the keyed tier's key (at least 16 characters), and required to start unless `[server] public = true` | — |
 | `SEER_ALLOWED_HOSTS` | Comma-separated `Host:` values (`host:*` matches any port) the API also answers without `SEER_API_KEY`. Without a key only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`) is served otherwise — any other gets a 421, which stops DNS-rebinding pages. Ignored with a key; `/mcp` uses `SEER_MCP_ALLOWED_HOSTS` instead when that is set | — |
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for the REST API. Unset: no CORS headers, and without `SEER_API_KEY` a request from a non-loopback `Origin` is refused (403) | — |
 | `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |

@@ -47,6 +47,10 @@ pub struct Settings {
     pub max_in_flight_per_client: u32,
     /// How long a successful response is reused; zero disables the cache.
     pub cache_ttl: Duration,
+    /// How long a connection may take to send a complete request header.
+    pub header_timeout: Duration,
+    /// Connections open at once.
+    pub max_connections: usize,
 }
 
 /// Shortest API key the server starts with. The key is the only thing
@@ -147,6 +151,8 @@ impl Settings {
             max_in_flight: server.max_in_flight,
             max_in_flight_per_client: server.max_in_flight_per_client,
             cache_ttl: Duration::from_secs(server.cache_ttl_secs),
+            header_timeout: Duration::from_secs(server.header_timeout_secs),
+            max_connections: server.max_connections,
         })
     }
 

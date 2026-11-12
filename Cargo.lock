@@ -2635,6 +2635,8 @@ dependencies = [
  "axum",
  "getrandom 0.4.3",
  "governor",
+ "hyper",
+ "hyper-util",
  "insta",
  "ipnet",
  "seer-core",
