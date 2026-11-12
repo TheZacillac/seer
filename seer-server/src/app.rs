@@ -233,6 +233,7 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             public,
             cors_origins: origins.iter().map(|s| s.to_string()).collect(),
+            ..ServerConfig::default()
         };
         let settings = Settings::new(&server, key.map(str::to_string)).unwrap();
         let clients = Clients::from_config(&SeerConfig::default());

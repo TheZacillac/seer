@@ -102,6 +102,21 @@ pub struct ServerConfig {
     /// Origins whose pages may read responses from a browser (CORS), e.g.
     /// `"https://example.com"`. Empty by default; `"*"` allows any origin.
     pub cors_origins: Vec<String>,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as IP
+    /// addresses or CIDR ranges (`"127.0.0.1"`, `"10.0.0.0/8"`). Empty by
+    /// default: the socket peer is then the client, so behind a proxy every
+    /// visitor would share one rate-limit bucket.
+    pub trusted_proxies: Vec<String>,
+    /// How many times the anonymous rate limit a keyed caller gets.
+    pub keyed_rate_multiplier: u32,
+    /// Overall deadline for one request, in seconds: the wait for a free
+    /// slot plus the lookup itself.
+    pub request_timeout_secs: u64,
+    /// Lookups allowed to run at once. Anonymous callers share half of it.
+    pub max_in_flight: usize,
+    /// How long a successful response is reused, in seconds; `0` disables
+    /// the response cache.
+    pub cache_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -110,6 +125,11 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:8001".to_string(),
             public: false,
             cors_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
+            keyed_rate_multiplier: 10,
+            request_timeout_secs: 30,
+            max_in_flight: 64,
+            cache_ttl_secs: 60,
         }
     }
 }
@@ -269,7 +289,8 @@ impl SeerConfig {
     /// concurrent connections. Timeouts of `0` would error every network call
     /// immediately. The bounds are per-protocol (a config file can't bypass
     /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
-    /// http and CT 1–120s; audit 10–300s.
+    /// http and CT 1–120s; audit 10–300s; server: key multiplier 1–100,
+    /// request timeout 1–120s, in-flight 2–1024, cache TTL 0–3600s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
         // A multi-day per-operation delay would stall bulk runs indefinitely;
@@ -281,6 +302,13 @@ impl SeerConfig {
         self.timeouts.http_secs = self.timeouts.http_secs.clamp(1, 120);
         self.timeouts.ct_secs = self.timeouts.ct_secs.clamp(1, MAX_CT_SECS);
         self.timeouts.audit_secs = self.timeouts.audit_secs.clamp(10, 300);
+        // seer-server: a multiplier of 0 would refuse every keyed request,
+        // a timeout of 0 every request, and fewer than 2 slots would leave
+        // anonymous callers none. `cache_ttl_secs = 0` is valid (cache off).
+        self.server.keyed_rate_multiplier = self.server.keyed_rate_multiplier.clamp(1, 100);
+        self.server.request_timeout_secs = self.server.request_timeout_secs.clamp(1, 120);
+        self.server.max_in_flight = self.server.max_in_flight.clamp(2, 1024);
+        self.server.cache_ttl_secs = self.server.cache_ttl_secs.min(3600);
         self
     }
 
@@ -379,6 +407,53 @@ cors_origins = ["https://example.com"]
         let parsed: SeerConfig = toml::from_str(&SeerConfig::default_toml()).unwrap();
         assert_eq!(parsed.server.bind, "127.0.0.1:8001");
         assert!(SeerConfig::default_toml().contains("[server]"));
+    }
+
+    #[test]
+    fn server_protection_settings_have_safe_defaults() {
+        let server = SeerConfig::default().server;
+        assert!(server.trusted_proxies.is_empty());
+        assert_eq!(server.keyed_rate_multiplier, 10);
+        assert_eq!(server.request_timeout_secs, 30);
+        assert_eq!(server.max_in_flight, 64);
+        assert_eq!(server.cache_ttl_secs, 60);
+    }
+
+    #[test]
+    fn server_protection_settings_parse_and_are_clamped() {
+        let parse = |body: &str| {
+            SeerConfig::parse_or_default(
+                &format!("[server]\n{body}\n"),
+                std::path::Path::new("test.toml"),
+            )
+            .server
+        };
+        let low = parse(
+            "keyed_rate_multiplier = 0\nrequest_timeout_secs = 0\nmax_in_flight = 0\ncache_ttl_secs = 0",
+        );
+        assert_eq!(low.keyed_rate_multiplier, 1);
+        assert_eq!(low.request_timeout_secs, 1);
+        assert_eq!(low.max_in_flight, 2);
+        assert_eq!(low.cache_ttl_secs, 0, "0 is valid: it disables the cache");
+
+        let high = parse(
+            "keyed_rate_multiplier = 5000\nrequest_timeout_secs = 5000\nmax_in_flight = 500000\ncache_ttl_secs = 500000",
+        );
+        assert_eq!(high.keyed_rate_multiplier, 100);
+        assert_eq!(high.request_timeout_secs, 120);
+        assert_eq!(high.max_in_flight, 1024);
+        assert_eq!(high.cache_ttl_secs, 3600);
+
+        let proxies = parse("trusted_proxies = [\"10.0.0.0/8\", \"192.0.2.1\"]");
+        assert_eq!(proxies.trusted_proxies, ["10.0.0.0/8", "192.0.2.1"]);
+    }
+
+    #[test]
+    fn server_protection_settings_are_known_keys() {
+        let unknown = SeerConfig::unknown_keys(
+            "[server]\ntrusted_proxies = []\nkeyed_rate_multiplier = 2\nrequest_timeout_secs = 5\nmax_in_flight = 8\ncache_ttl_secs = 0\n",
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
     }
 
     #[test]

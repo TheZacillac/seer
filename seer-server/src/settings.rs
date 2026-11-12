@@ -126,6 +126,7 @@ mod tests {
             bind: bind.to_string(),
             public,
             cors_origins: origins.iter().map(|s| s.to_string()).collect(),
+            ..ServerConfig::default()
         }
     }
 
