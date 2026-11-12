@@ -160,7 +160,7 @@ impl Default for BulkExecutor {
 impl BulkExecutor {
     pub fn new() -> Self {
         Self {
-            concurrency: 10,
+            concurrency: crate::contract::CONCURRENCY_DEFAULT,
             rate_limit_delay: Duration::from_millis(100),
             whois_client: WhoisClient::new(),
             rdap_client: RdapClient::new(),
@@ -198,7 +198,7 @@ impl BulkExecutor {
     }
 
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
-        self.concurrency = concurrency.clamp(1, 50);
+        self.concurrency = concurrency.clamp(1, crate::contract::CONCURRENCY_MAX);
         self
     }
 

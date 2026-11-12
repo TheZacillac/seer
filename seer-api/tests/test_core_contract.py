@@ -120,3 +120,10 @@ def test_binding_missing_a_contract_key_fails_with_rebuild_message(monkeypatch):
     monkeypatch.delitem(sys.modules, "seer_api._core", raising=False)
     with pytest.raises(ImportError, match="maturin develop"):
         importlib.import_module("seer_api._core")
+
+
+def test_concurrency_ceiling_is_cores():
+    from seer_api import _contract
+    from seer_api._core import CONTRACT
+
+    assert _contract.MAX_CONCURRENCY == CONTRACT["concurrency_max"] == 50

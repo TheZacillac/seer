@@ -24,6 +24,15 @@ pub const RECORD_TYPE_PATTERN: &str = "^[A-Z0-9]+$";
 /// Most characters of error text an external surface shows a client.
 pub const MESSAGE_MAX_LENGTH: usize = 200;
 
+/// Fan-out width used when a caller does not choose one.
+pub const CONCURRENCY_DEFAULT: usize = 10;
+
+/// Widest fan-out a caller or a config file may ask for.
+pub const CONCURRENCY_MAX: usize = 50;
+
+// The default must itself be a legal choice.
+const _: () = assert!(CONCURRENCY_DEFAULT >= 1 && CONCURRENCY_DEFAULT <= CONCURRENCY_MAX);
+
 /// Whether `token` is a plausible DNS record-type name: 1 to
 /// [`RECORD_TYPE_MAX_LENGTH`] ASCII uppercase letters or digits. An edge
 /// check only — parsing the name is `RecordType`'s job.

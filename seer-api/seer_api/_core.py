@@ -38,6 +38,7 @@ _CONTRACT_KEYS = (
     "record_type_pattern",
     "message_max_length",
     "tld_token_pattern",
+    "concurrency_max",
     "rate_limits",
 )
 

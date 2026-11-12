@@ -366,7 +366,7 @@ fn error_status_table(py: Python<'_>) -> Vec<(Bound<'_, PyType>, u16)> {
 
 /// seer-core's input and rate-limit contract (`seer_core::contract`) as a
 /// dict: the length limits, the record-type token pattern, the error-text
-/// cap, and `rate_limits` mapping each cost class name to its per-minute
+/// cap, the fan-out concurrency default and ceiling, and `rate_limits` mapping each cost class name to its per-minute
 /// limit. Pure data.
 #[pyfunction]
 fn contract(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
@@ -383,6 +383,8 @@ fn contract(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     dict.set_item("record_type_pattern", shared::RECORD_TYPE_PATTERN)?;
     dict.set_item("message_max_length", shared::MESSAGE_MAX_LENGTH)?;
     dict.set_item("tld_token_pattern", shared::TLD_TOKEN_PATTERN)?;
+    dict.set_item("concurrency_default", shared::CONCURRENCY_DEFAULT)?;
+    dict.set_item("concurrency_max", shared::CONCURRENCY_MAX)?;
     dict.set_item("rate_limits", rate_limits)?;
     Ok(dict)
 }
@@ -565,7 +567,7 @@ fn propagation<'py>(
     to_py(py, &response)
 }
 
-const MAX_CONCURRENCY: usize = 50;
+use seer_core::contract::CONCURRENCY_MAX as MAX_CONCURRENCY;
 
 /// Maximum number of domains accepted by a single `bulk_*` call. Mirrors the
 /// FastAPI router's `MAX_BULK_DOMAINS` (seer-api) so the binding — the real
