@@ -72,7 +72,7 @@ mod tests {
     use crate::app::{assemble, router};
     use crate::settings::Settings;
     use crate::state::{AppState, Clients};
-    use crate::test_support::{get, get_with_key};
+    use crate::test_support::{get, get_with_key, KEY};
     use crate::tier::{Caller, Tier};
     use axum::http::StatusCode;
     use axum::Router;
@@ -86,7 +86,7 @@ mod tests {
             public: true,
             ..ServerConfig::default()
         };
-        let settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let settings = Settings::new(&server, Some(KEY.to_string())).unwrap();
         router(
             settings,
             Clients::from_config(&SeerConfig::default()),
@@ -195,7 +195,7 @@ mod tests {
             public: true,
             ..ServerConfig::default()
         };
-        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let mut settings = Settings::new(&server, Some(KEY.to_string())).unwrap();
         settings.request_timeout = Duration::from_millis(100);
         settings.max_in_flight = 2;
         let mut clients = Clients::from_config(&SeerConfig::default());
@@ -207,7 +207,7 @@ mod tests {
         let _a = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
         let _b = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
         for (pattern, uri) in SAMPLES {
-            let reply = get_with_key(&app, uri, "k").await;
+            let reply = get_with_key(&app, uri, KEY).await;
             assert_eq!(
                 reply.status,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -230,7 +230,7 @@ mod tests {
             public: true,
             ..ServerConfig::default()
         };
-        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let mut settings = Settings::new(&server, Some(KEY.to_string())).unwrap();
         settings.request_timeout = Duration::from_millis(100);
         settings.max_in_flight = 2;
         let table = routes();
@@ -338,10 +338,10 @@ mod tests {
             state
                 .cache
                 .put(crate::cache::key(route, parts), body.into());
-            let reply = get_with_key(&app, hit, "k").await;
+            let reply = get_with_key(&app, hit, KEY).await;
             assert_eq!(reply.status, StatusCode::OK, "{hit} missed its entry");
             assert_eq!(reply.json["seeded"], index, "{hit} read another entry");
-            let other = get_with_key(&app, miss, "k").await;
+            let other = get_with_key(&app, miss, KEY).await;
             assert_eq!(
                 other.status,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -355,7 +355,7 @@ mod tests {
             "{}".into(),
         );
         assert_eq!(
-            get_with_key(&app, compare, "k").await.status,
+            get_with_key(&app, compare, KEY).await.status,
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -369,7 +369,7 @@ mod tests {
             "/propagation/example.com/a",
             "/propagation/example.com/ZZZ",
         ] {
-            let reply = get_with_key(&app(), path, "k").await;
+            let reply = get_with_key(&app(), path, KEY).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
         }
     }
@@ -384,17 +384,17 @@ mod tests {
             "?server_a=8.8.8.8&server_b=tls://192.168.1.1",
         ] {
             let path = format!("/dns/compare/example.com{query}");
-            let reply = get_with_key(&app(), &path, "k").await;
+            let reply = get_with_key(&app(), &path, KEY).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
         }
-        let missing = get_with_key(&app(), "/dns/compare/example.com", "k").await;
+        let missing = get_with_key(&app(), "/dns/compare/example.com", KEY).await;
         assert_eq!(missing.json["detail"], "server_a and server_b are required");
         let long = format!(
             "/dns/compare/example.com?server_a={}&server_b=1.1.1.1",
             "a".repeat(513)
         );
         assert_eq!(
-            get_with_key(&app(), &long, "k").await.status,
+            get_with_key(&app(), &long, KEY).await.status,
             StatusCode::BAD_REQUEST
         );
     }
@@ -406,12 +406,12 @@ mod tests {
             "/dnssec/bad..host",
             "/delegation/-x-.com",
         ] {
-            let reply = get_with_key(&app(), path, "k").await;
+            let reply = get_with_key(&app(), path, KEY).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
         }
         let long = format!("/info/{}", "a".repeat(254));
         assert_eq!(
-            get_with_key(&app(), &long, "k").await.status,
+            get_with_key(&app(), &long, KEY).await.status,
             StatusCode::BAD_REQUEST
         );
     }
@@ -453,7 +453,7 @@ mod tests {
         for route in ["/subdomains", "/takeover", "/confusables"] {
             for value in ["0", "51", "100000", "-1", "ten"] {
                 let path = format!("{route}/example.com?concurrency={value}");
-                let reply = get_with_key(&app(), &path, "k").await;
+                let reply = get_with_key(&app(), &path, KEY).await;
                 assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
             }
         }
@@ -461,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_must_be_true_or_false() {
-        let reply = get_with_key(&app(), "/subdomains/example.com?resolve=maybe", "k").await;
+        let reply = get_with_key(&app(), "/subdomains/example.com?resolve=maybe", KEY).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     }
 
@@ -475,7 +475,7 @@ mod tests {
             "/diff/169.254.169.254/example.com",
             "/diff/example.com/192.168.1.1",
         ] {
-            let reply = get_with_key(&app(), path, "k").await;
+            let reply = get_with_key(&app(), path, KEY).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
         }
     }
@@ -492,7 +492,7 @@ mod tests {
             "/takeover/not_a_domain",
             "/confusables/not_a_domain",
         ] {
-            let reply = get_with_key(&app(), path, "k").await;
+            let reply = get_with_key(&app(), path, KEY).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
         }
     }
@@ -508,7 +508,7 @@ mod tests {
             .collect();
         for (pattern, uri) in SAMPLES {
             if keyed.contains(pattern) {
-                let reply = get_with_key(&app, uri, "k").await;
+                let reply = get_with_key(&app, uri, KEY).await;
                 assert_eq!(reply.status, StatusCode::OK, "{pattern}: {}", reply.json);
             }
         }
@@ -523,7 +523,7 @@ mod tests {
             public: true,
             ..ServerConfig::default()
         };
-        let settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let settings = Settings::new(&server, Some(KEY.to_string())).unwrap();
         let clients = Clients::from_config(&SeerConfig::default());
         let state = AppState::new(settings, clients, &table);
         let app = assemble(state.clone(), table);
@@ -531,7 +531,7 @@ mod tests {
         for (pattern, uri) in SAMPLES {
             let request = tokio::spawn({
                 let app = app.clone();
-                async move { get_with_key(&app, uri, "k").await }
+                async move { get_with_key(&app, uri, KEY).await }
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             request.abort();
@@ -637,7 +637,7 @@ mod tests {
     async fn a_reserved_nameserver_is_refused_for_keyed_callers_too() {
         for spec in ["127.0.0.1", "10.0.0.1:53", "tls://192.168.1.1"] {
             let path = format!("/dns/example.com/A?nameserver={spec}");
-            let reply = get_with_key(&app(), &path, "k").await;
+            let reply = get_with_key(&app(), &path, KEY).await;
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{spec}");
         }
     }
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn an_overlong_nameserver_is_a_400() {
         let path = format!("/dns/example.com/A?nameserver={}", "a".repeat(513));
-        let reply = get_with_key(&app(), &path, "k").await;
+        let reply = get_with_key(&app(), &path, KEY).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     }
 

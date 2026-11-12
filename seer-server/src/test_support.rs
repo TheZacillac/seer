@@ -29,6 +29,10 @@ pub async fn reply(response: Response) -> Reply {
     }
 }
 
+/// The API key the test servers are started with: long enough to pass the
+/// startup floor.
+pub const KEY: &str = "test-key-0123456789abcdef";
+
 /// The peer address `send`, `get` and `get_with_key` come from.
 pub const PEER: &str = "203.0.113.7";
 

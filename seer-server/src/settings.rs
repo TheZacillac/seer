@@ -49,6 +49,16 @@ pub struct Settings {
     pub cache_ttl: Duration,
 }
 
+/// Shortest API key the server starts with. The key is the only thing
+/// guarding the keyed routes, so a guessable one is refused outright.
+pub const MIN_KEY_LENGTH: usize = 16;
+
+/// Narrowest prefix a `trusted_proxies` range may have. Anything broader
+/// trusts a large share of all addresses (two `/1`s trust everyone); real
+/// proxy and CDN ranges are far narrower than this.
+const MIN_PROXY_PREFIX_V4: u8 = 8;
+const MIN_PROXY_PREFIX_V6: u8 = 16;
+
 /// Why the server will not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupError {
@@ -58,8 +68,11 @@ pub enum StartupError {
     InvalidOrigin(String),
     /// A `[server] trusted_proxies` entry is not an IP address or a range.
     InvalidProxy(String),
-    /// A `[server] trusted_proxies` entry covers every address.
+    /// A `[server] trusted_proxies` range is broader than any real proxy
+    /// range.
     ProxyRangeTooBroad(String),
+    /// `SEER_API_KEY` is shorter than [`MIN_KEY_LENGTH`].
+    KeyTooShort,
     /// `public = false` and no API key: nobody could call anything.
     KeyRequired,
 }
@@ -83,8 +96,14 @@ impl fmt::Display for StartupError {
             ),
             StartupError::ProxyRangeTooBroad(entry) => write!(
                 f,
-                "[server] trusted_proxies entry {entry:?} trusts every address: any caller \
-                 could then claim any identity. List only your reverse proxies"
+                "[server] trusted_proxies entry {entry:?} is too broad (at most a /{MIN_PROXY_PREFIX_V4} \
+                 for IPv4, a /{MIN_PROXY_PREFIX_V6} for IPv6): any caller inside it could claim \
+                 any identity. List only your reverse proxies"
+            ),
+            StartupError::KeyTooShort => write!(
+                f,
+                "refusing to start: SEER_API_KEY is shorter than {MIN_KEY_LENGTH} characters. \
+                 Use a long random value, e.g. from `openssl rand -hex 32`"
             ),
             StartupError::KeyRequired => write!(
                 f,
@@ -110,6 +129,12 @@ impl Settings {
             .filter(|key| !key.is_empty());
         if !server.public && api_key.is_none() {
             return Err(StartupError::KeyRequired);
+        }
+        if api_key
+            .as_ref()
+            .is_some_and(|key| key.chars().count() < MIN_KEY_LENGTH)
+        {
+            return Err(StartupError::KeyTooShort);
         }
         Ok(Self {
             bind,
@@ -186,7 +211,11 @@ fn parse_proxies(entries: &[String]) -> Result<Vec<IpNet>, StartupError> {
                 .or_else(|_| trimmed.parse::<IpAddr>().map(IpNet::from))
                 .map_err(|_| StartupError::InvalidProxy(entry.clone()))
                 .and_then(|net| {
-                    if net.prefix_len() == 0 {
+                    let narrowest = match net {
+                        IpNet::V4(_) => MIN_PROXY_PREFIX_V4,
+                        IpNet::V6(_) => MIN_PROXY_PREFIX_V6,
+                    };
+                    if net.prefix_len() < narrowest {
                         Err(StartupError::ProxyRangeTooBroad(entry.clone()))
                     } else {
                         Ok(net)
@@ -209,6 +238,7 @@ fn is_broad_private_range(net: &IpNet) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::KEY;
 
     fn server(bind: &str, public: bool, origins: &[&str]) -> ServerConfig {
         ServerConfig {
@@ -221,11 +251,15 @@ mod tests {
 
     #[test]
     fn defaults_with_a_key_are_accepted() {
-        let settings = Settings::new(&ServerConfig::default(), Some("s3cret".into())).unwrap();
+        let settings = Settings::new(
+            &ServerConfig::default(),
+            Some("s3cret-s3cret-s3cret".into()),
+        )
+        .unwrap();
         assert_eq!(settings.bind.to_string(), "127.0.0.1:8001");
         assert!(!settings.public);
         assert_eq!(settings.cors, CorsOrigins::None);
-        assert_eq!(settings.api_key.as_deref(), Some("s3cret"));
+        assert_eq!(settings.api_key.as_deref(), Some("s3cret-s3cret-s3cret"));
     }
 
     #[test]
@@ -243,8 +277,56 @@ mod tests {
 
     #[test]
     fn a_key_is_trimmed() {
-        let settings = Settings::new(&ServerConfig::default(), Some(" k \n".into())).unwrap();
-        assert_eq!(settings.api_key.as_deref(), Some("k"));
+        let settings = Settings::new(
+            &ServerConfig::default(),
+            Some(" sixteen-chars-xy \n".into()),
+        )
+        .unwrap();
+        assert_eq!(settings.api_key.as_deref(), Some("sixteen-chars-xy"));
+    }
+
+    #[test]
+    fn a_short_key_refuses_to_start() {
+        // A key is the only thing guarding the keyed routes.
+        for key in ["k", "short", "fifteen-chars-x"] {
+            let error = Settings::new(&ServerConfig::default(), Some(key.into())).unwrap_err();
+            assert_eq!(error, StartupError::KeyTooShort, "{key}");
+        }
+        assert!(Settings::new(&ServerConfig::default(), Some("sixteen-chars-xy".into())).is_ok());
+        assert!(StartupError::KeyTooShort.to_string().contains("16"));
+    }
+
+    #[test]
+    fn an_over_broad_proxy_range_is_refused() {
+        // Halves of the address space trust everyone as surely as /0 does.
+        for entry in [
+            "0.0.0.0/1",
+            "128.0.0.0/1",
+            "0.0.0.0/7",
+            "::/1",
+            "2000::/3",
+            "::/15",
+        ] {
+            let server = ServerConfig {
+                public: true,
+                trusted_proxies: vec![entry.to_string()],
+                ..ServerConfig::default()
+            };
+            assert_eq!(
+                Settings::new(&server, None).unwrap_err(),
+                StartupError::ProxyRangeTooBroad(entry.to_string()),
+                "{entry}"
+            );
+        }
+        // Real proxy and CDN ranges are far narrower.
+        for entry in ["10.0.0.0/8", "104.16.0.0/13", "2400:cb00::/32", "fd00::/16"] {
+            let server = ServerConfig {
+                public: true,
+                trusted_proxies: vec![entry.to_string()],
+                ..ServerConfig::default()
+            };
+            assert!(Settings::new(&server, None).is_ok(), "{entry}");
+        }
     }
 
     #[test]
@@ -306,7 +388,7 @@ mod tests {
 
     #[test]
     fn protection_settings_carry_over_with_units() {
-        let settings = Settings::new(&ServerConfig::default(), Some("k".into())).unwrap();
+        let settings = Settings::new(&ServerConfig::default(), Some(KEY.into())).unwrap();
         assert!(settings.trusted_proxies.is_empty());
         assert_eq!(settings.keyed_rate_multiplier, 10);
         assert_eq!(settings.request_timeout, Duration::from_secs(30));
@@ -325,7 +407,7 @@ mod tests {
             ],
             ..ServerConfig::default()
         };
-        let settings = Settings::new(&server, Some("k".into())).unwrap();
+        let settings = Settings::new(&server, Some(KEY.into())).unwrap();
         let contains = |ip: &str| {
             let ip: IpAddr = ip.parse().unwrap();
             settings.trusted_proxies.iter().any(|net| net.contains(&ip))
@@ -348,7 +430,7 @@ mod tests {
                 trusted_proxies: vec![entry.to_string()],
                 ..ServerConfig::default()
             };
-            let error = Settings::new(&server, Some("k".into())).unwrap_err();
+            let error = Settings::new(&server, Some(KEY.into())).unwrap_err();
             assert_eq!(error, StartupError::InvalidProxy(entry.to_string()));
         }
     }
@@ -370,7 +452,7 @@ mod tests {
         };
         assert!(Settings::new(&proxied, None).unwrap().warnings().is_empty());
         // A private server limits by key, so the client IP does not matter.
-        let private = Settings::new(&ServerConfig::default(), Some("k".into())).unwrap();
+        let private = Settings::new(&ServerConfig::default(), Some(KEY.into())).unwrap();
         assert!(private.warnings().is_empty());
     }
     #[test]
@@ -382,9 +464,9 @@ mod tests {
                 trusted_proxies: vec![entry.to_string()],
                 ..ServerConfig::default()
             };
-            let error = Settings::new(&server, Some("k".into())).unwrap_err();
+            let error = Settings::new(&server, Some(KEY.into())).unwrap_err();
             assert_eq!(error, StartupError::ProxyRangeTooBroad(entry.to_string()));
-            assert!(error.to_string().contains("every address"), "{error}");
+            assert!(error.to_string().contains("too broad"), "{error}");
         }
     }
 
@@ -400,7 +482,7 @@ mod tests {
         };
         // "Trust my whole network": a client inside it can choose its own
         // identity.
-        for broad in ["10.0.0.0/8", "192.168.0.0/16", "fd00::/8"] {
+        for broad in ["10.0.0.0/8", "192.168.0.0/16", "fd00::/16"] {
             let found = warnings(&[broad]);
             assert_eq!(found.len(), 1, "{broad}: {found:?}");
             assert!(found[0].contains(broad), "{found:?}");
