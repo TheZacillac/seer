@@ -149,7 +149,7 @@ Using Seer from Rust code instead? See [Rust Library](#-rust-library).
 | **seer-cli** | Rust binary | `brew install TheZacillac/tap/seer` or `cargo install seer-cli` | The `seer` command-line tool |
 | **seer-py** | Python extension | `pip install ./seer-py` | Python bindings via PyO3 (`import seer`); PyPI (`domain-seer`) planned |
 | **seer-api** | Python package | `pip install -e .` | REST API + MCP server |
-| **seer-server** | Rust binary | `cargo install --path seer-server` | HTTP server for websites (Axum); preview |
+| **seer-server** | Rust binary | `cargo install --path seer-server` | HTTP server for websites (Axum) |
 
 <details>
 <summary><b>seer-cli vs seer-core — which do I need?</b></summary>
@@ -661,9 +661,9 @@ A Rust server that serves the single-domain lookups as JSON, for websites.
 It runs alongside `seer-api` and uses the same paths and response shapes;
 bulk jobs, streaming and MCP stay in `seer-api`.
 
-> **Not ready for the public internet yet.** This release has no rate
-> limiting, response cache or concurrency caps. Keep it on loopback or
-> behind your own access control until the next release adds them.
+Put it behind a reverse proxy that terminates TLS (Caddy, nginx,
+Cloudflare), list that proxy in `trusted_proxies`, and set
+`public = true` to let browsers call it without a key.
 
 ```bash
 cargo install --path seer-server
@@ -686,15 +686,30 @@ curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8001/lookup/example.com
 Callers are **keyed** (`Authorization: Bearer $SEER_API_KEY`) or, when
 `public = true`, **anonymous**. A wrong key is always a 401. Errors are
 `{"detail": "..."}`. Without `public = true` the server refuses to start
-unless `SEER_API_KEY` is set.
+unless `SEER_API_KEY` is set, and it refuses to start on a config file
+it cannot parse or that has a setting it does not know.
+
+Every route is rate-limited per caller: anonymous callers by client
+address (IPv6 by /64), keyed callers at `keyed_rate_multiplier` times
+the limit. Over the limit is a 429 with `Retry-After`. Successful
+answers are cached for `cache_ttl_secs` and sent with a matching
+`Cache-Control`, so your proxy or CDN can reuse them too. At most
+`max_in_flight` lookups run at once (anonymous callers share half); a
+request that cannot get a slot within `request_timeout_secs` is a 503,
+and a lookup still running at that deadline is a 504.
 
 Configure it in `~/.seer/config.toml`:
 
 ```toml
 [server]
-bind = "127.0.0.1:8001"                  # put a TLS-terminating proxy in front
+bind = "127.0.0.1:8001"                  # the proxy forwards here
 public = false                           # true: anonymous callers get the routes above
 cors_origins = ["https://example.com"]   # browser origins allowed to read responses
+trusted_proxies = ["127.0.0.1"]          # whose X-Forwarded-For to believe (IPs or CIDR)
+keyed_rate_multiplier = 10               # keyed callers' limit, as a multiple (1-100)
+request_timeout_secs = 30                # one request's deadline (1-120)
+max_in_flight = 64                       # lookups at once (2-1024)
+cache_ttl_secs = 60                      # reuse successes this long; 0 = off (0-3600)
 ```
 
 ---

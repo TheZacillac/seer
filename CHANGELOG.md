@@ -114,13 +114,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `https://127.0.0.1/`), so they get the documented 400.
 
 ### Added
-- **seer-server (new, preview).** A Rust HTTP server (Axum) that serves the
+- **seer-server (new).** A Rust HTTP server (Axum) that serves the
   single-domain lookups as JSON with seer-api's paths and response shapes:
   lookup, WHOIS, RDAP, availability, TLD info, DNS, SSL and status. Callers
   are keyed (`SEER_API_KEY`) or, with `[server] public = true`, anonymous.
   Not shipped in the release archives; install with
-  `cargo install --path seer-server`. It has no rate limiting yet — do not
-  expose it publicly.
+  `cargo install --path seer-server`.
+- **seer-server protection.** Per-route rate limits (seer-api's numbers;
+  anonymous callers by client address, keyed callers at a multiple), a
+  response cache with matching `Cache-Control`, a cap on lookups in flight
+  with half reserved from anonymous callers, and a per-request deadline.
+  Client addresses come from `X-Forwarded-For` only behind a listed
+  `trusted_proxies` entry. New `[server]` keys: `trusted_proxies`,
+  `keyed_rate_multiplier`, `request_timeout_secs`, `max_in_flight`,
+  `cache_ttl_secs`.
+- `SeerConfig::load_strict()` (Rust): a config load that fails on an
+  unreadable or malformed file or an unknown setting. seer-server uses it.
 - `[server]` section in `~/.seer/config.toml`: `bind`, `public`,
   `cors_origins`.
 - `seer.normalize_host(host)` (Python): seer-core's probe-target
@@ -130,6 +139,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`CostClass`, length limits, `clean_message`).
 
 ### Changed
+- **seer-server** refuses to start on a config file it cannot read or
+  parse, or that names a setting it does not know (it used to fall back to
+  defaults with a warning).
 - **seer-api.** The TLD token rule now comes from seer-core
   (`contract::is_tld_token`) and is ASCII-only, as its error message says;
   two non-ASCII letters Python's case-insensitive match used to let through
