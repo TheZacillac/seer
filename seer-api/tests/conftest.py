@@ -132,6 +132,45 @@ def _install_seer_stub() -> None:
         "ConfigError",
     ):
         setattr(stub, name, type(name, (SeerError,), {}))
+
+    # seer-core's shared contract. Called at import time by seer_api._core,
+    # so these return real values. They mirror seer-core's `ErrorCategory`
+    # and `contract` module; with the compiled bindings installed (as in CI)
+    # the real ones are used instead.
+    def _stub_error_status_table():
+        return [
+            (ValueError, 400),
+            (TimeoutError, 504),
+            (ConnectionError, 502),
+            (stub.RateLimitedError, 429),
+            (stub.WhoisServerNotFoundError, 404),
+            (stub.DnsError, 502),
+            (stub.UpstreamError, 502),
+            (stub.LookupFailedError, 502),
+            (stub.ParseError, 502),
+            (stub.TlsError, 502),
+            (stub.ConfigError, 500),
+            (stub.SeerError, 500),
+        ]
+
+    def _stub_contract():
+        return {
+            "domain_max_length": 253,
+            "nameserver_max_length": 512,
+            "record_type_max_length": 10,
+            "record_type_pattern": "^[A-Z0-9]+$",
+            "message_max_length": 200,
+            "rate_limits": {"light": 60, "standard": 30, "moderate": 20, "heavy": 5},
+        }
+
+    def _stub_clean_message(msg):
+        import re
+
+        return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", msg)[:200]
+
+    stub.error_status_table = _stub_error_status_table
+    stub.contract = _stub_contract
+    stub.clean_message = _stub_clean_message
     sys.modules["seer"] = stub
 
 

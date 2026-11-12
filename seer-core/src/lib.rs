@@ -22,6 +22,7 @@ pub mod cache;
 pub mod colors;
 pub mod config;
 pub mod confusables;
+pub mod contract;
 mod dates;
 pub mod diff;
 pub mod dkim;
@@ -68,7 +69,7 @@ pub use audit::{AuditOptions, AuditReport, Auditor};
 pub use availability::{AvailabilityChecker, AvailabilityResult};
 pub use cache::TtlCache;
 pub use config::SeerConfig;
-pub use error::{Result, SeerError};
+pub use error::{ErrorCategory, Result, SeerError};
 pub use retry::{is_retryable, RetryExecutor, RetryPolicy};
 pub use validation::normalize_domain;
 

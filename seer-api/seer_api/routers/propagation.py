@@ -5,6 +5,7 @@ from fastapi import APIRouter, Path, Request
 import seer
 from seer_api._contract import (
     HEAVY_LIMIT,
+    MODERATE_LIMIT,
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
     BulkPropagationRequest,
@@ -19,7 +20,7 @@ router = APIRouter()
 
 
 @router.get("/{domain}/{record_type}")
-@limiter.limit("20/minute")
+@limiter.limit(MODERATE_LIMIT)
 async def propagation_check(
     request: Request,
     domain: Domain,

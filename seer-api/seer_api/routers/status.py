@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Request
 
 import seer
-from seer_api._contract import HEAVY_LIMIT, BulkRequest, Domain
+from seer_api._contract import HEAVY_LIMIT, MODERATE_LIMIT, BulkRequest, Domain
 from seer_api._run import run_bulk, run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
@@ -14,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/{domain}")
-@limiter.limit("20/minute")
+@limiter.limit(MODERATE_LIMIT)
 async def check_status(request: Request, domain: Domain):
     """
     Check the status of a domain.

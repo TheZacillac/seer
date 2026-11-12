@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Request
 
 import seer
-from seer_api._contract import HEAVY_LIMIT, BulkRequest, Domain
+from seer_api._contract import HEAVY_LIMIT, STANDARD_LIMIT, BulkRequest, Domain
 from seer_api._run import run_bulk, run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
@@ -14,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/{domain}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def ssl_inspect(request: Request, domain: Domain):
     """Inspect the SSL/TLS certificate chain for a single domain.
 

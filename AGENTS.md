@@ -41,7 +41,7 @@ in `seer-core`. The other three parse input, call core and present results.
 | Probes | `ssl.rs` + `tls.rs` (inspection-only rustls), `status/`, `headers.rs`, `http.rs` (SSRF-guarded GET), `posture.rs` (SPF/DMARC/MTA-STS/BIMI/DANE), `caa.rs`, `takeover.rs`, `subdomains/` (CT logs), `confusables.rs` |
 | Assessment | `audit/` (finding model, scorer, `CHECKS` adapters), `grade.rs` (letter scale), `dkim.rs`, `security_txt.rs`, `https_upgrade.rs` |
 | Safety | `net.rs` (SSRF guards, `ipv4_first`, `connect_any`, `client_builder`), `validation.rs` (normalization), `psl.rs` |
-| Infra | `error.rs`, `config.rs`, `retry.rs`, `cache.rs`, `bulk/`, `logging.rs`, `fsutil.rs` (`~/.seer` stores), `doctor.rs`, `webhook.rs` |
+| Infra | `error.rs` (`SeerError`, `ErrorCategory`), `contract.rs` (shared limits and cost classes), `config.rs`, `retry.rs`, `cache.rs`, `bulk/`, `logging.rs`, `fsutil.rs` (`~/.seer` stores), `doctor.rs`, `webhook.rs` |
 | CLI-only | `output/` (formatters), `colors.rs`, `history.rs`, `watchlist.rs`, `drift.rs`, `diff.rs` |
 
 ### seer-cli/src
@@ -67,8 +67,8 @@ in `seer-core`. The other three parse input, call core and present results.
   also goes in the `#[pymodule_export]` list and in
   `python/seer/__init__.py` + `__all__`.
 - `seer-api/seer_api/` — `main.py` (auth, middleware, startup checks),
-  `_run.py` (`run_seer` dispatch + deadline, the shared bulk-job cap), `errors.py` (exception →
-  status, `clean_message`), `ssrf.py`, `routers/`, `mcp/server.py` (the
+  `_run.py` (`run_seer` dispatch + deadline, the shared bulk-job cap), `_core.py` (seer-core's contract, loaded once),
+  `errors.py` (exception → status), `ssrf.py`, `routers/`, `mcp/server.py` (the
   `_TOOLS` registry).
 
 ---
@@ -228,7 +228,9 @@ step). The tables:
 | TUI lenses | `LENSES` |
 | TUI lens options | `options.rs` consts on each `LENSES` row |
 | MCP tools | `_TOOLS` in `seer-api/seer_api/mcp/server.py` |
-| Bulk / API limits | `seer-api/seer_api/_contract.py` |
+| Error categories / HTTP statuses | `error::ErrorCategory` (Python: `seer.error_status_table()`) |
+| Input limits / rate-limit classes | `seer_core::contract` (Python: `seer.contract()`, via `seer-api/seer_api/_core.py`) |
+| Bulk limits | `seer-api/seer_api/_contract.py` |
 
 ### Code
 
@@ -291,7 +293,9 @@ step). The tables:
   the `memory://` rate-limit store. Every REST route declares its own rate
   limit. `test_declared_dependencies.py` fails on any undeclared import.
 - **seer-py errors** map to typed `seer.SeerError` subclasses; seer-api maps
-  statuses from those classes — never by matching message text.
+  statuses from those classes — never by matching message text. The class
+  comes from `SeerError::category()` through the `category_exceptions!`
+  table in `seer-py/src/lib.rs`.
 - Env vars are documented in one place: README → Configuration →
   Environment Variables. Add new ones there.
 

@@ -112,8 +112,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `seer.normalize_host(host)` (Python): seer-core's probe-target
   normalization, or `None` for invalid input.
+- **seer-core.** `SeerError::category()` and `SeerError::root_cause()`,
+  `ErrorCategory` with `http_status()`, and the `contract` module
+  (`CostClass`, length limits, `clean_message`).
 
 ### Changed
+- **Shared contract.** Error classification, HTTP status codes, input limits
+  and rate-limit classes now live in seer-core (`ErrorCategory`, the
+  `contract` module) and are read by the Python bindings and seer-api
+  instead of being defined again there. Behaviour is unchanged. New
+  bindings: `seer.error_status_table()`, `seer.contract()`,
+  `seer.clean_message()`. seer-api needs bindings from this release or
+  later; with older ones it refuses to start and says to rebuild them.
 - `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
   silently ignored); use `--format json`.
 - TUI: a `:` command with extra arguments (`:prop example.com MX`,
