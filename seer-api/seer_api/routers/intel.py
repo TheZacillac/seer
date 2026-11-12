@@ -18,7 +18,16 @@ targets.)
 from fastapi import APIRouter, Query, Request
 
 import seer
-from seer_api._contract import BULK_LIMIT, HEAVY_LIMIT, MAX_CONCURRENCY, BulkRequest, Domain
+from seer_api._contract import (
+    BULK_LIMIT,
+    HEAVY_LIMIT,
+    LIGHT_LIMIT,
+    MAX_CONCURRENCY,
+    MODERATE_LIMIT,
+    STANDARD_LIMIT,
+    BulkRequest,
+    Domain,
+)
 from seer_api._run import run_bulk, run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
@@ -29,7 +38,7 @@ availability_router = APIRouter()
 
 
 @availability_router.get("/{domain}")
-@limiter.limit("60/minute")
+@limiter.limit(LIGHT_LIMIT)
 async def availability(request: Request, domain: Domain):
     """Check whether a domain appears to be available for registration."""
     return await as_http(run_seer(seer.availability, domain), "Availability check failed")
@@ -51,7 +60,7 @@ info_router = APIRouter()
 
 
 @info_router.get("/{domain}")
-@limiter.limit("60/minute")
+@limiter.limit(LIGHT_LIMIT)
 async def info(request: Request, domain: Domain):
     """Merged RDAP + WHOIS domain info as flat fields."""
     return await as_http(run_seer(seer.info, domain), "Info lookup failed")
@@ -104,7 +113,7 @@ dnssec_router = APIRouter()
 
 
 @dnssec_router.get("/{domain}")
-@limiter.limit("60/minute")
+@limiter.limit(LIGHT_LIMIT)
 async def dnssec(request: Request, domain: Domain):
     """DNSSEC validation report (DS/DNSKEY digest consistency)."""
     return await as_http(run_seer(seer.dnssec, domain), "DNSSEC check failed")
@@ -118,7 +127,7 @@ delegation_router = APIRouter()
 @delegation_router.get("/{domain}")
 # 30/minute (matching /posture, not /dnssec's 60): each check fans out to
 # parent-zone NS queries plus a lameness probe per delegated nameserver.
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def delegation(request: Request, domain: Domain):
     """NS delegation health: parent delegation vs zone NS RRset, plus a
     lameness probe of each delegated nameserver."""
@@ -131,7 +140,7 @@ diff_router = APIRouter()
 
 
 @diff_router.get("/{domain_a}/{domain_b}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def diff(
     request: Request,
     domain_a: Domain,
@@ -147,7 +156,7 @@ caa_router = APIRouter()
 
 
 @caa_router.get("/{domain}")
-@limiter.limit("60/minute")
+@limiter.limit(LIGHT_LIMIT)
 async def caa(request: Request, domain: Domain):
     """CAA (Certification Authority Authorization) policy, incl. iodef and
     wildcard-vs-base consistency analysis."""
@@ -160,7 +169,7 @@ posture_router = APIRouter()
 
 
 @posture_router.get("/{domain}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def posture(request: Request, domain: Domain):
     """Email/DNS security posture (SPF, DMARC, MTA-STS, BIMI, DANE)."""
     return await as_http(run_seer(seer.posture, domain), "Posture check failed")
@@ -172,7 +181,7 @@ headers_router = APIRouter()
 
 
 @headers_router.get("/{domain}")
-@limiter.limit("20/minute")
+@limiter.limit(MODERATE_LIMIT)
 async def headers(request: Request, domain: Domain):
     """Audit HTTP security headers, cookie flags, and version disclosure.
 

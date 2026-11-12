@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Path, Request
 
 import seer
-from seer_api._contract import Domain
+from seer_api._contract import STANDARD_LIMIT, Domain
 from seer_api._run import run_seer
 from seer_api.errors import as_http
 from seer_api.limiting import limiter
@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.get("/domain/{domain}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def rdap_domain_lookup(request: Request, domain: Domain):
     """
     Look up RDAP information for a domain.
@@ -28,7 +28,7 @@ async def rdap_domain_lookup(request: Request, domain: Domain):
 
 
 @router.get("/ip/{ip}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def rdap_ip_lookup(
     request: Request,
     ip: str = Path(..., min_length=1, max_length=45),
@@ -47,7 +47,7 @@ async def rdap_ip_lookup(
 
 
 @router.get("/asn/{asn}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def rdap_asn_lookup(
     request: Request,
     asn: int = Path(..., ge=0, le=4_294_967_295),

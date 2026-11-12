@@ -4,7 +4,7 @@ Three responsibilities:
 
 1. ``clean_message(msg)`` — the one sanitizer for error text put on the wire
    (REST bodies, SSE events, MCP tool results): control/ANSI bytes stripped,
-   length capped.
+   length capped. It is seer-core's (``_core.py``), re-exported here.
 
 2. ``safe_error_message(exc, fallback)`` — a client-safe message for an
    exception, chosen by exception *type* (never by sniffing message text).
@@ -13,6 +13,9 @@ Three responsibilities:
    exception and pick the HTTP status code: invalid input 400, a rate-limited
    upstream 429, an unsupported TLD 404, upstream failures 502, no free bulk slot 503, timeouts 504.
    Route handlers wrap their core call in ``as_http``, which applies it.
+   The statuses for the binding's exceptions are seer-core's table
+   (``_core.ERROR_STATUS_TABLE``); only seer-api's own exceptions are
+   listed here.
 
 The binding raises builtins for invalid input (``ValueError``), timeouts
 (``TimeoutError``) and WHOIS connect failures (``ConnectionError``), and a
@@ -22,7 +25,6 @@ The binding raises builtins for invalid input (``ValueError``), timeouts
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Awaitable
 from typing import TypeVar
 
@@ -30,20 +32,14 @@ from fastapi import HTTPException
 
 import seer
 
+from ._core import CONTRACT, ERROR_STATUS_TABLE, clean_message
+
 T = TypeVar("T")
 
 logger = logging.getLogger("seer_api")
 
-# Maximum characters of error text surfaced to a client. The Rust core's
-# ``sanitized_message`` is already conservative, but we cap the length here
-# as defense-in-depth against a hypothetical verbose error.
-_MAX_MESSAGE_LEN = 200
-
-# C0/C1 control characters (incl. CR/LF and the ESC that begins an ANSI
-# escape sequence). Mirrors the CR/LF stripping done for the correlation id
-# in middleware.py — a future verbose core error could carry ANSI colour
-# codes or an embedded NUL that must never land in a REST body or SSE event.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Maximum characters of error text surfaced to a client (seer-core's cap).
+_MAX_MESSAGE_LEN: int = CONTRACT["message_max_length"]
 
 
 class ServiceUnavailable(Exception):
@@ -61,31 +57,14 @@ class ServerBusy(Exception):
     """
 
 
-def clean_message(msg: str) -> str:
-    """Strip control/ANSI bytes from ``msg``, then cap its length.
-
-    Stripping happens *before* the length cap so that a message padded with
-    control bytes cannot push its visible content past the cap.
-    """
-    return _CONTROL_CHARS_RE.sub("", msg)[:_MAX_MESSAGE_LEN]
-
-
 # (exception type, HTTP status) in match order: the first isinstance wins.
-# The builtins come first; a `seer.SeerError` subclass not listed (the base
-# itself: an uncategorized core failure, or a config error) is a 500.
+# seer-api's own exceptions, then seer-core's table for everything the
+# binding raises (builtins first, `seer.SeerError` — an uncategorized core
+# failure — last). Anything matching no row is a 500.
 _STATUS_BY_TYPE: tuple[tuple[type[BaseException], int], ...] = (
-    (ValueError, 400),
-    (TimeoutError, 504),
-    (ConnectionError, 502),
     (ServiceUnavailable, 503),
     (ServerBusy, 503),
-    (seer.RateLimitedError, 429),
-    (seer.WhoisServerNotFoundError, 404),
-    (seer.DnsError, 502),
-    (seer.UpstreamError, 502),
-    (seer.LookupFailedError, 502),
-    (seer.ParseError, 502),
-    (seer.TlsError, 502),
+    *ERROR_STATUS_TABLE,
 )
 
 

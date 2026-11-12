@@ -6,9 +6,11 @@ import seer
 from seer_api._contract import (
     BULK_LIMIT,
     HEAVY_LIMIT,
+    LIGHT_LIMIT,
     NAMESERVER_MAX_LENGTH,
     RECORD_TYPE_MAX_LENGTH,
     RECORD_TYPE_PATTERN,
+    STANDARD_LIMIT,
     BulkRecordRequest,
     Domain,
 )
@@ -55,7 +57,7 @@ async def dns_trace(
 
 
 @router.get("/compare/{domain}")
-@limiter.limit("30/minute")
+@limiter.limit(STANDARD_LIMIT)
 async def dns_compare(
     request: Request,
     domain: Domain,
@@ -80,7 +82,7 @@ async def dns_compare(
 
 
 @router.get("/{domain}/{record_type}")
-@limiter.limit("60/minute")
+@limiter.limit(LIGHT_LIMIT)
 async def dns_lookup(
     request: Request,
     domain: Domain,
