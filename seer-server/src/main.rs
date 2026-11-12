@@ -11,7 +11,15 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> ExitCode {
     init_logging();
-    let config = SeerConfig::load();
+    // Strict: a config file with a typo stops the server instead of
+    // silently starting it on defaults.
+    let config = match SeerConfig::load_strict() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("seer-server: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let settings = match Settings::new(&config.server, std::env::var("SEER_API_KEY").ok()) {
         Ok(settings) => settings,
         Err(error) => {

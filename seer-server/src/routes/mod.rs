@@ -2,32 +2,43 @@
 //!
 //! [`routes`] is the single list of paths, tiers and handlers; the router,
 //! the tier gate and the tests all read it. Handlers live in the sibling
-//! modules by area and all have the same shape: edge checks, one seer-core
-//! call, the result as JSON. Paths and JSON match seer-api's.
+//! modules by area and all have the same shape: edge checks, then one
+//! seer-core call handed to `Call::respond`, which caches, bounds and times
+//! it. Paths and JSON match seer-api's.
 
 mod dns;
 mod probes;
 mod registration;
 
 use axum::routing::get;
+use seer_core::contract::CostClass::{Light, Moderate, Standard};
 
 use crate::app::Route;
 
-/// Every route the server exposes. The keyed-only operations (audit,
+/// Every route the server exposes. Each cost class is the one whose limit
+/// seer-api declares on the same route. The keyed-only operations (audit,
 /// trace, propagation and the rest) join this table in the next release.
 pub fn routes() -> Vec<Route> {
     vec![
-        Route::public("/lookup/{domain}", get(registration::lookup)),
-        Route::public("/whois/{domain}", get(registration::whois)),
-        Route::public("/rdap/domain/{domain}", get(registration::rdap_domain)),
-        Route::public("/rdap/ip/{ip}", get(registration::rdap_ip)),
-        Route::public("/rdap/asn/{asn}", get(registration::rdap_asn)),
-        Route::public("/availability/{domain}", get(registration::availability)),
-        Route::public("/tld/", get(registration::tld_list)),
-        Route::public("/tld/{tld}", get(registration::tld_info)),
-        Route::public("/dns/{domain}/{record_type}", get(dns::dig)),
-        Route::public("/ssl/{domain}", get(probes::ssl)),
-        Route::public("/status/{domain}", get(probes::status)),
+        Route::public("/lookup/{domain}", Standard, get(registration::lookup)),
+        Route::public("/whois/{domain}", Standard, get(registration::whois)),
+        Route::public(
+            "/rdap/domain/{domain}",
+            Standard,
+            get(registration::rdap_domain),
+        ),
+        Route::public("/rdap/ip/{ip}", Standard, get(registration::rdap_ip)),
+        Route::public("/rdap/asn/{asn}", Standard, get(registration::rdap_asn)),
+        Route::public(
+            "/availability/{domain}",
+            Light,
+            get(registration::availability),
+        ),
+        Route::public("/tld/", Standard, get(registration::tld_list)),
+        Route::public("/tld/{tld}", Light, get(registration::tld_info)),
+        Route::public("/dns/{domain}/{record_type}", Light, get(dns::dig)),
+        Route::public("/ssl/{domain}", Standard, get(probes::ssl)),
+        Route::public("/status/{domain}", Moderate, get(probes::status)),
     ]
 }
 
@@ -78,6 +89,20 @@ mod tests {
                 ("/status/{domain}", Tier::Public),
             ]
         );
+    }
+
+    #[test]
+    fn the_whole_table_is_snapshotted() {
+        // Path, tier and cost class of every route: any change to what the
+        // server exposes, or how it is limited, shows up in review.
+        let table: String = routes()
+            .iter()
+            .map(|r| {
+                let tier = format!("{:?}", r.tier);
+                format!("{:<32} {tier:<7} {}\n", r.path, r.cost.name())
+            })
+            .collect();
+        insta::assert_snapshot!(table);
     }
 
     #[test]
@@ -191,6 +216,54 @@ mod tests {
             assert_eq!(
                 reply.json["detail"],
                 "asn must be a number between 0 and 4294967295"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tld_list_is_cached_for_browsers_and_proxies() {
+        let reply = get(&app(), "/tld/").await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.headers["cache-control"], "max-age=60");
+        assert_eq!(reply.headers["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_name_is_a_400_before_the_cache_or_a_slot() {
+        // Normalization for the cache key rejects these with core's own
+        // message; nothing is looked up.
+        for path in ["/lookup/not_a_domain", "/ssl/bad..host", "/whois/-x-.com"] {
+            let reply = get(&app(), path).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(reply.headers["cache-control"], "no-store", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_every_route_answers_and_repeats_from_the_cache() {
+        let app = app();
+        for path in [
+            "/lookup/example.com",
+            "/whois/example.com",
+            "/rdap/domain/example.com",
+            "/rdap/ip/1.1.1.1",
+            "/rdap/asn/13335",
+            "/availability/example.com",
+            "/tld/",
+            "/tld/com",
+            "/dns/example.com/A",
+            "/ssl/example.com",
+            "/status/example.com",
+        ] {
+            let first = get(&app, path).await;
+            assert_eq!(first.status, StatusCode::OK, "{path}: {}", first.json);
+            let started = std::time::Instant::now();
+            let second = get(&app, path).await;
+            assert_eq!(second.json, first.json, "{path}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(50),
+                "{path} was not served from the cache"
             );
         }
     }

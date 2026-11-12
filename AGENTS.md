@@ -78,13 +78,20 @@ in `seer-core`. The other four parse input, call core and present results.
 - `lib.rs` — `serve` / `serve_on` (graceful shutdown).
 - `settings.rs` — `Settings::new` validates `[server]` + `SEER_API_KEY`;
   a `StartupError` stops the server before it binds.
-- `routes/` — `routes()` is the **one** route table (path, tier,
-  handler); handlers are edge checks → one core call → `Json`.
-- `app.rs` — builds the router: the tier gate (reads the matched route's
-  tier from the table), panic capture, `nosniff`, CORS, request log.
+- `routes/` — `routes()` is the **one** route table (path, tier, cost
+  class, handler); handlers are edge checks → one core call handed to
+  `Call::respond`.
+- `app.rs` — builds the router: the gate (tier, then rate limit, both
+  read from the table), panic capture, `nosniff`, CORS, request log.
+- `call.rs` — `Call::respond`: cache lookup → permit → core call, the
+  last two under one deadline. `respond_fresh` skips the cache.
+- `limit.rs` (GCRA limits per route and caller), `client_ip.rs` (the
+  trusted-proxy rule), `cache.rs` (response bodies in a `TtlCache`, capped per body),
+  `state.rs` (the shared core clients, `Permits`, `PerClient`,
+  `AppState::new`).
 - `tier.rs` (anonymous vs keyed), `edge.rs` (edge checks, JSON-rejecting
   extractors), `error.rs` (`ApiError`: status from
-  `ErrorCategory::http_status()`), `state.rs` (the shared core clients).
+  `ErrorCategory::http_status()`, `Retry-After` on 429/503).
 
 ---
 
@@ -159,6 +166,9 @@ informational coverage. Python test failures block merges like Rust ones.
   - Bulk CSV: `csv_golden` in `seer-cli/src/utils.rs` (byte-exact).
   - MCP `tools/list`: `cd seer-api && python -m tests.test_mcp_tool_snapshot`.
   - CLI exit codes: the table test beside `exit_code` (a scripting contract).
+  - seer-server route table: `the_whole_table_is_snapshotted` in
+    `seer-server/src/routes/mod.rs` (`insta`). Re-run with
+    `INSTA_UPDATE=always`, then read the `.snap`.
 - seer-api tests run against a `seer` stub when the extension isn't built
   (`tests/conftest.py`). pytest ≥ 9.1.1 with **no pytest-asyncio**: an async
   test without a plugin fails rather than skips.
@@ -321,6 +331,17 @@ step). The tables:
   panicking request end the process, where `[profile.release]` lets
   `CatchPanicLayer` turn it into a 500. Install with
   `cargo install --path seer-server`.
+- **seer-server loads its config strictly** (`SeerConfig::load_strict`):
+  an unreadable, malformed or misspelled `~/.seer/config.toml` stops it.
+  The CLI keeps the tolerant `load()`.
+- **seer-server's rate-limit identity** is the socket peer unless that
+  peer is in `[server] trusted_proxies`; only then is `X-Forwarded-For`
+  read, right to left. IPv6 callers are counted by /64, and every
+  address is compared in canonical form (`::ffff:a.b.c.d` is `a.b.c.d`).
+  Any address inside a trusted range can choose its own identity, so
+  `trusted_proxies` lists proxies, never client networks. A handler must
+  go through `Call::respond` / `respond_fresh` — returning `Json`
+  directly skips the cache, the permits and the deadline.
 - **seer-server mirrors seer-api's paths and JSON, not its edge:**
   validation failures are 400 (FastAPI: 422), and there is no server-side
   Origin/Host refusal — the tier gate and CORS are the controls. A wrong

@@ -1,79 +1,84 @@
 //! Builds the router: the route table, the tier gate and the layers every
 //! response passes through.
 //!
-//! Layers, innermost first: the gate (who may call this route), panic
+//! Layers, innermost first: the gate (who may call this route, and how
+//! often), panic
 //! capture (a panicking handler is a 500, not a dropped connection),
 //! `nosniff`, CORS, and the request log, which also stamps `X-Request-Id`.
 //! `/health` sits outside the gate.
 
 use std::any::Any;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{MatchedPath, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{self, MethodRouter};
 use axum::{Json, Router};
+use seer_core::contract::CostClass;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::Instrument;
 
+use crate::client_ip::{client_ip, forwarded_for, ClientAddr};
 use crate::error::ApiError;
+use crate::limit::{self, Subject};
 use crate::settings::{CorsOrigins, Settings};
 use crate::state::{AppState, Clients};
-use crate::tier::{self, Tier};
+use crate::tier::{self, Caller, Tier};
 
 /// The response header carrying the id that also tags the request's log
 /// lines.
 const X_REQUEST_ID: &str = "x-request-id";
 
-/// One row of the route table: a path, who may call it, and its handler.
+/// One row of the route table: a path, who may call it, what it costs,
+/// and its handler.
 pub struct Route {
     /// The path pattern, as Axum spells it (`/lookup/{domain}`).
     pub path: &'static str,
     /// Who may call it.
     pub tier: Tier,
+    /// How expensive it is to serve, which sets its rate limit.
+    pub cost: CostClass,
     /// The handler, already wrapped in its HTTP method.
     pub handler: MethodRouter<AppState>,
 }
 
 impl Route {
     /// A route anonymous callers may use when the server is public.
-    pub fn public(path: &'static str, handler: MethodRouter<AppState>) -> Self {
+    pub fn public(path: &'static str, cost: CostClass, handler: MethodRouter<AppState>) -> Self {
         Self {
             path,
             tier: Tier::Public,
+            cost,
             handler,
         }
     }
 
     /// A route only keyed callers may use.
-    pub fn keyed(path: &'static str, handler: MethodRouter<AppState>) -> Self {
+    pub fn keyed(path: &'static str, cost: CostClass, handler: MethodRouter<AppState>) -> Self {
         Self {
             path,
             tier: Tier::Keyed,
+            cost,
             handler,
         }
     }
 }
 
-/// Builds the application: every route in `routes` behind the tier gate,
-/// plus `/health`, the JSON 404 and the response layers.
+/// Builds the application: every route in `routes` behind the gate, plus
+/// `/health`, the JSON 404 and the response layers.
 pub fn router(settings: Settings, clients: Clients, routes: Vec<Route>) -> Router {
-    let state = AppState {
-        tiers: Arc::new(
-            routes
-                .iter()
-                .map(|route| (route.path, route.tier))
-                .collect(),
-        ),
-        settings: Arc::new(settings),
-        clients: Arc::new(clients),
-    };
+    assemble(AppState::new(settings, clients, &routes), routes)
+}
+
+/// [`router`] over state that already exists (it must have been built from
+/// the same `routes`).
+pub fn assemble(state: AppState, routes: Vec<Route>) -> Router {
     let mut app = Router::new();
     for route in routes {
         app = app.route(route.path, route.handler);
@@ -96,18 +101,19 @@ pub fn router(settings: Settings, clients: Clients, routes: Vec<Route>) -> Route
         .with_state(state)
 }
 
-/// Refuses a request its caller's tier may not make; otherwise records the
-/// caller for the handler.
+/// Refuses a request its caller's tier may not make or that is over the
+/// route's rate limit; otherwise records the caller for the handler.
 async fn gate(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     // A matched route missing from the table is a bug here: fail closed.
-    let tier = request
+    let (route, meta) = request
         .extensions()
         .get::<MatchedPath>()
-        .and_then(|path| state.tiers.get(path.as_str()).copied())
+        .and_then(|path| state.rows.get_key_value(path.as_str()))
+        .map(|(route, meta)| (*route, *meta))
         .ok_or_else(ApiError::internal)?;
     // A header that is not valid UTF-8 is present but wrong, never absent.
     // So is a repeated one: a proxy in front could honour a different copy
@@ -119,7 +125,37 @@ async fn gate(
         (Some(_), Some(_)) => Some(""),
     };
     let caller = tier::identify(authorization, state.settings.api_key.as_deref())?;
-    tier::authorize(caller, tier, state.settings.public)?;
+    tier::authorize(caller, meta.tier, state.settings.public)?;
+
+    // Rate limit after the tier check: a refused caller gets the 401, and
+    // only requests that would otherwise be served are counted.
+    let subject = match caller {
+        Caller::Keyed => Subject::Keyed,
+        Caller::Anonymous => {
+            // Without the socket peer there is no identity to limit by.
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip())
+                .ok_or_else(ApiError::internal)?;
+            Subject::Anonymous(client_ip(
+                peer,
+                &forwarded_for(request.headers()),
+                &state.settings.trusted_proxies,
+            ))
+        }
+    };
+    state
+        .limits
+        .check(route, meta.cost, subject)
+        .map_err(ApiError::rate_limited)?;
+
+    if let Subject::Anonymous(ip) = subject {
+        // The identity this client is limited under, for `Call`.
+        request
+            .extensions_mut()
+            .insert(ClientAddr(limit::bucket(ip)));
+    }
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
 }
@@ -199,13 +235,17 @@ fn panic_response(_: Box<dyn Any + Send + 'static>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{get, get_with_key, send};
+    use crate::call::Call;
+    use crate::edge::PathParams;
+    use crate::test_support::{get, get_with_key, send, send_from};
     use crate::tier::Caller;
     use axum::http::{header, Method, StatusCode};
     use axum::Extension;
     use seer_core::config::ServerConfig;
     use seer_core::{SeerConfig, SeerError};
     use serde_json::{json, Value};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     async fn echo(Extension(caller): Extension<Caller>) -> Json<Value> {
         Json(json!({ "caller": format!("{caller:?}") }))
@@ -219,24 +259,229 @@ mod tests {
         panic!("handler bug")
     }
 
+    /// Counts how often the "lookup" behind `/count/{name}` really ran.
+    static COUNTED: AtomicUsize = AtomicUsize::new(0);
+
+    async fn count(call: Call, PathParams(name): PathParams<String>) -> Result<Response, ApiError> {
+        call.respond(&[&name], async {
+            let run = COUNTED.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok::<_, SeerError>(json!({ "name": name, "run": run }))
+        })
+        .await
+    }
+
+    async fn fresh(call: Call) -> Result<Response, ApiError> {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        call.respond_fresh(async {
+            Ok::<_, SeerError>(json!({ "run": RUNS.fetch_add(1, Ordering::SeqCst) + 1 }))
+        })
+        .await
+    }
+
+    async fn flaky(call: Call, PathParams(name): PathParams<String>) -> Result<Response, ApiError> {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        call.respond(&[&name], async {
+            // Fails the first time, succeeds afterwards.
+            if RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(SeerError::DnsError("resolver down".into()))
+            } else {
+                Ok(json!({ "ok": true }))
+            }
+        })
+        .await
+    }
+
+    async fn hang(call: Call) -> Result<Response, ApiError> {
+        call.respond_fresh(async {
+            std::future::pending::<()>().await;
+            Ok::<_, SeerError>(json!(null))
+        })
+        .await
+    }
+
+    /// A public stub server whose key is `k`, and its state.
+    fn app_and_state(adjust: impl FnOnce(&mut Settings)) -> (Router, AppState) {
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        adjust(&mut settings);
+        let routes = stub_routes();
+        let clients = Clients::from_config(&SeerConfig::default());
+        let state = AppState::new(settings, clients, &routes);
+        (assemble(state.clone(), routes), state)
+    }
+
     fn stub_routes() -> Vec<Route> {
         vec![
-            Route::public("/open/{name}", routing::get(echo)),
-            Route::keyed("/locked/{name}", routing::get(echo)),
-            Route::public("/fail", routing::get(fail)),
-            Route::public("/boom", routing::get(boom)),
+            Route::public("/open/{name}", CostClass::Light, routing::get(echo)),
+            Route::keyed("/locked/{name}", CostClass::Light, routing::get(echo)),
+            Route::public("/fail", CostClass::Light, routing::get(fail)),
+            Route::public("/boom", CostClass::Light, routing::get(boom)),
+            Route::public("/heavy/{name}", CostClass::Heavy, routing::get(echo)),
+            Route::public("/count/{name}", CostClass::Light, routing::get(count)),
+            Route::public("/fresh", CostClass::Light, routing::get(fresh)),
+            Route::public("/flaky/{name}", CostClass::Light, routing::get(flaky)),
+            Route::public("/hang", CostClass::Light, routing::get(hang)),
         ]
     }
 
     fn app(public: bool, key: Option<&str>, origins: &[&str]) -> Router {
+        app_with(public, key, origins, |_| {})
+    }
+
+    /// [`app`], with the settings adjusted before the router is built.
+    fn app_with(
+        public: bool,
+        key: Option<&str>,
+        origins: &[&str],
+        adjust: impl FnOnce(&mut Settings),
+    ) -> Router {
         let server = ServerConfig {
             bind: "127.0.0.1:0".to_string(),
             public,
             cors_origins: origins.iter().map(|s| s.to_string()).collect(),
+            ..ServerConfig::default()
         };
-        let settings = Settings::new(&server, key.map(str::to_string)).unwrap();
+        let mut settings = Settings::new(&server, key.map(str::to_string)).unwrap();
+        adjust(&mut settings);
         let clients = Clients::from_config(&SeerConfig::default());
         router(settings, clients, stub_routes())
+    }
+
+    /// Sends `GET uri` from `peer` until the first refusal; returns how
+    /// many were admitted and the refusal.
+    async fn until_refused(
+        app: &Router,
+        peer: &str,
+        uri: &str,
+        headers: &[(&str, &[u8])],
+    ) -> (u32, crate::test_support::Reply) {
+        let mut admitted = 0;
+        loop {
+            let reply = send_from(app, peer, Method::GET, uri, headers).await;
+            if reply.status != StatusCode::OK {
+                return (admitted, reply);
+            }
+            admitted += 1;
+            assert!(admitted < 10_000, "never refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_caller_is_limited_per_route_and_told_when_to_retry() {
+        let app = app(true, None, &[]);
+        let (admitted, refusal) = until_refused(&app, "198.51.100.1", "/heavy/x", &[]).await;
+        assert_eq!(admitted, CostClass::Heavy.per_minute());
+        assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refusal.json, json!({ "detail": "Rate limit exceeded" }));
+        let retry: u64 = refusal.headers[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "{retry}");
+        // Another caller, and another route for the same caller, are fine.
+        let other = send_from(&app, "198.51.100.2", Method::GET, "/heavy/x", &[]).await;
+        assert_eq!(other.status, StatusCode::OK);
+        let elsewhere = send_from(&app, "198.51.100.1", Method::GET, "/open/x", &[]).await;
+        assert_eq!(elsewhere.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_keyed_caller_gets_the_multiplied_limit_whatever_its_address() {
+        let app = app_with(true, Some("k"), &[], |s| s.keyed_rate_multiplier = 2);
+        let auth: &[(&str, &[u8])] = &[("authorization", b"Bearer k")];
+        let (admitted, refusal) = until_refused(&app, "198.51.100.1", "/heavy/x", auth).await;
+        assert_eq!(admitted, CostClass::Heavy.per_minute() * 2);
+        assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
+        // The key is the identity: a different address does not help.
+        let moved = send_from(&app, "198.51.100.99", Method::GET, "/heavy/x", auth).await;
+        assert_eq!(moved.status, StatusCode::TOO_MANY_REQUESTS);
+        // The anonymous tier has its own allowance.
+        let anonymous = send_from(&app, "198.51.100.1", Method::GET, "/heavy/x", &[]).await;
+        assert_eq!(anonymous.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_forged_forwarded_header_does_not_reset_the_limit() {
+        // No trusted proxy: the socket peer is the client, whatever it says.
+        let app = app(true, None, &[]);
+        let (admitted, _) = until_refused(&app, "198.51.100.1", "/heavy/x", &[]).await;
+        assert_eq!(admitted, CostClass::Heavy.per_minute());
+        let forged = send_from(
+            &app,
+            "198.51.100.1",
+            Method::GET,
+            "/heavy/x",
+            &[("x-forwarded-for", b"203.0.113.250")],
+        )
+        .await;
+        assert_eq!(forged.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn behind_a_trusted_proxy_each_visitor_has_their_own_limit() {
+        let app = app_with(true, None, &[], |s| {
+            s.trusted_proxies = vec!["10.0.0.1/32".parse().unwrap()];
+        });
+        let visitor_a: &[(&str, &[u8])] = &[("x-forwarded-for", b"6.6.6.6, 198.51.100.1")];
+        let visitor_b: &[(&str, &[u8])] = &[("x-forwarded-for", b"198.51.100.2")];
+        let (admitted, _) = until_refused(&app, "10.0.0.1", "/heavy/x", visitor_a).await;
+        assert_eq!(admitted, CostClass::Heavy.per_minute());
+        let b = send_from(&app, "10.0.0.1", Method::GET, "/heavy/x", visitor_b).await;
+        assert_eq!(
+            b.status,
+            StatusCode::OK,
+            "visitors must not share the proxy's bucket"
+        );
+        // Visitor A changing only the forged leftmost entry is still A.
+        let a_again = send_from(
+            &app,
+            "10.0.0.1",
+            Method::GET,
+            "/heavy/x",
+            &[("x-forwarded-for", b"7.7.7.7, 198.51.100.1")],
+        )
+        .await;
+        assert_eq!(a_again.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn ipv6_addresses_in_one_slash_64_share_a_limit() {
+        let app = app(true, None, &[]);
+        let (admitted, _) = until_refused(&app, "2001:db8:1:2::1", "/heavy/x", &[]).await;
+        assert_eq!(admitted, CostClass::Heavy.per_minute());
+        let neighbour = send_from(&app, "2001:db8:1:2:9::9", Method::GET, "/heavy/x", &[]).await;
+        assert_eq!(neighbour.status, StatusCode::TOO_MANY_REQUESTS);
+        let elsewhere = send_from(&app, "2001:db8:1:3::1", Method::GET, "/heavy/x", &[]).await;
+        assert_eq!(elsewhere.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn refused_auth_and_health_are_not_rate_limited_into_a_429() {
+        let app = app(false, Some("k"), &[]);
+        for _ in 0..(CostClass::Heavy.per_minute() + 5) {
+            // No key on a private server: always the 401, never a 429.
+            let reply = get(&app, "/heavy/x").await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        }
+        for _ in 0..200 {
+            assert_eq!(get(&app, "/health").await.status, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_peer_address_fails_closed() {
+        // Only possible if the server is ever served without connect info.
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .uri("/open/x")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app(true, None, &[]).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -455,5 +700,162 @@ mod tests {
             "https://site.example"
         );
         assert_eq!(reply.headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
+    }
+
+    #[tokio::test]
+    async fn a_success_is_served_from_the_cache_the_second_time() {
+        let (app, _) = app_and_state(|_| {});
+        let first = get(&app, "/count/cached-a").await;
+        let second = get(&app, "/count/cached-a").await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.json, second.json, "the lookup ran twice");
+        assert_eq!(first.headers[header::CACHE_CONTROL], "max-age=60");
+        assert_eq!(second.headers[header::CACHE_CONTROL], "max-age=60");
+        assert_eq!(second.headers[header::CONTENT_TYPE], "application/json");
+        // A different name is a different entry.
+        let other = get(&app, "/count/cached-b").await;
+        assert_ne!(other.json["run"], first.json["run"]);
+        assert_eq!(other.json["name"], "cached-b");
+    }
+
+    #[tokio::test]
+    async fn the_cache_is_shared_by_both_tiers_but_still_rate_limited() {
+        let (app, _) = app_and_state(|_| {});
+        let anonymous = get(&app, "/count/shared").await;
+        let keyed = get_with_key(&app, "/count/shared", "k").await;
+        assert_eq!(anonymous.json, keyed.json);
+        // Cached answers still count against the caller's allowance.
+        let (admitted, refusal) = until_refused(&app, "198.51.100.44", "/count/shared", &[]).await;
+        assert_eq!(admitted, CostClass::Light.per_minute());
+        assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_zero_ttl_runs_the_lookup_every_time_and_says_no_store() {
+        let (app, _) = app_and_state(|s| s.cache_ttl = Duration::ZERO);
+        let first = get(&app, "/count/uncached").await;
+        let second = get(&app, "/count/uncached").await;
+        assert_ne!(first.json["run"], second.json["run"]);
+        assert_eq!(second.headers[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn respond_fresh_never_caches() {
+        let (app, _) = app_and_state(|_| {});
+        let first = get(&app, "/fresh").await;
+        let second = get(&app, "/fresh").await;
+        assert_ne!(first.json["run"], second.json["run"]);
+        assert_eq!(second.headers[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn an_error_is_not_cached() {
+        let (app, _) = app_and_state(|_| {});
+        let failed = get(&app, "/flaky/x").await;
+        assert_eq!(failed.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(failed.headers[header::CACHE_CONTROL], "no-store");
+        // The failure did not stick: the next request runs and succeeds.
+        let recovered = get(&app, "/flaky/x").await;
+        assert_eq!(recovered.status, StatusCode::OK);
+        assert_eq!(recovered.json, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn a_call_past_its_deadline_is_a_504() {
+        let (app, _) = app_and_state(|s| s.request_timeout = Duration::from_millis(100));
+        let started = Instant::now();
+        let reply = get(&app, "/hang").await;
+        assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(reply.json, json!({ "detail": "Request timed out" }));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_call_returns_its_permits() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 2;
+        });
+        let before = state.permits.available();
+        for _ in 0..4 {
+            assert_eq!(get(&app, "/hang").await.status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        // Each timed-out call was dropped mid-flight; nothing stayed held.
+        assert_eq!(state.permits.available(), before);
+        assert_eq!(get(&app, "/fresh").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_free_slot_before_the_deadline_is_a_503_for_that_tier_only() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 2;
+        });
+        // Hold the one anonymous slot, as a lookup in flight would.
+        let held = state.permits.acquire(Caller::Anonymous).await.unwrap();
+        let anonymous = get(&app, "/fresh").await;
+        assert_eq!(anonymous.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            anonymous.json,
+            json!({ "detail": "Server busy; retry shortly" })
+        );
+        assert_eq!(anonymous.headers[header::RETRY_AFTER], "1");
+        // The keyed tier still has a slot.
+        assert_eq!(
+            get_with_key(&app, "/fresh", "k").await.status,
+            StatusCode::OK
+        );
+        drop(held);
+        assert_eq!(get(&app, "/fresh").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_needs_no_slot() {
+        let (app, state) = app_and_state(|s| s.max_in_flight = 2);
+        assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
+        let _a = state.permits.acquire(Caller::Keyed).await.unwrap();
+        let _b = state.permits.acquire(Caller::Keyed).await.unwrap();
+        // Every slot is taken, yet the cached answer is served at once.
+        assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn one_anonymous_client_cannot_hold_every_slot() {
+        let (app, state) = app_and_state(|s| s.max_in_flight_per_client = 1);
+        // The client already has its one lookup in flight.
+        let client: std::net::IpAddr = crate::test_support::PEER.parse().unwrap();
+        let held = state.per_client.enter(client).unwrap();
+        let refused = get(&app, "/fresh").await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers[header::RETRY_AFTER], "1");
+        // Other clients, keyed callers and cached answers are unaffected.
+        let other = send_from(&app, "198.51.100.9", Method::GET, "/fresh", &[]).await;
+        assert_eq!(other.status, StatusCode::OK);
+        assert_eq!(
+            get_with_key(&app, "/fresh", "k").await.status,
+            StatusCode::OK
+        );
+        drop(held);
+        assert_eq!(get(&app, "/fresh").await.status, StatusCode::OK);
+        assert_eq!(
+            state.per_client.clients(),
+            0,
+            "finished lookups are forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_call_frees_its_clients_slot() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight_per_client = 1;
+        });
+        for _ in 0..3 {
+            assert_eq!(get(&app, "/hang").await.status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        assert_eq!(state.per_client.clients(), 0);
     }
 }

@@ -102,6 +102,24 @@ pub struct ServerConfig {
     /// Origins whose pages may read responses from a browser (CORS), e.g.
     /// `"https://example.com"`. Empty by default; `"*"` allows any origin.
     pub cors_origins: Vec<String>,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as IP
+    /// addresses or CIDR ranges (`"127.0.0.1"`, `"10.0.0.0/8"`). Empty by
+    /// default: the socket peer is then the client, so behind a proxy every
+    /// visitor would share one rate-limit bucket.
+    pub trusted_proxies: Vec<String>,
+    /// How many times the anonymous rate limit a keyed caller gets.
+    pub keyed_rate_multiplier: u32,
+    /// Overall deadline for one request, in seconds: the wait for a free
+    /// slot plus the lookup itself.
+    pub request_timeout_secs: u64,
+    /// Lookups allowed to run at once. Anonymous callers share half of it.
+    pub max_in_flight: usize,
+    /// Lookups one anonymous client may have running at once, so a few
+    /// clients aiming at slow targets cannot hold every anonymous slot.
+    pub max_in_flight_per_client: u32,
+    /// How long a successful response is reused, in seconds; `0` disables
+    /// the response cache.
+    pub cache_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -110,6 +128,12 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:8001".to_string(),
             public: false,
             cors_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
+            keyed_rate_multiplier: 10,
+            request_timeout_secs: 30,
+            max_in_flight: 64,
+            max_in_flight_per_client: 4,
+            cache_ttl_secs: 60,
         }
     }
 }
@@ -183,6 +207,45 @@ impl SeerConfig {
                 Self::default()
             }
         }
+    }
+
+    /// Loads `~/.seer/config.toml` for a long-running service, refusing a
+    /// file [`load`](Self::load) would paper over. A missing file is the
+    /// defaults. A file that cannot be read, does not parse, or names a
+    /// setting seer does not know is an error: a server must not start on
+    /// defaults its operator did not choose because of a typo.
+    pub fn load_strict() -> crate::error::Result<Self> {
+        match Self::config_path() {
+            Some(path) => Self::load_strict_from(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// [`load_strict`](Self::load_strict) for a given path.
+    fn load_strict_from(path: &std::path::Path) -> crate::error::Result<Self> {
+        use crate::error::SeerError;
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(SeerError::ConfigError(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| SeerError::ConfigError(format!("{} is not valid: {e}", path.display())))?;
+        let unknown = Self::unknown_keys(&content);
+        if !unknown.is_empty() {
+            return Err(SeerError::ConfigError(format!(
+                "{} has unknown settings: {}",
+                path.display(),
+                unknown.join(", ")
+            )));
+        }
+        Ok(config.clamped())
     }
 
     /// Parses config file content, falling back to defaults on malformed
@@ -269,7 +332,9 @@ impl SeerConfig {
     /// concurrent connections. Timeouts of `0` would error every network call
     /// immediately. The bounds are per-protocol (a config file can't bypass
     /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
-    /// http and CT 1–120s; audit 10–300s.
+    /// http and CT 1–120s; audit 10–300s; server: key multiplier 1–100,
+    /// request timeout 1–120s, in-flight 2–1024 (1–64 per client), cache
+    /// TTL 0–3600s.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self.bulk.concurrency.clamp(1, 50);
         // A multi-day per-operation delay would stall bulk runs indefinitely;
@@ -281,6 +346,14 @@ impl SeerConfig {
         self.timeouts.http_secs = self.timeouts.http_secs.clamp(1, 120);
         self.timeouts.ct_secs = self.timeouts.ct_secs.clamp(1, MAX_CT_SECS);
         self.timeouts.audit_secs = self.timeouts.audit_secs.clamp(10, 300);
+        // seer-server: a multiplier of 0 would refuse every keyed request,
+        // a timeout of 0 every request, and fewer than 2 slots would leave
+        // anonymous callers none. `cache_ttl_secs = 0` is valid (cache off).
+        self.server.keyed_rate_multiplier = self.server.keyed_rate_multiplier.clamp(1, 100);
+        self.server.request_timeout_secs = self.server.request_timeout_secs.clamp(1, 120);
+        self.server.max_in_flight = self.server.max_in_flight.clamp(2, 1024);
+        self.server.max_in_flight_per_client = self.server.max_in_flight_per_client.clamp(1, 64);
+        self.server.cache_ttl_secs = self.server.cache_ttl_secs.min(3600);
         self
     }
 
@@ -341,6 +414,7 @@ impl SeerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SeerError;
 
     #[test]
     fn server_section_defaults_are_private_and_loopback() {
@@ -379,6 +453,112 @@ cors_origins = ["https://example.com"]
         let parsed: SeerConfig = toml::from_str(&SeerConfig::default_toml()).unwrap();
         assert_eq!(parsed.server.bind, "127.0.0.1:8001");
         assert!(SeerConfig::default_toml().contains("[server]"));
+    }
+
+    #[test]
+    fn server_protection_settings_have_safe_defaults() {
+        let server = SeerConfig::default().server;
+        assert!(server.trusted_proxies.is_empty());
+        assert_eq!(server.keyed_rate_multiplier, 10);
+        assert_eq!(server.request_timeout_secs, 30);
+        assert_eq!(server.max_in_flight, 64);
+        assert_eq!(server.cache_ttl_secs, 60);
+    }
+
+    #[test]
+    fn server_protection_settings_parse_and_are_clamped() {
+        let parse = |body: &str| {
+            SeerConfig::parse_or_default(
+                &format!("[server]\n{body}\n"),
+                std::path::Path::new("test.toml"),
+            )
+            .server
+        };
+        let low = parse(
+            "keyed_rate_multiplier = 0\nrequest_timeout_secs = 0\nmax_in_flight = 0\ncache_ttl_secs = 0",
+        );
+        assert_eq!(low.keyed_rate_multiplier, 1);
+        assert_eq!(low.request_timeout_secs, 1);
+        assert_eq!(low.max_in_flight, 2);
+        assert_eq!(low.cache_ttl_secs, 0, "0 is valid: it disables the cache");
+
+        let high = parse(
+            "keyed_rate_multiplier = 5000\nrequest_timeout_secs = 5000\nmax_in_flight = 500000\ncache_ttl_secs = 500000",
+        );
+        assert_eq!(high.keyed_rate_multiplier, 100);
+        assert_eq!(high.request_timeout_secs, 120);
+        assert_eq!(high.max_in_flight, 1024);
+        assert_eq!(high.cache_ttl_secs, 3600);
+
+        let proxies = parse("trusted_proxies = [\"10.0.0.0/8\", \"192.0.2.1\"]");
+        assert_eq!(proxies.trusted_proxies, ["10.0.0.0/8", "192.0.2.1"]);
+    }
+
+    #[test]
+    fn server_protection_settings_are_known_keys() {
+        let unknown = SeerConfig::unknown_keys(
+            "[server]\ntrusted_proxies = []\nkeyed_rate_multiplier = 2\nrequest_timeout_secs = 5\nmax_in_flight = 8\ncache_ttl_secs = 0\n",
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    /// Writes `content` to a fresh temp file and strict-loads it.
+    fn strict(name: &str, content: &str) -> crate::error::Result<SeerConfig> {
+        let path =
+            std::env::temp_dir().join(format!("seer-strict-{}-{name}.toml", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        let result = SeerConfig::load_strict_from(&path);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn strict_load_of_a_missing_file_is_the_defaults() {
+        let path = std::env::temp_dir().join(format!("seer-absent-{}.toml", std::process::id()));
+        let config = SeerConfig::load_strict_from(&path).unwrap();
+        assert_eq!(config.server.bind, "127.0.0.1:8001");
+    }
+
+    #[test]
+    fn strict_load_accepts_and_clamps_a_valid_file() {
+        let config = strict("valid", "[server]\npublic = true\nmax_in_flight = 1\n").unwrap();
+        assert!(config.server.public);
+        assert_eq!(config.server.max_in_flight, 2);
+    }
+
+    #[test]
+    fn strict_load_rejects_malformed_toml() {
+        // The tolerant loader would start on defaults; a server must not.
+        let error = strict("malformed", "[server]\nbind = 8001\n").unwrap_err();
+        assert!(matches!(error, SeerError::ConfigError(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("seer-strict-"),
+            "names the file: {error}"
+        );
+    }
+
+    #[test]
+    fn strict_load_rejects_unknown_settings() {
+        let error = strict("typo", "[server]\npublc = true\n").unwrap_err();
+        assert!(matches!(error, SeerError::ConfigError(_)), "{error:?}");
+        assert!(error.to_string().contains("server.publc"), "{error}");
+    }
+
+    #[test]
+    fn per_client_in_flight_cap_defaults_parses_and_is_clamped() {
+        assert_eq!(SeerConfig::default().server.max_in_flight_per_client, 4);
+        let parse = |value: u32| {
+            SeerConfig::parse_or_default(
+                &format!("[server]\nmax_in_flight_per_client = {value}\n"),
+                std::path::Path::new("test.toml"),
+            )
+            .server
+            .max_in_flight_per_client
+        };
+        assert_eq!(parse(0), 1);
+        assert_eq!(parse(8), 8);
+        assert_eq!(parse(5000), 64);
+        assert!(SeerConfig::unknown_keys("[server]\nmax_in_flight_per_client = 2\n").is_empty());
     }
 
     #[test]
