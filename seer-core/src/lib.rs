@@ -68,7 +68,7 @@ pub use audit::{AuditOptions, AuditReport, Auditor};
 pub use availability::{AvailabilityChecker, AvailabilityResult};
 pub use cache::TtlCache;
 pub use config::SeerConfig;
-pub use error::{Result, SeerError};
+pub use error::{ErrorCategory, Result, SeerError};
 pub use retry::{is_retryable, RetryExecutor, RetryPolicy};
 pub use validation::normalize_domain;
 

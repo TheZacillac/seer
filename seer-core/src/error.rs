@@ -154,7 +154,124 @@ impl From<hickory_resolver::net::NetError> for SeerError {
     }
 }
 
+/// What kind of failure a [`SeerError`] is, independent of its text.
+///
+/// The one classification every external surface shares: seer-py picks its
+/// Python exception class from it, and the HTTP servers pick a status code
+/// with [`ErrorCategory::http_status`]. Classify with
+/// [`SeerError::category`]; never by matching message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorCategory {
+    /// The caller's input was rejected (domain, IP, record type, allowlist).
+    InvalidInput,
+    /// An operation ran out of time.
+    Timeout,
+    /// A WHOIS server could not be connected to.
+    Connection,
+    /// An upstream registry or service throttled the request.
+    RateLimited,
+    /// No WHOIS server is known for the TLD; retrying will not help.
+    WhoisServerNotFound,
+    /// DNS resolution failed.
+    Dns,
+    /// A WHOIS, RDAP or HTTP upstream failed; may be transient.
+    Upstream,
+    /// Every lookup source failed for the domain.
+    LookupFailed,
+    /// An upstream response could not be parsed.
+    Parse,
+    /// Certificate or TLS inspection failed.
+    Tls,
+    /// Seer's own configuration is invalid.
+    Config,
+    /// Anything uncategorized.
+    Other,
+}
+
+impl ErrorCategory {
+    /// Every category. [`ErrorCategory::Other`] is last, so a consumer that
+    /// walks this list with first-match-wins reaches the specific
+    /// categories before the catch-all.
+    pub const ALL: [ErrorCategory; 12] = [
+        ErrorCategory::InvalidInput,
+        ErrorCategory::Timeout,
+        ErrorCategory::Connection,
+        ErrorCategory::RateLimited,
+        ErrorCategory::WhoisServerNotFound,
+        ErrorCategory::Dns,
+        ErrorCategory::Upstream,
+        ErrorCategory::LookupFailed,
+        ErrorCategory::Parse,
+        ErrorCategory::Tls,
+        ErrorCategory::Config,
+        ErrorCategory::Other,
+    ];
+
+    /// The HTTP status an API answers this category with: invalid input
+    /// 400, a throttled upstream 429, an unsupported TLD 404, upstream
+    /// failures 502, timeouts 504, and 500 for a configuration or
+    /// uncategorized failure.
+    pub fn http_status(self) -> u16 {
+        match self {
+            ErrorCategory::InvalidInput => 400,
+            ErrorCategory::Timeout => 504,
+            ErrorCategory::RateLimited => 429,
+            ErrorCategory::WhoisServerNotFound => 404,
+            ErrorCategory::Connection
+            | ErrorCategory::Dns
+            | ErrorCategory::Upstream
+            | ErrorCategory::LookupFailed
+            | ErrorCategory::Parse
+            | ErrorCategory::Tls => 502,
+            ErrorCategory::Config | ErrorCategory::Other => 500,
+        }
+    }
+}
+
 impl SeerError {
+    /// The error underneath any [`SeerError::RetryExhausted`] wrappers: the
+    /// failure the retry framework gave up on. An unwrapped error is its
+    /// own root cause.
+    pub fn root_cause(&self) -> &SeerError {
+        let mut error = self;
+        while let SeerError::RetryExhausted { last_error, .. } = error {
+            error = last_error.as_ref();
+        }
+        error
+    }
+
+    /// Classifies this error. A [`SeerError::RetryExhausted`] is classified
+    /// by its [root cause](Self::root_cause), so a retried timeout is still
+    /// a timeout.
+    pub fn category(&self) -> ErrorCategory {
+        // No wildcard arm: a new variant must be given a category here.
+        match self.root_cause() {
+            SeerError::InvalidInput(_)
+            | SeerError::InvalidDomain(_)
+            | SeerError::InvalidIpAddress(_)
+            | SeerError::InvalidRecordType(_)
+            | SeerError::DomainNotAllowed { .. } => ErrorCategory::InvalidInput,
+            SeerError::Timeout(_) => ErrorCategory::Timeout,
+            SeerError::WhoisConnectionFailed(_) => ErrorCategory::Connection,
+            SeerError::RateLimited(_) => ErrorCategory::RateLimited,
+            SeerError::WhoisServerNotFound(_) => ErrorCategory::WhoisServerNotFound,
+            SeerError::DnsError(_) | SeerError::DnsResolverError(_) => ErrorCategory::Dns,
+            SeerError::WhoisError(_)
+            | SeerError::RdapError(_)
+            | SeerError::RdapBootstrapError(_)
+            | SeerError::HttpError(_)
+            | SeerError::ReqwestError { .. } => ErrorCategory::Upstream,
+            SeerError::LookupFailed { .. } => ErrorCategory::LookupFailed,
+            SeerError::JsonError(_) => ErrorCategory::Parse,
+            SeerError::CertificateError(_) | SeerError::SslError(_) => ErrorCategory::Tls,
+            SeerError::ConfigError(_) => ErrorCategory::Config,
+            // `root_cause` never returns a RetryExhausted; the arm exists
+            // only because the match is exhaustive.
+            SeerError::Other(_) | SeerError::RetryExhausted { .. } => ErrorCategory::Other,
+        }
+    }
+
     /// Returns a sanitized error message safe for external exposure
     /// (API responses, MCP tool results, Python exceptions).
     ///
@@ -368,5 +485,121 @@ mod tests {
             other => panic!("expected DnsResolverError, got {other:?}"),
         }
         assert_eq!(err.to_string(), "DNS resolver error: request timed out");
+    }
+
+    // ---- classification ----
+
+    /// One sample of every `SeerError` variant except `RetryExhausted`,
+    /// paired with the category it must report.
+    fn samples() -> Vec<(SeerError, ErrorCategory)> {
+        use ErrorCategory as C;
+        let json = serde_json::from_str::<u8>("x").unwrap_err();
+        vec![
+            (SeerError::InvalidInput("x".into()), C::InvalidInput),
+            (SeerError::InvalidDomain("x".into()), C::InvalidInput),
+            (SeerError::InvalidIpAddress("x".into()), C::InvalidInput),
+            (SeerError::InvalidRecordType("x".into()), C::InvalidInput),
+            (
+                SeerError::DomainNotAllowed {
+                    domain: "a.zz".into(),
+                    tld: "zz".into(),
+                },
+                C::InvalidInput,
+            ),
+            (SeerError::Timeout("x".into()), C::Timeout),
+            (SeerError::WhoisConnectionFailed("x".into()), C::Connection),
+            (SeerError::RateLimited("x".into()), C::RateLimited),
+            (
+                SeerError::WhoisServerNotFound("zz".into()),
+                C::WhoisServerNotFound,
+            ),
+            (SeerError::DnsError("x".into()), C::Dns),
+            (SeerError::DnsResolverError("x".into()), C::Dns),
+            (SeerError::WhoisError("x".into()), C::Upstream),
+            (SeerError::RdapError("x".into()), C::Upstream),
+            (SeerError::RdapBootstrapError("x".into()), C::Upstream),
+            (SeerError::HttpError("x".into()), C::Upstream),
+            (
+                SeerError::ReqwestError {
+                    message: "x".into(),
+                    transient: true,
+                },
+                C::Upstream,
+            ),
+            (
+                SeerError::LookupFailed {
+                    domain: "example.com".into(),
+                    details: "x".into(),
+                    registry_url: "https://registry.test".into(),
+                },
+                C::LookupFailed,
+            ),
+            (SeerError::JsonError(json), C::Parse),
+            (SeerError::CertificateError("x".into()), C::Tls),
+            (SeerError::SslError("x".into()), C::Tls),
+            (SeerError::ConfigError("x".into()), C::Config),
+            (SeerError::Other("x".into()), C::Other),
+        ]
+    }
+
+    #[test]
+    fn every_variant_reports_its_category() {
+        for (err, expected) in samples() {
+            assert_eq!(err.category(), expected, "wrong category for {err:?}");
+        }
+    }
+
+    #[test]
+    fn retry_wrappers_classify_and_report_by_leaf() {
+        let layered = SeerError::RetryExhausted {
+            attempts: 3,
+            last_error: Box::new(SeerError::RetryExhausted {
+                attempts: 2,
+                last_error: Box::new(SeerError::Timeout("whois.internal timed out".into())),
+            }),
+        };
+        assert_eq!(layered.category(), ErrorCategory::Timeout);
+        assert_eq!(
+            layered.root_cause().sanitized_message(),
+            "Operation timed out"
+        );
+        // An unwrapped error is its own root cause.
+        let plain = SeerError::DnsError("x".into());
+        assert!(matches!(plain.root_cause(), SeerError::DnsError(_)));
+    }
+
+    #[test]
+    fn http_statuses_match_the_published_table() {
+        use ErrorCategory as C;
+        let table = [
+            (C::InvalidInput, 400),
+            (C::Timeout, 504),
+            (C::Connection, 502),
+            (C::RateLimited, 429),
+            (C::WhoisServerNotFound, 404),
+            (C::Dns, 502),
+            (C::Upstream, 502),
+            (C::LookupFailed, 502),
+            (C::Parse, 502),
+            (C::Tls, 502),
+            (C::Config, 500),
+            (C::Other, 500),
+        ];
+        for (category, status) in table {
+            assert_eq!(category.http_status(), status, "{category:?}");
+        }
+    }
+
+    #[test]
+    fn all_lists_every_category_once_with_other_last() {
+        let all = ErrorCategory::ALL;
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "duplicate in ALL");
+        for (_, category) in samples() {
+            assert!(all.contains(&category), "{category:?} missing from ALL");
+        }
+        // Consumers that walk ALL with first-match-wins (seer-py's exception
+        // table) need the catch-all last.
+        assert_eq!(all.last(), Some(&ErrorCategory::Other));
     }
 }
