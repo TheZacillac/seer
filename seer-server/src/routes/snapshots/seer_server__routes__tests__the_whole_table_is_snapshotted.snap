@@ -19,3 +19,11 @@ expression: table
 /propagation/{domain}/{record_type}  Keyed   moderate  Default
 /dns/trace/{domain}                  Keyed   heavy     Default
 /dns/compare/{domain}                Keyed   standard  Default
+/subdomains/{domain}                 Keyed   heavy     Default
+/diff/{domain_a}/{domain_b}          Keyed   standard  Default
+/caa/{domain}                        Keyed   light     Default
+/posture/{domain}                    Keyed   standard  Default
+/headers/{domain}                    Keyed   moderate  Default
+/audit/{domain}                      Keyed   heavy     Audit
+/takeover/{domain}                   Keyed   heavy     Default
+/confusables/{domain}                Keyed   heavy     Default

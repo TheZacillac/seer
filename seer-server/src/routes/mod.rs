@@ -6,6 +6,7 @@
 //! seer-core call handed to `Call::respond`, which caches, bounds and times
 //! it. Paths and JSON match seer-api's.
 
+mod assessment;
 mod dns;
 mod probes;
 mod registration;
@@ -14,6 +15,7 @@ use axum::routing::get;
 use seer_core::contract::CostClass::{Heavy, Light, Moderate, Standard};
 
 use crate::app::Route;
+use crate::state::Deadline;
 
 /// Every route the server exposes. Each cost class is the one whose limit
 /// seer-api declares on the same route. Routes built with `Route::keyed`
@@ -49,6 +51,18 @@ pub fn routes() -> Vec<Route> {
         ),
         Route::keyed("/dns/trace/{domain}", Heavy, get(dns::trace)),
         Route::keyed("/dns/compare/{domain}", Standard, get(dns::compare)),
+        Route::keyed("/subdomains/{domain}", Heavy, get(assessment::subdomains)),
+        Route::keyed(
+            "/diff/{domain_a}/{domain_b}",
+            Standard,
+            get(assessment::diff),
+        ),
+        Route::keyed("/caa/{domain}", Light, get(assessment::caa)),
+        Route::keyed("/posture/{domain}", Standard, get(assessment::posture)),
+        Route::keyed("/headers/{domain}", Moderate, get(assessment::headers)),
+        Route::keyed("/audit/{domain}", Heavy, get(assessment::audit)).within(Deadline::Audit),
+        Route::keyed("/takeover/{domain}", Heavy, get(assessment::takeover)),
+        Route::keyed("/confusables/{domain}", Heavy, get(assessment::confusables)),
     ]
 }
 
@@ -132,6 +146,17 @@ mod tests {
             "/dns/compare/{domain}",
             "/dns/compare/example.com?server_a=8.8.8.8&server_b=1.1.1.1",
         ),
+        ("/subdomains/{domain}", "/subdomains/example.com"),
+        (
+            "/diff/{domain_a}/{domain_b}",
+            "/diff/example.com/example.org",
+        ),
+        ("/caa/{domain}", "/caa/example.com"),
+        ("/posture/{domain}", "/posture/example.com"),
+        ("/headers/{domain}", "/headers/example.com"),
+        ("/audit/{domain}", "/audit/example.com"),
+        ("/takeover/{domain}", "/takeover/example.com"),
+        ("/confusables/{domain}", "/confusables/example.com"),
     ];
 
     #[test]
@@ -249,6 +274,134 @@ mod tests {
             get_with_key(&app(), &long, "k").await.status,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn only_the_audit_runs_under_the_audit_deadline() {
+        let audit: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.deadline == Deadline::Audit)
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(audit, ["/audit/{domain}"]);
+    }
+
+    #[test]
+    fn the_fan_outs_are_heavy() {
+        // These take a slot from the small pool; seer-api limits the same
+        // five at its heavy rate.
+        let mut heavy: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.cost == Heavy)
+            .map(|r| r.path)
+            .collect();
+        heavy.sort_unstable();
+        assert_eq!(
+            heavy,
+            [
+                "/audit/{domain}",
+                "/confusables/{domain}",
+                "/dns/trace/{domain}",
+                "/subdomains/{domain}",
+                "/takeover/{domain}",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_concurrency_outside_1_to_50_is_a_400() {
+        for route in ["/subdomains", "/takeover", "/confusables"] {
+            for value in ["0", "51", "100000", "-1", "ten"] {
+                let path = format!("{route}/example.com?concurrency={value}");
+                let reply = get_with_key(&app(), &path, "k").await;
+                assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_must_be_true_or_false() {
+        let reply = get_with_key(&app(), "/subdomains/example.com?resolve=maybe", "k").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reserved_literals_are_refused_on_the_keyed_probes() {
+        // The host is a connect target on these routes.
+        for path in [
+            "/headers/127.0.0.1",
+            "/headers/127.0.0.1:443",
+            "/audit/10.0.0.1",
+            "/diff/169.254.169.254/example.com",
+            "/diff/example.com/192.168.1.1",
+        ] {
+            let reply = get_with_key(&app(), path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_name_on_an_assessment_route_is_a_400_before_a_slot() {
+        for path in [
+            "/subdomains/not_a_domain",
+            "/diff/example.com/bad..host",
+            "/caa/bad..host",
+            "/posture/-x-.com",
+            "/headers/bad..host",
+            "/audit/bad..host",
+            "/takeover/not_a_domain",
+            "/confusables/not_a_domain",
+        ] {
+            let reply = get_with_key(&app(), path, "k").await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_every_keyed_route_answers() {
+        let app = app();
+        let keyed: Vec<&str> = routes()
+            .iter()
+            .filter(|r| r.tier == Tier::Keyed)
+            .map(|r| r.path)
+            .collect();
+        for (pattern, uri) in SAMPLES {
+            if keyed.contains(pattern) {
+                let reply = get_with_key(&app, uri, "k").await;
+                assert_eq!(reply.status, StatusCode::OK, "{pattern}: {}", reply.json);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_a_request_dropped_mid_flight_holds_nothing() {
+        // The spec's cancellation test, with real lookups in flight.
+        let table = routes();
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let clients = Clients::from_config(&SeerConfig::default());
+        let state = AppState::new(settings, clients, &table);
+        let app = assemble(state.clone(), table);
+        let full = (state.permits.available(), state.permits.heavy_available());
+        for (pattern, uri) in SAMPLES {
+            let request = tokio::spawn({
+                let app = app.clone();
+                async move { get_with_key(&app, uri, "k").await }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            request.abort();
+            let _ = request.await;
+            assert_eq!(
+                (state.permits.available(), state.permits.heavy_available()),
+                full,
+                "{pattern} left a slot held"
+            );
+        }
     }
 
     #[test]

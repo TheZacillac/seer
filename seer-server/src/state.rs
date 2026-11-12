@@ -437,6 +437,62 @@ mod tests {
     }
 
     #[test]
+    fn the_lookups_behind_the_keyed_routes_are_small_futures() {
+        // PR 2 shipped a crash from 45-65 KB futures overflowing a worker
+        // stack in debug builds. Building a future sends nothing; none is
+        // polled here.
+        use seer_core::{AuditOptions, RecordType};
+        use std::mem::size_of_val;
+
+        let c = Clients::from_config(&SeerConfig::default());
+        let (d, a) = ("example.com", RecordType::A);
+        let soon = Duration::from_secs(1);
+        let sizes = [
+            ("subdomains", size_of_val(&c.subdomains.enumerate(d))),
+            (
+                "classify",
+                size_of_val(&seer_core::classify_subdomains(&c.dns, d, vec![], 10)),
+            ),
+            ("dnssec", size_of_val(&c.dnssec.check(d))),
+            ("delegation", size_of_val(&c.delegation.check(d))),
+            ("diff", size_of_val(&c.differ.diff(d, d))),
+            (
+                "caa",
+                size_of_val(&seer_core::caa::lookup_caa(&c.dns, d, None)),
+            ),
+            (
+                "posture",
+                size_of_val(&seer_core::lookup_email_posture(&c.dns, d, None)),
+            ),
+            ("headers", size_of_val(&seer_core::audit_headers(d, soon))),
+            (
+                "audit",
+                size_of_val(&c.auditor.audit(d, AuditOptions::default())),
+            ),
+            (
+                "takeover",
+                size_of_val(&seer_core::scan_takeover(&c.dns, d, vec![], 10, soon)),
+            ),
+            (
+                "confusables",
+                size_of_val(&seer_core::find_confusables(&c.lookup, d, 10)),
+            ),
+            ("propagation", size_of_val(&c.propagation.check(d, a))),
+            ("trace", size_of_val(&c.tracer.trace(d, a))),
+            (
+                "compare",
+                size_of_val(&c.comparator.compare(d, a, "8.8.8.8", "1.1.1.1")),
+            ),
+        ];
+        for (name, size) in sizes {
+            assert!(
+                size <= 16 * 1024,
+                "the {name} future is {size} bytes; box its stages in seer-core with `.boxed()`"
+            );
+        }
+    }
+
+    #[test]
     fn the_audit_deadline_is_the_audit_timeout_plus_five_seconds() {
         // An audit may take its whole timeout (60 s by default); the request
         // deadline must not cut it short.
