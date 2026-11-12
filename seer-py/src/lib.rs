@@ -5,7 +5,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::{PyAny, PyDict, PyType};
 use pyo3::Py;
 use seer_core::{
     bulk::{BulkExecutor, BulkOperation},
@@ -17,7 +17,8 @@ use seer_core::{
     rdap::RdapClient,
     status::StatusClient,
     whois::WhoisClient,
-    Auditor, AvailabilityChecker, DomainDiffer, SeerError, SslChecker, SubdomainEnumerator,
+    Auditor, AvailabilityChecker, DomainDiffer, ErrorCategory, SeerError, SslChecker,
+    SubdomainEnumerator,
 };
 use tokio::sync::watch;
 
@@ -142,43 +143,52 @@ mod exceptions {
     create_exception!(seer, ConfigError, SeerError, "Invalid seer configuration.");
 }
 
-/// Map a `SeerError` to a Python exception using the variant-aware
-/// `sanitized_message()` so that internal URLs, hostnames, and raw system
-/// errors never leak to Python callers. Validation-shaped errors become
-/// `ValueError`, timeouts `TimeoutError`, WHOIS connect failures
-/// `ConnectionError`; every other category has its own `seer.SeerError`
-/// subclass (see [`exceptions`]).
-fn seer_err_to_py(e: &SeerError) -> PyErr {
-    use exceptions as ex;
-    use SeerError::*;
-    let msg = e.sanitized_message();
-    match e {
-        InvalidInput(_)
-        | InvalidDomain(_)
-        | InvalidIpAddress(_)
-        | InvalidRecordType(_)
-        | DomainNotAllowed { .. } => PyValueError::new_err(msg),
-        Timeout(_) => PyTimeoutError::new_err(msg),
-        WhoisConnectionFailed { .. } => PyConnectionError::new_err(msg),
-        // RetryExhausted wraps the retry framework's final failure; classify
-        // by the inner error so a retried timeout still surfaces as
-        // TimeoutError (which seer-api maps to 504) rather than a generic
-        // error. Recursion also unwraps layered retry wrappers.
-        RetryExhausted { last_error, .. } => seer_err_to_py(last_error),
-        RateLimited(_) => ex::RateLimitedError::new_err(msg),
-        WhoisServerNotFound(_) => ex::WhoisServerNotFoundError::new_err(msg),
-        DnsError(_) | DnsResolverError(_) => ex::DnsError::new_err(msg),
-        WhoisError(_)
-        | RdapError(_)
-        | RdapBootstrapError(_)
-        | HttpError(_)
-        | ReqwestError { .. } => ex::UpstreamError::new_err(msg),
-        LookupFailed { .. } => ex::LookupFailedError::new_err(msg),
-        JsonError(_) => ex::ParseError::new_err(msg),
-        CertificateError(_) | SslError(_) => ex::TlsError::new_err(msg),
-        ConfigError(_) => ex::ConfigError::new_err(msg),
-        _ => ex::SeerError::new_err(msg),
-    }
+/// The one table of which Python exception each `ErrorCategory` raises.
+/// Generates both directions from it:
+///
+/// - `seer_err_to_py`: a `SeerError` as a Python exception. The class comes
+///   from the error's category and the text from the root cause's
+///   `sanitized_message()`, so internal URLs, hostnames and raw system
+///   errors never reach Python, and a retried timeout still surfaces as
+///   `TimeoutError`.
+/// - `exception_type`: the class object for a category, which
+///   `error_status_table` hands to seer-api.
+///
+/// Callers branch on the class, never on the message text.
+macro_rules! category_exceptions {
+    ($($category:ident => $exception:ty,)*) => {
+        fn seer_err_to_py(e: &SeerError) -> PyErr {
+            let msg = e.root_cause().sanitized_message();
+            match e.category() {
+                $(ErrorCategory::$category => <$exception>::new_err(msg),)*
+                // ErrorCategory is non_exhaustive: a category added in core
+                // raises the base class until it gets a row here.
+                _ => exceptions::SeerError::new_err(msg),
+            }
+        }
+
+        fn exception_type(py: Python<'_>, category: ErrorCategory) -> Bound<'_, PyType> {
+            match category {
+                $(ErrorCategory::$category => py.get_type::<$exception>(),)*
+                _ => py.get_type::<exceptions::SeerError>(),
+            }
+        }
+    };
+}
+
+category_exceptions! {
+    InvalidInput => PyValueError,
+    Timeout => PyTimeoutError,
+    Connection => PyConnectionError,
+    RateLimited => exceptions::RateLimitedError,
+    WhoisServerNotFound => exceptions::WhoisServerNotFoundError,
+    Dns => exceptions::DnsError,
+    Upstream => exceptions::UpstreamError,
+    LookupFailed => exceptions::LookupFailedError,
+    Parse => exceptions::ParseError,
+    Tls => exceptions::TlsError,
+    Config => exceptions::ConfigError,
+    Other => exceptions::SeerError,
 }
 
 /// Run an async `SeerError`-returning future on the shared Tokio runtime and
@@ -339,6 +349,48 @@ fn nameserver_target(spec: &str) -> Option<(String, u16)> {
 #[pyfunction]
 fn normalize_host(host: &str) -> Option<String> {
     seer_core::validation::normalize_host(host).ok()
+}
+
+/// Every error category's Python exception class with the HTTP status
+/// seer-core assigns it, as `(class, status)` pairs. The base
+/// `seer.SeerError` row is last, so a first-match `isinstance` walk reaches
+/// each subclass first. Lets `seer-api` map exceptions to statuses with
+/// core's own table rather than a hand-synced copy. Pure data.
+#[pyfunction]
+fn error_status_table(py: Python<'_>) -> Vec<(Bound<'_, PyType>, u16)> {
+    ErrorCategory::ALL
+        .iter()
+        .map(|&category| (exception_type(py, category), category.http_status()))
+        .collect()
+}
+
+/// seer-core's input and rate-limit contract (`seer_core::contract`) as a
+/// dict: the length limits, the record-type token pattern, the error-text
+/// cap, and `rate_limits` mapping each cost class name to its per-minute
+/// limit. Pure data.
+#[pyfunction]
+fn contract(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    use seer_core::contract as shared;
+
+    let rate_limits = PyDict::new(py);
+    for class in shared::CostClass::ALL {
+        rate_limits.set_item(class.name(), class.per_minute())?;
+    }
+    let dict = PyDict::new(py);
+    dict.set_item("domain_max_length", shared::DOMAIN_MAX_LENGTH)?;
+    dict.set_item("nameserver_max_length", shared::NAMESERVER_MAX_LENGTH)?;
+    dict.set_item("record_type_max_length", shared::RECORD_TYPE_MAX_LENGTH)?;
+    dict.set_item("record_type_pattern", shared::RECORD_TYPE_PATTERN)?;
+    dict.set_item("message_max_length", shared::MESSAGE_MAX_LENGTH)?;
+    dict.set_item("rate_limits", rate_limits)?;
+    Ok(dict)
+}
+
+/// `msg` made safe for the wire by seer-core's `contract::clean_message`:
+/// control characters removed, then capped in length. Pure.
+#[pyfunction]
+fn clean_message(msg: &str) -> String {
+    seer_core::contract::clean_message(msg)
 }
 
 /// Generates the single-argument bindings that make one core call and return
@@ -1213,11 +1265,11 @@ mod _seer {
     use super::{
         _json_to_python_nested_for_test, _raise_retry_exhausted_for_test, all_tlds, audit,
         availability, bulk_availability, bulk_dig, bulk_info, bulk_lookup, bulk_propagation,
-        bulk_ssl, bulk_status, bulk_whois, caa, cancel_follow, confusables, delegation, diff, dig,
-        dns_compare, dns_follow, dns_trace, dnssec, headers, info, lookup, nameserver_target,
-        normalize_host, posture, propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip,
-        record_types, ssl, status, subdomains, subdomains_classify, takeover, tld_info,
-        validate_public_host, whois,
+        bulk_ssl, bulk_status, bulk_whois, caa, cancel_follow, clean_message, confusables,
+        contract, delegation, diff, dig, dns_compare, dns_follow, dns_trace, dnssec,
+        error_status_table, headers, info, lookup, nameserver_target, normalize_host, posture,
+        propagation, rdap_asn, rdap_auto, rdap_domain, rdap_ip, record_types, ssl, status,
+        subdomains, subdomains_classify, takeover, tld_info, validate_public_host, whois,
     };
 
     /// Forwards Rust `log` records into Python's `logging` — and `tracing`
