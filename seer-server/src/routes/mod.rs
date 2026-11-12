@@ -2,8 +2,9 @@
 //!
 //! [`routes`] is the single list of paths, tiers and handlers; the router,
 //! the tier gate and the tests all read it. Handlers live in the sibling
-//! modules by area and all have the same shape: edge checks, one seer-core
-//! call, the result as JSON. Paths and JSON match seer-api's.
+//! modules by area and all have the same shape: edge checks, then one
+//! seer-core call handed to `Call::respond`, which caches, bounds and times
+//! it. Paths and JSON match seer-api's.
 
 mod dns;
 mod probes;
@@ -215,6 +216,54 @@ mod tests {
             assert_eq!(
                 reply.json["detail"],
                 "asn must be a number between 0 and 4294967295"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tld_list_is_cached_for_browsers_and_proxies() {
+        let reply = get(&app(), "/tld/").await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.headers["cache-control"], "max-age=60");
+        assert_eq!(reply.headers["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_name_is_a_400_before_the_cache_or_a_slot() {
+        // Normalization for the cache key rejects these with core's own
+        // message; nothing is looked up.
+        for path in ["/lookup/not_a_domain", "/ssl/bad..host", "/whois/-x-.com"] {
+            let reply = get(&app(), path).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(reply.headers["cache-control"], "no-store", "{path}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network"]
+    async fn live_every_route_answers_and_repeats_from_the_cache() {
+        let app = app();
+        for path in [
+            "/lookup/example.com",
+            "/whois/example.com",
+            "/rdap/domain/example.com",
+            "/rdap/ip/1.1.1.1",
+            "/rdap/asn/13335",
+            "/availability/example.com",
+            "/tld/",
+            "/tld/com",
+            "/dns/example.com/A",
+            "/ssl/example.com",
+            "/status/example.com",
+        ] {
+            let first = get(&app, path).await;
+            assert_eq!(first.status, StatusCode::OK, "{path}: {}", first.json);
+            let started = std::time::Instant::now();
+            let second = get(&app, path).await;
+            assert_eq!(second.json, first.json, "{path}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(50),
+                "{path} was not served from the cache"
             );
         }
     }

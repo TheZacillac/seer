@@ -229,6 +229,8 @@ fn panic_response(_: Box<dyn Any + Send + 'static>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::call::Call;
+    use crate::edge::PathParams;
     use crate::test_support::{get, get_with_key, send, send_from};
     use crate::tier::Caller;
     use axum::http::{header, Method, StatusCode};
@@ -236,6 +238,8 @@ mod tests {
     use seer_core::config::ServerConfig;
     use seer_core::{SeerConfig, SeerError};
     use serde_json::{json, Value};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     async fn echo(Extension(caller): Extension<Caller>) -> Json<Value> {
         Json(json!({ "caller": format!("{caller:?}") }))
@@ -249,6 +253,60 @@ mod tests {
         panic!("handler bug")
     }
 
+    /// Counts how often the "lookup" behind `/count/{name}` really ran.
+    static COUNTED: AtomicUsize = AtomicUsize::new(0);
+
+    async fn count(call: Call, PathParams(name): PathParams<String>) -> Result<Response, ApiError> {
+        call.respond(&[&name], async {
+            let run = COUNTED.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok::<_, SeerError>(json!({ "name": name, "run": run }))
+        })
+        .await
+    }
+
+    async fn fresh(call: Call) -> Result<Response, ApiError> {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        call.respond_fresh(async {
+            Ok::<_, SeerError>(json!({ "run": RUNS.fetch_add(1, Ordering::SeqCst) + 1 }))
+        })
+        .await
+    }
+
+    async fn flaky(call: Call, PathParams(name): PathParams<String>) -> Result<Response, ApiError> {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        call.respond(&[&name], async {
+            // Fails the first time, succeeds afterwards.
+            if RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(SeerError::DnsError("resolver down".into()))
+            } else {
+                Ok(json!({ "ok": true }))
+            }
+        })
+        .await
+    }
+
+    async fn hang(call: Call) -> Result<Response, ApiError> {
+        call.respond_fresh(async {
+            std::future::pending::<()>().await;
+            Ok::<_, SeerError>(json!(null))
+        })
+        .await
+    }
+
+    /// A public stub server whose key is `k`, and its state.
+    fn app_and_state(adjust: impl FnOnce(&mut Settings)) -> (Router, AppState) {
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        adjust(&mut settings);
+        let routes = stub_routes();
+        let clients = Clients::from_config(&SeerConfig::default());
+        let state = AppState::new(settings, clients, &routes);
+        (assemble(state.clone(), routes), state)
+    }
+
     fn stub_routes() -> Vec<Route> {
         vec![
             Route::public("/open/{name}", CostClass::Light, routing::get(echo)),
@@ -256,6 +314,10 @@ mod tests {
             Route::public("/fail", CostClass::Light, routing::get(fail)),
             Route::public("/boom", CostClass::Light, routing::get(boom)),
             Route::public("/heavy/{name}", CostClass::Heavy, routing::get(echo)),
+            Route::public("/count/{name}", CostClass::Light, routing::get(count)),
+            Route::public("/fresh", CostClass::Light, routing::get(fresh)),
+            Route::public("/flaky/{name}", CostClass::Light, routing::get(flaky)),
+            Route::public("/hang", CostClass::Light, routing::get(hang)),
         ]
     }
 
@@ -632,5 +694,125 @@ mod tests {
             "https://site.example"
         );
         assert_eq!(reply.headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
+    }
+
+    #[tokio::test]
+    async fn a_success_is_served_from_the_cache_the_second_time() {
+        let (app, _) = app_and_state(|_| {});
+        let first = get(&app, "/count/cached-a").await;
+        let second = get(&app, "/count/cached-a").await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.json, second.json, "the lookup ran twice");
+        assert_eq!(first.headers[header::CACHE_CONTROL], "max-age=60");
+        assert_eq!(second.headers[header::CACHE_CONTROL], "max-age=60");
+        assert_eq!(second.headers[header::CONTENT_TYPE], "application/json");
+        // A different name is a different entry.
+        let other = get(&app, "/count/cached-b").await;
+        assert_ne!(other.json["run"], first.json["run"]);
+        assert_eq!(other.json["name"], "cached-b");
+    }
+
+    #[tokio::test]
+    async fn the_cache_is_shared_by_both_tiers_but_still_rate_limited() {
+        let (app, _) = app_and_state(|_| {});
+        let anonymous = get(&app, "/count/shared").await;
+        let keyed = get_with_key(&app, "/count/shared", "k").await;
+        assert_eq!(anonymous.json, keyed.json);
+        // Cached answers still count against the caller's allowance.
+        let (admitted, refusal) = until_refused(&app, "198.51.100.44", "/count/shared", &[]).await;
+        assert_eq!(admitted, CostClass::Light.per_minute());
+        assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_zero_ttl_runs_the_lookup_every_time_and_says_no_store() {
+        let (app, _) = app_and_state(|s| s.cache_ttl = Duration::ZERO);
+        let first = get(&app, "/count/uncached").await;
+        let second = get(&app, "/count/uncached").await;
+        assert_ne!(first.json["run"], second.json["run"]);
+        assert_eq!(second.headers[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn respond_fresh_never_caches() {
+        let (app, _) = app_and_state(|_| {});
+        let first = get(&app, "/fresh").await;
+        let second = get(&app, "/fresh").await;
+        assert_ne!(first.json["run"], second.json["run"]);
+        assert_eq!(second.headers[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn an_error_is_not_cached() {
+        let (app, _) = app_and_state(|_| {});
+        let failed = get(&app, "/flaky/x").await;
+        assert_eq!(failed.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(failed.headers[header::CACHE_CONTROL], "no-store");
+        // The failure did not stick: the next request runs and succeeds.
+        let recovered = get(&app, "/flaky/x").await;
+        assert_eq!(recovered.status, StatusCode::OK);
+        assert_eq!(recovered.json, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn a_call_past_its_deadline_is_a_504() {
+        let (app, _) = app_and_state(|s| s.request_timeout = Duration::from_millis(100));
+        let started = Instant::now();
+        let reply = get(&app, "/hang").await;
+        assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(reply.json, json!({ "detail": "Request timed out" }));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_call_returns_its_permits() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 2;
+        });
+        let before = state.permits.available();
+        for _ in 0..4 {
+            assert_eq!(get(&app, "/hang").await.status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        // Each timed-out call was dropped mid-flight; nothing stayed held.
+        assert_eq!(state.permits.available(), before);
+        assert_eq!(get(&app, "/fresh").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_free_slot_before_the_deadline_is_a_503_for_that_tier_only() {
+        let (app, state) = app_and_state(|s| {
+            s.request_timeout = Duration::from_millis(100);
+            s.max_in_flight = 2;
+        });
+        // Hold the one anonymous slot, as a lookup in flight would.
+        let held = state.permits.acquire(Caller::Anonymous).await.unwrap();
+        let anonymous = get(&app, "/fresh").await;
+        assert_eq!(anonymous.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            anonymous.json,
+            json!({ "detail": "Server busy; retry shortly" })
+        );
+        assert_eq!(anonymous.headers[header::RETRY_AFTER], "1");
+        // The keyed tier still has a slot.
+        assert_eq!(
+            get_with_key(&app, "/fresh", "k").await.status,
+            StatusCode::OK
+        );
+        drop(held);
+        assert_eq!(get(&app, "/fresh").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_needs_no_slot() {
+        let (app, state) = app_and_state(|s| s.max_in_flight = 2);
+        assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
+        let _a = state.permits.acquire(Caller::Keyed).await.unwrap();
+        let _b = state.permits.acquire(Caller::Keyed).await.unwrap();
+        // Every slot is taken, yet the cached answer is served at once.
+        assert_eq!(get(&app, "/count/warm").await.status, StatusCode::OK);
     }
 }

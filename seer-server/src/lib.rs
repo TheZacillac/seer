@@ -10,13 +10,17 @@
 //! route table and its handlers; [`edge`] holds the checks handlers run
 //! before calling core; [`app`] builds the router and its layers; [`tier`]
 //! decides who may call what; [`client_ip`] works out who the client is
-//! behind a proxy; [`limit`] rate-limits each caller per route; [`error`] turns failures into
+//! behind a proxy; [`limit`] rate-limits each caller per route; [`cache`] is the
+//! response cache; [`call`] runs a handler's lookup under the cache, the
+//! permits and the deadline; [`error`] turns failures into
 //! `{"detail": …}` responses.
 //!
 //! [`serve`] is the whole server: bind, route, and run until SIGTERM or
 //! Ctrl-C, letting in-flight requests finish.
 
 pub mod app;
+pub mod cache;
+pub mod call;
 pub mod client_ip;
 pub mod edge;
 pub mod error;
