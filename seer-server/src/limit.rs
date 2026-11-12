@@ -10,11 +10,16 @@
 //! Memory is bounded: idle entries are swept ([`Limits::sweep`]), IPv6
 //! callers are counted by /64 ([`bucket`]), and past a cap of tracked
 //! callers anonymous requests are refused rather than tracked.
+//!
+//! Requests refused for a wrong key never reach those limiters, so they
+//! are counted separately (`KeyGuesses`): a client that presents too many
+//! wrong keys in a minute is refused, key or no key, until the minute ends.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use governor::clock::{Clock, DefaultClock};
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
@@ -28,6 +33,10 @@ const MAX_TRACKED: usize = 100_000;
 /// The wait reported when a request is refused without consulting a
 /// bucket (the tracking cap, or a cost class with no limiter).
 const REFUSED: Duration = Duration::from_secs(60);
+
+/// Wrong keys one client may present in a minute before every request of
+/// its that carries a key is refused until the minute ends.
+pub const KEY_GUESSES_PER_MINUTE: u32 = 10;
 
 /// Who a request is counted against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +53,7 @@ pub struct Limits {
     keyed: HashMap<CostClass, DefaultKeyedRateLimiter<&'static str>>,
     clock: DefaultClock,
     cap: usize,
+    key_guesses: KeyGuesses,
 }
 
 impl Limits {
@@ -71,6 +81,7 @@ impl Limits {
             keyed,
             clock: DefaultClock::default(),
             cap,
+            key_guesses: KeyGuesses::new(KEY_GUESSES_PER_MINUTE, Duration::from_secs(60), cap),
         }
     }
 
@@ -107,9 +118,22 @@ impl Limits {
         verdict.map_err(|not_until| not_until.wait_time_from(self.clock.now()))
     }
 
+    /// How long `ip` must wait before it may present a key again, if it has
+    /// presented too many wrong ones. Checked before a key is compared, so
+    /// a refused guesser cannot tell a right guess from a wrong one.
+    pub fn key_blocked(&self, ip: IpAddr) -> Option<Duration> {
+        self.key_guesses.blocked(bucket(ip), Instant::now())
+    }
+
+    /// Counts one wrong key against `ip`.
+    pub fn key_failed(&self, ip: IpAddr) {
+        self.key_guesses.record(bucket(ip), Instant::now());
+    }
+
     /// Forgets callers whose allowance has fully refilled. Call it
     /// periodically; `check` also does when the cap is reached.
     pub fn sweep(&self) {
+        self.key_guesses.sweep(Instant::now());
         for limiter in self.anonymous.values() {
             limiter.retain_recent();
             limiter.shrink_to_fit();
@@ -123,6 +147,78 @@ impl Limits {
     /// Anonymous callers currently tracked, over all cost classes.
     pub fn tracked(&self) -> usize {
         self.anonymous.values().map(|limiter| limiter.len()).sum()
+    }
+}
+
+/// Wrong keys per client, in fixed windows.
+///
+/// The rate limiters above count requests that would be served; this
+/// counts the ones refused for a wrong key, which they never see. Without
+/// it the key could be guessed as fast as the socket allows.
+struct KeyGuesses {
+    max: u32,
+    window: Duration,
+    cap: usize,
+    /// Each client's wrong keys in its current window, and when it began.
+    seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl KeyGuesses {
+    fn new(max: u32, window: Duration, cap: usize) -> Self {
+        Self {
+            max,
+            window,
+            cap,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Time left in `ip`'s window, if it has used all its guesses.
+    fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        let seen = self.lock();
+        let (count, began) = seen.get(&ip).copied()?;
+        let age = now.saturating_duration_since(began);
+        (count >= self.max && age < self.window).then(|| self.window - age)
+    }
+
+    /// Counts one wrong key against `ip`.
+    fn record(&self, ip: IpAddr, now: Instant) {
+        let mut seen = self.lock();
+        if seen.len() >= self.cap && !seen.contains_key(&ip) {
+            let window = self.window;
+            seen.retain(|_, (_, began)| now.saturating_duration_since(*began) < window);
+            // Still full of live windows: a flood of distinct guessers.
+            // Start over rather than grow; memory stays bounded and each
+            // of them gets at most one more window's worth of guesses.
+            if seen.len() >= self.cap {
+                seen.clear();
+            }
+        }
+        let entry = seen.entry(ip).or_insert((0, now));
+        if now.saturating_duration_since(entry.1) >= self.window {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+
+    /// Forgets clients whose window has ended.
+    fn sweep(&self, now: Instant) {
+        let window = self.window;
+        self.lock()
+            .retain(|_, (_, began)| now.saturating_duration_since(*began) < window);
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Plain counters, valid at every step, so a poisoned lock is
+    /// recovered rather than propagated.
+    fn lock(&self) -> MutexGuard<'_, HashMap<IpAddr, (u32, Instant)>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -151,6 +247,39 @@ pub fn bucket(ip: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrong_keys_are_counted_per_client_within_a_window() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let guesses = KeyGuesses::new(3, Duration::from_secs(60), 100);
+        let start = Instant::now();
+        let a = ip("203.0.113.7");
+        assert_eq!(guesses.blocked(a, start), None);
+        for _ in 0..3 {
+            guesses.record(a, start);
+        }
+        let wait = guesses.blocked(a, start + Duration::from_secs(20)).unwrap();
+        assert_eq!(wait, Duration::from_secs(40));
+        // Another client is not affected, and the window ends.
+        assert_eq!(guesses.blocked(ip("203.0.113.8"), start), None);
+        assert_eq!(guesses.blocked(a, start + Duration::from_secs(61)), None);
+        // A new window starts counting from zero.
+        guesses.record(a, start + Duration::from_secs(61));
+        assert_eq!(guesses.blocked(a, start + Duration::from_secs(62)), None);
+    }
+
+    #[test]
+    fn tracked_guessers_are_bounded() {
+        let guesses = KeyGuesses::new(3, Duration::from_secs(60), 4);
+        let start = Instant::now();
+        for last in 1..=50u8 {
+            guesses.record(IpAddr::from([198, 51, 100, last]), start);
+        }
+        assert!(guesses.tracked() <= 4);
+        // Ended windows are forgotten by the sweep.
+        guesses.sweep(start + Duration::from_secs(61));
+        assert_eq!(guesses.tracked(), 0);
+    }
 
     fn ip(text: &str) -> IpAddr {
         text.parse().unwrap()

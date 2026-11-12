@@ -120,6 +120,13 @@ pub struct ServerConfig {
     /// How long a successful response is reused, in seconds; `0` disables
     /// the response cache.
     pub cache_ttl_secs: u64,
+    /// How long a connection may take to send a complete request header,
+    /// in seconds, before it is closed. Bounds idle and stalled
+    /// connections.
+    pub header_timeout_secs: u64,
+    /// Connections open at once. Past it, new ones wait in the listen
+    /// queue until one closes.
+    pub max_connections: usize,
 }
 
 impl Default for ServerConfig {
@@ -134,6 +141,8 @@ impl Default for ServerConfig {
             max_in_flight: 64,
             max_in_flight_per_client: 4,
             cache_ttl_secs: 60,
+            header_timeout_secs: 10,
+            max_connections: 1024,
         }
     }
 }
@@ -334,7 +343,7 @@ impl SeerConfig {
     /// them): concurrency 1–50; whois/rdap timeouts 1–300s; dns 1–60s;
     /// http and CT 1–120s; audit 10–300s; server: key multiplier 1–100,
     /// request timeout 1–120s, in-flight 2–1024 (1–64 per client), cache
-    /// TTL 0–3600s.
+    /// TTL 0–3600s, header timeout 1–60s, connections 16–65536.
     fn clamped(mut self) -> Self {
         self.bulk.concurrency = self
             .bulk
@@ -357,6 +366,8 @@ impl SeerConfig {
         self.server.max_in_flight = self.server.max_in_flight.clamp(2, 1024);
         self.server.max_in_flight_per_client = self.server.max_in_flight_per_client.clamp(1, 64);
         self.server.cache_ttl_secs = self.server.cache_ttl_secs.min(3600);
+        self.server.header_timeout_secs = self.server.header_timeout_secs.clamp(1, 60);
+        self.server.max_connections = self.server.max_connections.clamp(16, 65_536);
         self
     }
 
@@ -495,6 +506,31 @@ cors_origins = ["https://example.com"]
 
         let proxies = parse("trusted_proxies = [\"10.0.0.0/8\", \"192.0.2.1\"]");
         assert_eq!(proxies.trusted_proxies, ["10.0.0.0/8", "192.0.2.1"]);
+    }
+
+    #[test]
+    fn server_connection_limits_default_parse_and_are_clamped() {
+        let server = SeerConfig::default().server;
+        assert_eq!(server.header_timeout_secs, 10);
+        assert_eq!(server.max_connections, 1024);
+        let parse = |body: &str| {
+            SeerConfig::parse_or_default(
+                &format!("[server]\n{body}\n"),
+                std::path::Path::new("test.toml"),
+            )
+            .server
+        };
+        let low = parse("header_timeout_secs = 0\nmax_connections = 0");
+        assert_eq!((low.header_timeout_secs, low.max_connections), (1, 16));
+        let high = parse("header_timeout_secs = 9999\nmax_connections = 99999999");
+        assert_eq!(
+            (high.header_timeout_secs, high.max_connections),
+            (60, 65_536)
+        );
+        assert!(SeerConfig::unknown_keys(
+            "[server]\nheader_timeout_secs = 5\nmax_connections = 100\n"
+        )
+        .is_empty());
     }
 
     #[test]

@@ -75,9 +75,11 @@ in `seer-core`. The other four parse input, call core and present results.
 ### seer-server/src
 
 - `main.rs` — logging, config, startup checks; returns `ExitCode`.
-- `lib.rs` — `serve` / `serve_on` (graceful shutdown).
-- `settings.rs` — `Settings::new` validates `[server]` + `SEER_API_KEY`;
-  a `StartupError` stops the server before it binds.
+- `lib.rs` — `serve` / `serve_on`, and `run`, the accept loop on hyper
+  (header timeout, connection cap, bounded graceful shutdown).
+- `settings.rs` — `Settings::new` validates `[server]` + `SEER_API_KEY`
+  (16 characters or more); a `StartupError` stops the server before it
+  binds.
 - `routes/` — `routes()` is the **one** route table (path, tier, cost
   class, deadline, handler): eleven public rows and fourteen keyed ones;
   handlers are edge checks → one core call handed to `Call::respond`.
@@ -86,7 +88,8 @@ in `seer-core`. The other four parse input, call core and present results.
 - `call.rs` — `Call::respond`: cache lookup → permit → core call, the
   last two under the row's deadline (the audit's is the audit timeout plus
   5 s). `respond_fresh` skips the cache.
-- `limit.rs` (GCRA limits per route and caller), `client_ip.rs` (the
+- `limit.rs` (GCRA limits per route and caller; wrong keys counted per
+  client), `client_ip.rs` (the
   trusted-proxy rule), `cache.rs` (response bodies in a `TtlCache`, capped per body),
   `state.rs` (the shared core clients, `Permits` — total, anonymous half,
   heavy pool of 8 — `PerClient`, `AppState::new`).
@@ -343,6 +346,10 @@ step). The tables:
   `trusted_proxies` lists proxies, never client networks. A handler must
   go through `Call::respond` / `respond_fresh` — returning `Json`
   directly skips the cache, the permits and the deadline.
+- **seer-server does not use `axum::serve`.** It sets no header timeout
+  and no connection limit, so `lib.rs` runs its own accept loop on
+  hyper. Keep `header_read_timeout` and the connection semaphore if
+  you touch it.
 - **seer-server marks keyed answers `private`.** The in-process cache
   serves both tiers (the gate runs first, so an anonymous caller never
   reaches a keyed route's entry), but a CDN in front must not store what

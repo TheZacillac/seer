@@ -136,26 +136,41 @@ async fn gate(
         (Some(value), None) => Some(value.to_str().unwrap_or("")),
         (Some(_), Some(_)) => Some(""),
     };
-    let caller = tier::identify(authorization, state.settings.api_key.as_deref())?;
-    tier::authorize(caller, meta.tier, state.settings.public)?;
-
-    // Rate limit after the tier check: a refused caller gets the 401, and
-    // only requests that would otherwise be served are counted.
-    let subject = match caller {
-        Caller::Keyed => Subject::Keyed,
-        Caller::Anonymous => {
-            // Without the socket peer there is no identity to limit by.
-            let peer = request
-                .extensions()
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0.ip())
-                .ok_or_else(ApiError::internal)?;
-            Subject::Anonymous(client_ip(
+    // The client's address: the socket peer, or the one a trusted proxy
+    // names. Without the peer there is no identity to limit by.
+    let client = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip())
+        .map(|peer| {
+            client_ip(
                 peer,
                 &forwarded_for(request.headers()),
                 &state.settings.trusted_proxies,
-            ))
+            )
+        });
+    if authorization.is_some() {
+        // A client that has presented too many wrong keys is refused
+        // before this one is compared.
+        let client = client.ok_or_else(ApiError::internal)?;
+        if let Some(wait) = state.limits.key_blocked(client) {
+            return Err(ApiError::rate_limited(wait));
         }
+    }
+    let caller =
+        tier::identify(authorization, state.settings.api_key.as_deref()).inspect_err(|_| {
+            if let Some(client) = client {
+                state.limits.key_failed(client);
+            }
+        })?;
+    tier::authorize(caller, meta.tier, state.settings.public)?;
+
+    // Rate limit after the tier check: a refused caller gets the 401, and
+    // only requests that would otherwise be served are counted. (Wrong
+    // keys are counted above instead.)
+    let subject = match caller {
+        Caller::Keyed => Subject::Keyed,
+        Caller::Anonymous => Subject::Anonymous(client.ok_or_else(ApiError::internal)?),
     };
     state
         .limits
@@ -249,7 +264,7 @@ mod tests {
     use super::*;
     use crate::call::Call;
     use crate::edge::PathParams;
-    use crate::test_support::{get, get_with_key, send, send_from};
+    use crate::test_support::{get, get_with_key, send, send_from, KEY};
     use crate::tier::Caller;
     use axum::http::{header, Method, StatusCode};
     use axum::Extension;
@@ -325,7 +340,7 @@ mod tests {
             public: true,
             ..ServerConfig::default()
         };
-        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        let mut settings = Settings::new(&server, Some(KEY.to_string())).unwrap();
         adjust(&mut settings);
         let routes = stub_routes();
         let mut clients = Clients::from_config(&SeerConfig::default());
@@ -421,8 +436,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_keyed_caller_gets_the_multiplied_limit_whatever_its_address() {
-        let app = app_with(true, Some("k"), &[], |s| s.keyed_rate_multiplier = 2);
-        let auth: &[(&str, &[u8])] = &[("authorization", b"Bearer k")];
+        let app = app_with(true, Some(KEY), &[], |s| s.keyed_rate_multiplier = 2);
+        let auth = format!("Bearer {KEY}");
+        let auth: &[(&str, &[u8])] = &[("authorization", auth.as_bytes())];
         let (admitted, refusal) = until_refused(&app, "198.51.100.1", "/heavy/x", auth).await;
         assert_eq!(admitted, CostClass::Heavy.per_minute() * 2);
         assert_eq!(refusal.status, StatusCode::TOO_MANY_REQUESTS);
@@ -491,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn refused_auth_and_health_are_not_rate_limited_into_a_429() {
-        let app = app(false, Some("k"), &[]);
+        let app = app(false, Some(KEY), &[]);
         for _ in 0..(CostClass::Heavy.per_minute() + 5) {
             // No key on a private server: always the 401, never a 429.
             let reply = get(&app, "/heavy/x").await;
@@ -516,21 +532,21 @@ mod tests {
 
     #[tokio::test]
     async fn health_needs_no_key_even_on_a_private_server() {
-        let reply = get(&app(false, Some("k"), &[]), "/health").await;
+        let reply = get(&app(false, Some(KEY), &[]), "/health").await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.json, json!({ "status": "healthy" }));
     }
 
     #[tokio::test]
     async fn anonymous_callers_reach_public_routes_on_a_public_server() {
-        let reply = get(&app(true, Some("k"), &[]), "/open/x").await;
+        let reply = get(&app(true, Some(KEY), &[]), "/open/x").await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.json, json!({ "caller": "Anonymous" }));
     }
 
     #[tokio::test]
     async fn anonymous_callers_are_refused_keyed_routes() {
-        let reply = get(&app(true, Some("k"), &[]), "/locked/x").await;
+        let reply = get(&app(true, Some(KEY), &[]), "/locked/x").await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
         assert_eq!(
             reply.json,
@@ -541,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_callers_are_refused_everything_on_a_private_server() {
-        let reply = get(&app(false, Some("k"), &[]), "/open/x").await;
+        let reply = get(&app(false, Some(KEY), &[]), "/open/x").await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
         assert_eq!(reply.json, json!({ "detail": "API key required" }));
     }
@@ -550,7 +566,7 @@ mod tests {
     async fn the_key_opens_every_route() {
         for public in [true, false] {
             for path in ["/open/x", "/locked/x"] {
-                let reply = get_with_key(&app(public, Some("k"), &[]), path, "k").await;
+                let reply = get_with_key(&app(public, Some(KEY), &[]), path, KEY).await;
                 assert_eq!(reply.status, StatusCode::OK, "{path} public={public}");
                 assert_eq!(reply.json, json!({ "caller": "Keyed" }));
             }
@@ -559,15 +575,40 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_key_is_refused_even_on_a_public_route() {
-        let reply = get_with_key(&app(true, Some("k"), &[]), "/open/x", "wrong").await;
+        let reply = get_with_key(&app(true, Some(KEY), &[]), "/open/x", "wrong").await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
         assert_eq!(reply.json, json!({ "detail": "Invalid API key" }));
     }
 
     #[tokio::test]
+    async fn wrong_keys_are_throttled_per_client() {
+        let app = app(true, Some(KEY), &[]);
+        let guesser = "198.51.100.77";
+        let wrong: &[(&str, &[u8])] = &[("authorization", b"Bearer not-the-key")];
+        for attempt in 0..limit::KEY_GUESSES_PER_MINUTE {
+            let reply = send_from(&app, guesser, Method::GET, "/locked/x", wrong).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+        }
+        let refused = send_from(&app, guesser, Method::GET, "/locked/x", wrong).await;
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(refused.headers.contains_key(header::RETRY_AFTER));
+        // While refused, even the right key is not evaluated: otherwise a
+        // guesser would still learn which guess was right.
+        let right = format!("Bearer {KEY}");
+        let right: &[(&str, &[u8])] = &[("authorization", right.as_bytes())];
+        let blocked = send_from(&app, guesser, Method::GET, "/locked/x", right).await;
+        assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+        // Other clients, and requests that present no key, are unaffected.
+        let other = send_from(&app, "198.51.100.78", Method::GET, "/locked/x", right).await;
+        assert_eq!(other.status, StatusCode::OK);
+        let anonymous = send_from(&app, guesser, Method::GET, "/open/x", &[]).await;
+        assert_eq!(anonymous.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn non_utf8_authorization_is_unauthorized() {
         let reply = send(
-            &app(true, Some("k"), &[]),
+            &app(true, Some(KEY), &[]),
             Method::GET,
             "/open/x",
             &[("authorization", b"Bearer \xff\xfe")],
@@ -580,8 +621,12 @@ mod tests {
     async fn more_than_one_authorization_header_is_refused() {
         // A proxy and this server could disagree about which one counts, so
         // neither order is accepted, even when one of them is the right key.
-        let app = app(true, Some("k"), &[]);
-        for pair in [["Bearer k", "Bearer wrong"], ["Bearer wrong", "Bearer k"]] {
+        let app = app(true, Some(KEY), &[]);
+        let right = format!("Bearer {KEY}");
+        for pair in [
+            [right.as_str(), "Bearer wrong"],
+            ["Bearer wrong", right.as_str()],
+        ] {
             let reply = send(
                 &app,
                 Method::GET,
@@ -715,7 +760,7 @@ mod tests {
         // A browser preflight carries no Authorization header. On a private
         // server it must still be answered by CORS, not refused 401.
         let reply = send(
-            &app(false, Some("k"), &["https://site.example"]),
+            &app(false, Some(KEY), &["https://site.example"]),
             Method::OPTIONS,
             "/open/x",
             &[
@@ -752,7 +797,7 @@ mod tests {
     async fn the_cache_is_shared_by_both_tiers_but_still_rate_limited() {
         let (app, _) = app_and_state(|_| {});
         let anonymous = get(&app, "/count/shared").await;
-        let keyed = get_with_key(&app, "/count/shared", "k").await;
+        let keyed = get_with_key(&app, "/count/shared", KEY).await;
         assert_eq!(anonymous.json, keyed.json);
         // Cached answers still count against the caller's allowance.
         let (admitted, refusal) = until_refused(&app, "198.51.100.44", "/count/shared", &[]).await;
@@ -763,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn a_keyed_answer_is_private_and_an_anonymous_one_is_shared() {
         let (app, _) = app_and_state(|_| {});
-        let keyed = get_with_key(&app, "/count/tiered", "k").await;
+        let keyed = get_with_key(&app, "/count/tiered", KEY).await;
         assert_eq!(keyed.headers[header::CACHE_CONTROL], "private, max-age=60");
         // The same cached body, to a caller a CDN may serve from its store.
         let anonymous = get(&app, "/count/tiered").await;
@@ -774,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn a_cached_keyed_answer_is_never_served_to_an_anonymous_caller() {
         let (app, _) = app_and_state(|_| {});
-        let keyed = get_with_key(&app, "/locked-count/secret", "k").await;
+        let keyed = get_with_key(&app, "/locked-count/secret", KEY).await;
         assert_eq!(keyed.status, StatusCode::OK);
         assert_eq!(keyed.headers[header::CACHE_CONTROL], "private, max-age=60");
         // It is in the cache now; the gate still answers first.
@@ -833,7 +878,7 @@ mod tests {
             |c| c.audit_deadline = Duration::from_millis(400),
         );
         let started = Instant::now();
-        let reply = get_with_key(&app, "/slow-audit", "k").await;
+        let reply = get_with_key(&app, "/slow-audit", KEY).await;
         assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
         // A lower bound only: it outlived the 50 ms request timeout.
         assert!(started.elapsed() >= Duration::from_millis(350));
@@ -856,16 +901,16 @@ mod tests {
                     .unwrap(),
             );
         }
-        let heavy = get_with_key(&app, "/heavy-count/a", "k").await;
+        let heavy = get_with_key(&app, "/heavy-count/a", KEY).await;
         assert_eq!(heavy.status, StatusCode::SERVICE_UNAVAILABLE);
         // The fourth total slot is still there for a light lookup.
         assert_eq!(
-            get_with_key(&app, "/count/light", "k").await.status,
+            get_with_key(&app, "/count/light", KEY).await.status,
             StatusCode::OK
         );
         held.clear();
         assert_eq!(
-            get_with_key(&app, "/heavy-count/a", "k").await.status,
+            get_with_key(&app, "/heavy-count/a", KEY).await.status,
             StatusCode::OK
         );
     }
@@ -878,7 +923,7 @@ mod tests {
         });
         let before = (state.permits.available(), state.permits.heavy_available());
         for _ in 0..3 {
-            let reply = get_with_key(&app, "/heavy-hang", "k").await;
+            let reply = get_with_key(&app, "/heavy-hang", KEY).await;
             assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
         }
         // Dropped mid-flight three times with one heavy slot: none stuck.
@@ -908,7 +953,7 @@ mod tests {
             .await
             .unwrap();
         let started = Instant::now();
-        let reply = get_with_key(&app, "/slow-audit", "k").await;
+        let reply = get_with_key(&app, "/slow-audit", KEY).await;
         // Busy after the request timeout, not after the audit's deadline.
         assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -934,7 +979,7 @@ mod tests {
             .await
             .unwrap();
         let started = Instant::now();
-        let request = get_with_key(&app, "/slow-audit", "k");
+        let request = get_with_key(&app, "/slow-audit", KEY);
         let release = async {
             tokio::time::sleep(Duration::from_millis(250)).await;
             drop(a);
@@ -982,7 +1027,7 @@ mod tests {
         assert_eq!(anonymous.headers[header::RETRY_AFTER], "1");
         // The keyed tier still has a slot.
         assert_eq!(
-            get_with_key(&app, "/fresh", "k").await.status,
+            get_with_key(&app, "/fresh", KEY).await.status,
             StatusCode::OK
         );
         drop(held);
@@ -1020,7 +1065,7 @@ mod tests {
         let other = send_from(&app, "198.51.100.9", Method::GET, "/fresh", &[]).await;
         assert_eq!(other.status, StatusCode::OK);
         assert_eq!(
-            get_with_key(&app, "/fresh", "k").await.status,
+            get_with_key(&app, "/fresh", KEY).await.status,
             StatusCode::OK
         );
         drop(held);

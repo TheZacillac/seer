@@ -136,6 +136,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DNS trace and DNS compare, on seer-api's paths. The heaviest share a
   pool of 8 slots, the audit runs under the audit timeout plus 5 seconds,
   and answers to keyed requests are `Cache-Control: private`.
+- **seer-server hardening.** `SEER_API_KEY` must be at least 16
+  characters; a client that presents ten wrong keys in a minute is refused
+  with a 429 until the minute ends; a `trusted_proxies` range broader than
+  `/8` (IPv4) or `/16` (IPv6) is refused; a connection that sends no
+  complete request within `header_timeout_secs` (default 10) is closed; at
+  most `max_connections` (default 1024) are open at once; and shutdown no
+  longer waits indefinitely on a stalled connection.
 - `seer.contract()` (Python) carries `concurrency_default` and
   `concurrency_max`; the fan-out ceiling of 50 is now defined once, in
   seer-core.
