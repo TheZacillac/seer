@@ -1,8 +1,9 @@
 //! `seer-server`: seer-core's lookups over HTTP, as JSON, for websites.
 //!
-//! It runs alongside the Python `seer-api` and serves the single-domain
-//! operations; bulk jobs, SSE streams and MCP stay there. Callers are
-//! anonymous (the public routes, when `[server] public = true`) or keyed
+//! It runs alongside the Python `seer-api` and serves every single-domain
+//! operation; bulk jobs, SSE streams and MCP stay there. Callers are
+//! anonymous (the public routes only, and only when `[server] public =
+//! true`) or keyed
 //! (`Authorization: Bearer $SEER_API_KEY`).
 //!
 //! Module map: [`settings`] validates the config and runs the startup

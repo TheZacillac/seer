@@ -683,6 +683,26 @@ curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8001/lookup/example.com
 | `/status/{domain}` | HTTP status, title, certificate, expiry |
 | `/health` | `{"status": "healthy"}`; no key needed |
 
+With the key, the server also answers every other single-domain
+operation:
+
+| Route | Returns |
+|-------|---------|
+| `/info/{domain}` | Registration data merged into flat fields |
+| `/dnssec/{domain}` | DNSSEC chain report |
+| `/delegation/{domain}` | Parent vs child NS records, lame servers |
+| `/propagation/{domain}/{record_type}` | One query across public resolvers |
+| `/dns/trace/{domain}` | The walk from the root servers (`?record_type=`, default `A`) |
+| `/dns/compare/{domain}` | One query on two servers (`?server_a=&server_b=`, `?record_type=`) |
+| `/caa/{domain}` | CAA policy |
+| `/posture/{domain}` | SPF, DMARC, MTA-STS, BIMI, DANE |
+| `/headers/{domain}` | HTTP security headers |
+| `/diff/{domain_a}/{domain_b}` | Two domains side by side |
+| `/subdomains/{domain}` | Names from CT logs (`?resolve=true` classifies them; `?concurrency=`) |
+| `/takeover/{domain}` | Subdomain takeover exposure (`?concurrency=`) |
+| `/confusables/{domain}` | Registered look-alike domains (`?concurrency=`) |
+| `/audit/{domain}` | The graded security audit |
+
 Callers are **keyed** (`Authorization: Bearer $SEER_API_KEY`) or, when
 `public = true`, **anonymous**. A wrong key is always a 401. Errors are
 `{"detail": "..."}`. Without `public = true` the server refuses to start
@@ -699,6 +719,13 @@ one anonymous client may have `max_in_flight_per_client` of them); a
 request that cannot get a slot within `request_timeout_secs` is a 503,
 and a lookup still running at that deadline is a 504.
 
+Answers to keyed requests are sent `Cache-Control: private`, so a CDN in
+front never stores them. The heaviest operations (audit, trace,
+subdomains, takeover, confusables) also share a pool of 8 slots. The
+audit runs under its own deadline, `[timeouts] audit_secs` plus 5
+seconds; the others use `request_timeout_secs`, so raise it (up to 120)
+if the CT-log scans time out for you.
+
 List only your reverse proxies in `trusted_proxies`. Any address inside
 a trusted range can choose the address it is rate-limited as, so a
 private network such as `10.0.0.0/8` draws a startup warning and
@@ -709,7 +736,7 @@ Configure it in `~/.seer/config.toml`:
 ```toml
 [server]
 bind = "127.0.0.1:8001"                  # the proxy forwards here
-public = false                           # true: anonymous callers get the routes above
+public = false                           # true: anonymous callers get the first table of routes
 cors_origins = ["https://example.com"]   # browser origins allowed to read responses
 trusted_proxies = ["127.0.0.1"]          # whose X-Forwarded-For to believe (IPs or CIDR)
 keyed_rate_multiplier = 10               # keyed callers' limit, as a multiple (1-100)

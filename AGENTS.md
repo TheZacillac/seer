@@ -79,16 +79,17 @@ in `seer-core`. The other four parse input, call core and present results.
 - `settings.rs` — `Settings::new` validates `[server]` + `SEER_API_KEY`;
   a `StartupError` stops the server before it binds.
 - `routes/` — `routes()` is the **one** route table (path, tier, cost
-  class, handler); handlers are edge checks → one core call handed to
-  `Call::respond`.
+  class, deadline, handler): eleven public rows and fourteen keyed ones;
+  handlers are edge checks → one core call handed to `Call::respond`.
 - `app.rs` — builds the router: the gate (tier, then rate limit, both
   read from the table), panic capture, `nosniff`, CORS, request log.
 - `call.rs` — `Call::respond`: cache lookup → permit → core call, the
-  last two under one deadline. `respond_fresh` skips the cache.
+  last two under the row's deadline (the audit's is the audit timeout plus
+  5 s). `respond_fresh` skips the cache.
 - `limit.rs` (GCRA limits per route and caller), `client_ip.rs` (the
   trusted-proxy rule), `cache.rs` (response bodies in a `TtlCache`, capped per body),
-  `state.rs` (the shared core clients, `Permits`, `PerClient`,
-  `AppState::new`).
+  `state.rs` (the shared core clients, `Permits` — total, anonymous half,
+  heavy pool of 8 — `PerClient`, `AppState::new`).
 - `tier.rs` (anonymous vs keyed), `edge.rs` (edge checks, JSON-rejecting
   extractors), `error.rs` (`ApiError`: status from
   `ErrorCategory::http_status()`, `Retry-After` on 429/503).
@@ -257,7 +258,7 @@ step). The tables:
 | MCP tools | `_TOOLS` in `seer-api/seer_api/mcp/server.py` |
 | seer-server routes | `routes::routes()` in `seer-server/src/routes/mod.rs` |
 | Error categories / HTTP statuses | `error::ErrorCategory` (Python: `seer.error_status_table()`) |
-| Input limits / rate-limit classes | `seer_core::contract` (Python: `seer.contract()`, via `seer-api/seer_api/_core.py`) |
+| Input limits / rate-limit classes / fan-out concurrency | `seer_core::contract` (Python: `seer.contract()`, via `seer-api/seer_api/_core.py`) |
 | Bulk limits | `seer-api/seer_api/_contract.py` |
 
 ### Code
@@ -342,6 +343,15 @@ step). The tables:
   `trusted_proxies` lists proxies, never client networks. A handler must
   go through `Call::respond` / `respond_fresh` — returning `Json`
   directly skips the cache, the permits and the deadline.
+- **seer-server marks keyed answers `private`.** The in-process cache
+  serves both tiers (the gate runs first, so an anonymous caller never
+  reaches a keyed route's entry), but a CDN in front must not store what
+  only keyed callers may have. Don't add a response path that sends a
+  keyed success with a bare `max-age`.
+- **seer-server's fan-out routes share the default deadline.** Only the
+  audit has its own. `/subdomains`, `/takeover` and `/confusables` can hit
+  `request_timeout_secs` when CT logs are slow; that is a 504 with every
+  slot returned, not a bug.
 - **seer-server mirrors seer-api's paths and JSON, not its edge:**
   validation failures are 400 (FastAPI: 422), and there is no server-side
   Origin/Host refusal — the tier gate and CORS are the controls. A wrong
