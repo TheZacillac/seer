@@ -6,12 +6,16 @@
 //! (`Authorization: Bearer $SEER_API_KEY`).
 //!
 //! Module map: [`settings`] validates the config and runs the startup
-//! checks; [`state`] holds the shared seer-core clients; [`app`] builds the
-//! router and its layers; [`tier`] decides who may call what; [`error`]
-//! turns failures into `{"detail": …}` responses.
+//! checks; [`state`] holds the shared seer-core clients; [`routes`] is the
+//! route table and its handlers; [`edge`] holds the checks handlers run
+//! before calling core; [`app`] builds the router and its layers; [`tier`]
+//! decides who may call what; [`error`] turns failures into
+//! `{"detail": …}` responses.
 
 pub mod app;
+pub mod edge;
 pub mod error;
+pub mod routes;
 pub mod settings;
 pub mod state;
 pub mod tier;
