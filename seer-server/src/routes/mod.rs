@@ -221,6 +221,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_cached_route_reads_the_cache_under_its_normalized_key() {
+        // Seeds the cache under the key each handler should build, then
+        // asks in another spelling. Every slot is held and the deadline is
+        // short, so a handler that builds a different key gets a 503
+        // instead of the seeded body, and nothing touches the network.
+        let server = ServerConfig {
+            public: true,
+            ..ServerConfig::default()
+        };
+        let mut settings = Settings::new(&server, Some("k".to_string())).unwrap();
+        settings.request_timeout = Duration::from_millis(100);
+        settings.max_in_flight = 2;
+        let table = routes();
+        let state = AppState::new(
+            settings,
+            Clients::from_config(&SeerConfig::default()),
+            &table,
+        );
+        let app = assemble(state.clone(), table);
+        let _a = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
+        let _b = state.permits.acquire(Caller::Keyed, Light).await.unwrap();
+        // (route, key parts, a request that must hit, one that must miss)
+        let cases: &[(&str, &[&str], &str, &str)] = &[
+            // Registration-level names drop `www.`; per-host ones keep it.
+            (
+                "/info/{domain}",
+                &["example.com"],
+                "/info/WWW.Example.com",
+                "/info/example.org",
+            ),
+            (
+                "/delegation/{domain}",
+                &["example.com"],
+                "/delegation/www.example.com",
+                "/delegation/example.org",
+            ),
+            (
+                "/posture/{domain}",
+                &["example.com"],
+                "/posture/www.EXAMPLE.com",
+                "/posture/example.org",
+            ),
+            (
+                "/takeover/{domain}",
+                &["example.com"],
+                "/takeover/www.example.com?concurrency=3",
+                "/takeover/example.org",
+            ),
+            (
+                "/confusables/{domain}",
+                &["example.com"],
+                "/confusables/Example.com?concurrency=50",
+                "/confusables/example.org",
+            ),
+            (
+                "/dnssec/{domain}",
+                &["www.example.com"],
+                "/dnssec/WWW.example.com",
+                "/dnssec/example.com",
+            ),
+            (
+                "/caa/{domain}",
+                &["www.example.com"],
+                "/caa/www.Example.com",
+                "/caa/example.com",
+            ),
+            (
+                "/headers/{domain}",
+                &["www.example.com"],
+                "/headers/www.example.COM",
+                "/headers/example.com",
+            ),
+            (
+                "/audit/{domain}",
+                &["www.example.com"],
+                "/audit/WWW.example.com",
+                "/audit/example.com",
+            ),
+            // Order matters in a diff.
+            (
+                "/diff/{domain_a}/{domain_b}",
+                &["a.example", "b.example"],
+                "/diff/A.example/b.example",
+                "/diff/b.example/a.example",
+            ),
+            // The two shapes of a subdomain answer never share an entry.
+            (
+                "/subdomains/{domain}",
+                &["example.com", "names"],
+                "/subdomains/www.example.com",
+                "/subdomains/example.com?resolve=true",
+            ),
+            (
+                "/subdomains/{domain}",
+                &["example.org", "resolved"],
+                "/subdomains/example.org?resolve=true&concurrency=2",
+                "/subdomains/example.org?resolve=false",
+            ),
+            // The record type is part of the answer.
+            (
+                "/propagation/{domain}/{record_type}",
+                &["example.com", "MX"],
+                "/propagation/Example.COM/MX",
+                "/propagation/example.com/A",
+            ),
+            (
+                "/dns/trace/{domain}",
+                &["example.com", "A"],
+                "/dns/trace/EXAMPLE.com",
+                "/dns/trace/example.com?record_type=MX",
+            ),
+        ];
+        for (index, (route, parts, hit, miss)) in cases.iter().enumerate() {
+            let body = format!("{{\"seeded\":{index}}}");
+            state
+                .cache
+                .put(crate::cache::key(route, parts), body.into());
+            let reply = get_with_key(&app, hit, "k").await;
+            assert_eq!(reply.status, StatusCode::OK, "{hit} missed its entry");
+            assert_eq!(reply.json["seeded"], index, "{hit} read another entry");
+            let other = get_with_key(&app, miss, "k").await;
+            assert_eq!(
+                other.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{miss} shared {hit}'s entry"
+            );
+        }
+        // Compare is never cached: nothing is read, whatever is stored.
+        let compare = "/dns/compare/example.com?server_a=8.8.8.8&server_b=1.1.1.1";
+        state.cache.put(
+            crate::cache::key("/dns/compare/{domain}", &["example.com", "A"]),
+            "{}".into(),
+        );
+        assert_eq!(
+            get_with_key(&app, compare, "k").await.status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
     async fn the_keyed_dns_routes_check_their_record_type() {
         for path in [
             "/dns/trace/example.com?record_type=a",

@@ -723,8 +723,12 @@ Answers to keyed requests are sent `Cache-Control: private`, so a CDN in
 front never stores them. The heaviest operations (audit, trace,
 subdomains, takeover, confusables) also share a pool of 8 slots. The
 audit runs under its own deadline, `[timeouts] audit_secs` plus 5
-seconds; the others use `request_timeout_secs`, so raise it (up to 120)
-if the CT-log scans time out for you.
+seconds from the moment it starts. The others use
+`request_timeout_secs`, and the two that read Certificate Transparency
+logs (subdomains, takeover) can outlast it when a log is slow: raise
+`request_timeout_secs` (up to 120)
+and lower `[timeouts] ct_secs` so a slow log fails over sooner. A very
+large zone may still not finish; that is a 504, and nothing is cached.
 
 List only your reverse proxies in `trusted_proxies`. Any address inside
 a trusted range can choose the address it is rate-limited as, so a

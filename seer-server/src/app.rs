@@ -889,6 +889,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_audit_waits_for_a_slot_no_longer_than_any_other_request() {
+        let (app, state) = app_and_state_with(
+            |s| {
+                s.request_timeout = Duration::from_millis(100);
+                s.max_in_flight = 2;
+            },
+            |c| c.audit_deadline = Duration::from_secs(30),
+        );
+        let _a = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let _b = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let reply = get_with_key(&app, "/slow-audit", "k").await;
+        // Busy after the request timeout, not after the audit's deadline.
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn an_audit_that_waited_for_a_slot_still_gets_its_whole_deadline() {
+        let (app, state) = app_and_state_with(
+            |s| {
+                s.request_timeout = Duration::from_millis(350);
+                s.max_in_flight = 2;
+            },
+            |c| c.audit_deadline = Duration::from_millis(400),
+        );
+        let a = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let _b = state
+            .permits
+            .acquire(Caller::Keyed, CostClass::Light)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let request = get_with_key(&app, "/slow-audit", "k");
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(a);
+        };
+        let (reply, ()) = tokio::join!(request, release);
+        assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
+        // 250 ms queued, then the full 400 ms: the wait was not charged
+        // to the audit. (Charged, it would end at 400 ms.)
+        assert!(started.elapsed() >= Duration::from_millis(600));
+    }
+
+    #[tokio::test]
     async fn a_timed_out_call_returns_its_permits() {
         let (app, state) = app_and_state(|s| {
             s.request_timeout = Duration::from_millis(100);

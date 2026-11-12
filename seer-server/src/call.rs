@@ -4,7 +4,9 @@
 //! [`Call::respond`], which runs it only if needed and only if allowed:
 //! the cache is consulted first, then the client's own share of lookups in
 //! flight is checked, then a slot is taken, and the wait for the slot plus
-//! the lookup itself share one deadline, the row's. Dropping the future at
+//! the lookup itself share one deadline. (The audit row differs: its wait
+//! is bounded the same way, then the audit gets its own, longer deadline
+//! from the moment it starts.) Dropping the future at
 //! the deadline (or when the client disconnects) cancels the lookup and
 //! returns its slots.
 
@@ -130,19 +132,24 @@ impl Call {
             ),
             None => None,
         };
-        let budget = match self.meta.deadline {
-            Deadline::Default => self.state.settings.request_timeout,
-            Deadline::Audit => self.state.clients.audit_deadline,
-        };
-        let deadline = Instant::now() + budget;
-        // No slot in time: nothing was started, so the caller may retry.
+        // The wait for a slot is bounded the same way on every route. No
+        // slot in time: nothing was started, so the caller may retry.
+        let slot_by = Instant::now() + self.state.settings.request_timeout;
         let _held = timeout_at(
-            deadline,
+            slot_by,
             self.state.permits.acquire(self.caller, self.meta.cost),
         )
         .await
         .map_err(|_| ApiError::busy())?
         .map_err(|_| ApiError::internal())?;
+        let deadline = match self.meta.deadline {
+            // One budget for the wait and the lookup.
+            Deadline::Default => slot_by,
+            // An audit returns a useful report at its own timeout, so its
+            // budget starts once it runs: time spent queued must not turn
+            // that report into a 504.
+            Deadline::Audit => Instant::now() + self.state.clients.audit_deadline,
+        };
         let value = timeout_at(deadline, work)
             .await
             .map_err(|_| ApiError::timeout())??;

@@ -258,7 +258,7 @@ step). The tables:
 | MCP tools | `_TOOLS` in `seer-api/seer_api/mcp/server.py` |
 | seer-server routes | `routes::routes()` in `seer-server/src/routes/mod.rs` |
 | Error categories / HTTP statuses | `error::ErrorCategory` (Python: `seer.error_status_table()`) |
-| Input limits / rate-limit classes / fan-out concurrency | `seer_core::contract` (Python: `seer.contract()`, via `seer-api/seer_api/_core.py`) |
+| Input limits / rate-limit classes / fan-out concurrency ceiling | `seer_core::contract` (Python: `seer.contract()`, via `seer-api/seer_api/_core.py`) |
 | Bulk limits | `seer-api/seer_api/_contract.py` |
 
 ### Code
