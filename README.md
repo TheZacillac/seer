@@ -149,6 +149,7 @@ Using Seer from Rust code instead? See [Rust Library](#-rust-library).
 | **seer-cli** | Rust binary | `brew install TheZacillac/tap/seer` or `cargo install seer-cli` | The `seer` command-line tool |
 | **seer-py** | Python extension | `pip install ./seer-py` | Python bindings via PyO3 (`import seer`); PyPI (`domain-seer`) planned |
 | **seer-api** | Python package | `pip install -e .` | REST API + MCP server |
+| **seer-server** | Rust binary | `cargo install --path seer-server` | HTTP server for websites (Axum); preview |
 
 <details>
 <summary><b>seer-cli vs seer-core — which do I need?</b></summary>
@@ -654,6 +655,50 @@ API docs (when `SEER_DOCS_ENABLED=true`):
 
 ---
 
+## 🌐 HTTP Server (seer-server)
+
+A Rust server that serves the single-domain lookups as JSON, for websites.
+It runs alongside `seer-api` and uses the same paths and response shapes;
+bulk jobs, streaming and MCP stay in `seer-api`.
+
+> **Not ready for the public internet yet.** This release has no rate
+> limiting, response cache or concurrency caps. Keep it on loopback or
+> behind your own access control until the next release adds them.
+
+```bash
+cargo install --path seer-server
+SEER_API_KEY=$KEY seer-server            # listens on 127.0.0.1:8001
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8001/lookup/example.com
+```
+
+| Route | Returns |
+|-------|---------|
+| `/lookup/{domain}` | Registration data (RDAP first, WHOIS fallback) |
+| `/whois/{domain}` | WHOIS |
+| `/rdap/domain/{domain}`, `/rdap/ip/{ip}`, `/rdap/asn/{asn}` | RDAP |
+| `/availability/{domain}` | Whether the domain can be registered |
+| `/tld/`, `/tld/{tld}` | Known TLDs; one TLD's WHOIS/RDAP servers |
+| `/dns/{domain}/{record_type}` | A DNS query, reported as `dig` does (`?nameserver=` needs the key) |
+| `/ssl/{domain}` | Certificate chain and warnings |
+| `/status/{domain}` | HTTP status, title, certificate, expiry |
+| `/health` | `{"status": "healthy"}`; no key needed |
+
+Callers are **keyed** (`Authorization: Bearer $SEER_API_KEY`) or, when
+`public = true`, **anonymous**. A wrong key is always a 401. Errors are
+`{"detail": "..."}`. Without `public = true` the server refuses to start
+unless `SEER_API_KEY` is set.
+
+Configure it in `~/.seer/config.toml`:
+
+```toml
+[server]
+bind = "127.0.0.1:8001"                  # put a TLS-terminating proxy in front
+public = false                           # true: anonymous callers get the routes above
+cors_origins = ["https://example.com"]   # browser origins allowed to read responses
+```
+
+---
+
 ## 🤖 MCP Server
 
 Integrate Seer with AI assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). Two transports expose the same tools:
@@ -729,7 +774,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RUST_LOG` | Logging level (`trace` / `debug` / `info` / `warn` / `error`) | — |
-| `ARCANUM_LOG_LEVEL` | Logging level or filter for the CLI and the bindings; takes precedence over `RUST_LOG` | — |
+| `ARCANUM_LOG_LEVEL` | Logging level or filter for the CLI, the bindings and seer-server; takes precedence over `RUST_LOG` | — |
 | `ARCANUM_LOG_FORMAT` | Log line format: `text` or `json` | `text` |
 | `ARCANUM_LOG_FILE` | `1` / `true` / `yes` also writes a daily-rotated log file | off |
 | `ARCANUM_LOG_DIR` | Directory for that log file | `~/.arcanum/logs` |
@@ -738,7 +783,7 @@ Propagation checks query **30 nameservers** across **6 regions**:
 | `SEER_DOMAIN_ALLOWLIST` | Comma-separated allowlist restricting which domains may be queried | — |
 | `SEER_HOST` | API bind host. Non-loopback requires `SEER_API_KEY` (without it, requests arriving on a non-loopback interface get a 503 however the server was started) | `127.0.0.1` |
 | `SEER_PORT` | API bind port | `8000` |
-| `SEER_API_KEY` | Bearer token required for all non-`/health` requests | — |
+| `SEER_API_KEY` | Bearer token required for all non-`/health` requests (seer-api and seer-server) | — |
 | `SEER_ALLOWED_HOSTS` | Comma-separated `Host:` values (`host:*` matches any port) the API also answers without `SEER_API_KEY`. Without a key only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`) is served otherwise — any other gets a 421, which stops DNS-rebinding pages. Ignored with a key; `/mcp` uses `SEER_MCP_ALLOWED_HOSTS` instead when that is set | — |
 | `SEER_CORS_ORIGINS` | Comma-separated CORS origins for the REST API. Unset: no CORS headers, and without `SEER_API_KEY` a request from a non-loopback `Origin` is refused (403) | — |
 | `SEER_DOCS_ENABLED` | Expose `/docs`, `/redoc`, `/openapi.json` | `false` |
@@ -827,8 +872,8 @@ cargo deny check                                       # Supply-chain policy (ad
 
 ### Project Structure
 
-The four packages are listed under [Packages](#-packages); all business
-logic lives in `seer-core`, and the other three are thin interfaces over it.
+The five packages are listed under [Packages](#-packages); all business
+logic lives in `seer-core`, and the other four are thin interfaces over it.
 The annotated per-module map is in
 [AGENTS.md → Layout](AGENTS.md#layout).
 

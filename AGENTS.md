@@ -4,7 +4,7 @@ Seer is a domain-name utility in Rust with Python bindings: WHOIS, RDAP, DNS
 (dig, trace, propagation, DNSSEC, delegation), SSL, HTTP status/headers,
 email posture, subdomain takeover, a graded security audit (`seer audit`)
 and more, exposed as a CLI (commands, REPL, TUI), a Python library, a
-FastAPI REST API and an MCP server.
+FastAPI REST API, an MCP server and a Rust HTTP server (`seer-server`).
 
 This file holds the rules and the non-obvious parts. **How a module works
 lives in its `//!` overview** (every `mod.rs` and major file has one) — read
@@ -19,18 +19,19 @@ seer/
 ├── seer-core/   # ALL business logic (Rust library)
 ├── seer-cli/    # `seer` binary: clap commands, REPL, ratatui TUI
 ├── seer-py/     # PyO3 bindings → Python package `seer` (dist name domain-seer)
-└── seer-api/    # FastAPI REST + MCP server (Python), built on seer-py
+├── seer-api/    # FastAPI REST + MCP server (Python), built on seer-py
+└── seer-server/ # Axum HTTP server for websites (Rust), built on seer-core
 ```
 
 ```
-seer-cli ──┐
-           ├──> seer-core
-seer-py ───┘
+seer-cli ─────┐
+seer-py ──────┼──> seer-core
+seer-server ──┘
 seer-api ──> seer-py ──> seer-core
 ```
 
 **Keep core pure.** Normalization, validation, network I/O and parsing live
-in `seer-core`. The other three parse input, call core and present results.
+in `seer-core`. The other four parse input, call core and present results.
 
 ### seer-core/src — where things are
 
@@ -71,6 +72,20 @@ in `seer-core`. The other three parse input, call core and present results.
   `errors.py` (exception → status), `ssrf.py`, `routers/`, `mcp/server.py` (the
   `_TOOLS` registry).
 
+### seer-server/src
+
+- `main.rs` — logging, config, startup checks; returns `ExitCode`.
+- `lib.rs` — `serve` / `serve_on` (graceful shutdown).
+- `settings.rs` — `Settings::new` validates `[server]` + `SEER_API_KEY`;
+  a `StartupError` stops the server before it binds.
+- `routes/` — `routes()` is the **one** route table (path, tier,
+  handler); handlers are edge checks → one core call → `Json`.
+- `app.rs` — builds the router: the tier gate (reads the matched route's
+  tier from the table), panic capture, `nosniff`, CORS, request log.
+- `tier.rs` (anonymous vs keyed), `edge.rs` (edge checks, JSON-rejecting
+  extractors), `error.rs` (`ApiError`: status from
+  `ErrorCategory::http_status()`), `state.rs` (the shared core clients).
+
 ---
 
 ## Commands
@@ -85,6 +100,7 @@ cd seer-api && pip install -e '.[dev]'     # API + test deps
 ./target/release/seer tui example.com
 seer-api                                   # REST on 127.0.0.1:8000
 seer-mcp                                   # MCP over stdio
+cargo run -p seer-server                   # HTTP on 127.0.0.1:8001 (needs SEER_API_KEY or [server] public = true)
 ```
 
 Building needs only a Rust toolchain and a C compiler (aws-lc-sys). There is
@@ -228,6 +244,7 @@ step). The tables:
 | TUI lenses | `LENSES` |
 | TUI lens options | `options.rs` consts on each `LENSES` row |
 | MCP tools | `_TOOLS` in `seer-api/seer_api/mcp/server.py` |
+| seer-server routes | `routes::routes()` in `seer-server/src/routes/mod.rs` |
 | Error categories / HTTP statuses | `error::ErrorCategory` (Python: `seer.error_status_table()`) |
 | Input limits / rate-limit classes | `seer_core::contract` (Python: `seer.contract()`, via `seer-api/seer_api/_core.py`) |
 | Bulk limits | `seer-api/seer_api/_contract.py` |
@@ -296,6 +313,15 @@ step). The tables:
   statuses from those classes — never by matching message text. The class
   comes from `SeerError::category()` through the `category_exceptions!`
   table in `seer-py/src/lib.rs`.
+- **seer-server is not shipped by cargo-dist** (`dist = false`,
+  `publish = false`): `[profile.dist]`'s `panic = "abort"` would let one
+  panicking request end the process, where `[profile.release]` lets
+  `CatchPanicLayer` turn it into a 500. Install with
+  `cargo install --path seer-server`.
+- **seer-server mirrors seer-api's paths and JSON, not its edge:**
+  validation failures are 400 (FastAPI: 422), and there is no server-side
+  Origin/Host refusal — the tier gate and CORS are the controls. A wrong
+  key is 401 and never falls back to anonymous.
 - Env vars are documented in one place: README → Configuration →
   Environment Variables. Add new ones there.
 
