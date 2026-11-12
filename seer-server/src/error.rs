@@ -40,6 +40,11 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "Not Found")
     }
 
+    /// 405: the route exists but only answers `GET`.
+    pub fn method_not_allowed() -> Self {
+        Self::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+    }
+
     /// 500: a fault in the server itself. Carries no detail.
     pub fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
@@ -153,6 +158,10 @@ mod tests {
         );
         assert_eq!(ApiError::not_found().status(), StatusCode::NOT_FOUND);
         assert_eq!(ApiError::not_found().detail(), "Not Found");
+        assert_eq!(
+            ApiError::method_not_allowed().status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
         assert_eq!(
             ApiError::internal().status(),
             StatusCode::INTERNAL_SERVER_ERROR

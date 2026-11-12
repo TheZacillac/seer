@@ -112,6 +112,7 @@ no OpenSSL anywhere — no `libssl-dev`/`pkg-config`.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p seer-core --no-default-features --all-targets -- -D warnings
+cargo clippy -p seer-server --all-targets -- -D warnings                              # alone: no `cli` feature
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc -p seer-core --no-deps                          # docs changed
 RUSTDOCFLAGS="-D warnings" cargo doc -p seer-core --no-deps --document-private-items
@@ -274,7 +275,9 @@ step). The tables:
   modules (`output`, `colors`, `doctor`, `drift`, `fsutil`, `history`,
   `logging`, `watchlist`, `webhook`, `subdomains::baseline`). seer-py builds
   without it. An ungated module must never use a gated one — CI clippy with
-  `--no-default-features` catches it.
+  `--no-default-features` catches it. seer-server builds without it too;
+  CI lints it alone (`-p seer-server`), because the workspace build
+  turns `cli` on for every crate.
 - **One TLS stack:** rustls on aws-lc-rs, provider named explicitly in every
   config. Don't add a dependency that pulls in ring, native-tls or OpenSSL.
 - **`tls::InspectOnly` accepts any chain and skips the handshake-signature

@@ -83,6 +83,7 @@ pub fn router(settings: Settings, clients: Clients, routes: Vec<Route>) -> Route
         .route_layer(middleware::from_fn_with_state(state.clone(), gate))
         .route("/health", routing::get(health))
         .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         // Outermost last: the request log wraps everything, so even a
         // captured panic or a CORS preflight gets an id and a log line.
         .layer(CatchPanicLayer::custom(panic_response))
@@ -109,10 +110,14 @@ async fn gate(
         .and_then(|path| state.tiers.get(path.as_str()).copied())
         .ok_or_else(ApiError::internal)?;
     // A header that is not valid UTF-8 is present but wrong, never absent.
-    let authorization = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .map(|value| value.to_str().unwrap_or(""));
+    // So is a repeated one: a proxy in front could honour a different copy
+    // than this server would, so no order of two is accepted.
+    let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
+    let authorization = match (values.next(), values.next()) {
+        (None, _) => None,
+        (Some(value), None) => Some(value.to_str().unwrap_or("")),
+        (Some(_), Some(_)) => Some(""),
+    };
     let caller = tier::identify(authorization, state.settings.api_key.as_deref())?;
     tier::authorize(caller, tier, state.settings.public)?;
     request.extensions_mut().insert(caller);
@@ -178,6 +183,10 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn not_found() -> ApiError {
     ApiError::not_found()
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::method_not_allowed()
 }
 
 /// What a panicking handler's caller receives. The panic message goes to
@@ -293,6 +302,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn more_than_one_authorization_header_is_refused() {
+        // A proxy and this server could disagree about which one counts, so
+        // neither order is accepted, even when one of them is the right key.
+        let app = app(true, Some("k"), &[]);
+        for pair in [["Bearer k", "Bearer wrong"], ["Bearer wrong", "Bearer k"]] {
+            let reply = send(
+                &app,
+                Method::GET,
+                "/open/x",
+                &[
+                    ("authorization", pair[0].as_bytes()),
+                    ("authorization", pair[1].as_bytes()),
+                ],
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{pair:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_core_error_becomes_its_status_and_sanitized_detail() {
         let reply = get(&app(true, None, &[]), "/fail").await;
         assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
@@ -320,6 +349,8 @@ mod tests {
     async fn only_get_is_routed() {
         let reply = send(&app(true, None, &[]), Method::POST, "/open/x", &[]).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(reply.json, json!({ "detail": "Method Not Allowed" }));
+        assert_eq!(reply.headers[header::CACHE_CONTROL], "no-store");
     }
 
     #[tokio::test]
