@@ -382,6 +382,7 @@ fn contract(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     dict.set_item("record_type_max_length", shared::RECORD_TYPE_MAX_LENGTH)?;
     dict.set_item("record_type_pattern", shared::RECORD_TYPE_PATTERN)?;
     dict.set_item("message_max_length", shared::MESSAGE_MAX_LENGTH)?;
+    dict.set_item("tld_token_pattern", shared::TLD_TOKEN_PATTERN)?;
     dict.set_item("rate_limits", rate_limits)?;
     Ok(dict)
 }

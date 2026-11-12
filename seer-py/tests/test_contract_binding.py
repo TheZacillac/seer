@@ -41,6 +41,7 @@ def test_contract_carries_cores_limits():
         "record_type_max_length": 10,
         "record_type_pattern": "^[A-Z0-9]+$",
         "message_max_length": 200,
+        "tld_token_pattern": r"^\.?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$",
         "rate_limits": {"light": 60, "standard": 30, "moderate": 20, "heavy": 5},
     }
 

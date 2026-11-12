@@ -35,6 +35,26 @@ pub fn is_record_type_token(token: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// The TLD token rule as a regular expression, for surfaces that publish
+/// it or validate with a regex engine. [`is_tld_token`] is the same rule; a
+/// test holds the two together.
+pub const TLD_TOKEN_PATTERN: &str = r"^\.?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$";
+
+/// Whether `token` is a plausible TLD: an optional leading dot, then 1 to
+/// 63 ASCII letters, digits or hyphens with no leading or trailing hyphen
+/// (so punycode A-labels such as `xn--p1ai` pass). An edge check that
+/// rejects junk with a clear error; a TLD is a lookup key, never a connect
+/// target.
+pub fn is_tld_token(token: &str) -> bool {
+    let label = token.strip_prefix('.').unwrap_or(token);
+    (1..=63).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+}
+
 /// Makes error text safe to put on the wire: C0 and C1 control characters
 /// (CR/LF, NUL, the ESC that starts an ANSI sequence) are removed, then the
 /// result is cut to [`MESSAGE_MAX_LENGTH`] characters. Stripping comes
@@ -153,6 +173,28 @@ mod tests {
             assert_eq!(class.name(), name);
             assert_eq!(class.per_minute(), per_minute);
         }
+    }
+
+    #[test]
+    fn tld_token_rule_agrees_with_its_pattern() {
+        let pattern = regex::Regex::new(TLD_TOKEN_PATTERN).unwrap();
+        let label_63 = "a".repeat(63);
+        let label_64 = "a".repeat(64);
+        let dotted_63 = format!(".{label_63}");
+        for token in [
+            "com", ".com", "COM", "xn--p1ai", "a", "a1", "co.uk", "-a", "a-", "", ".", "..com",
+            "a b", "é", "a\n", &label_63, &label_64, &dotted_63,
+        ] {
+            assert_eq!(
+                is_tld_token(token),
+                pattern.is_match(token),
+                "rule and pattern disagree on {token:?}"
+            );
+        }
+        assert!(is_tld_token("com"));
+        assert!(is_tld_token(".xn--p1ai"));
+        assert!(!is_tld_token("co.uk"));
+        assert!(!is_tld_token(&label_64));
     }
 
     #[test]

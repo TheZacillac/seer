@@ -99,3 +99,24 @@ def test_stale_binding_fails_with_rebuild_message(monkeypatch):
     monkeypatch.delitem(sys.modules, "seer_api._core", raising=False)
     with pytest.raises(ImportError, match="maturin develop"):
         importlib.import_module("seer_api._core")
+
+
+def test_tld_token_rule_is_cores():
+    from seer_api import _contract
+
+    assert _contract.TLD_TOKEN_RE.pattern == seer.contract()["tld_token_pattern"]
+    assert _contract.TLD_TOKEN_RE.fullmatch("com")
+    assert _contract.TLD_TOKEN_RE.fullmatch(".XN--P1AI")
+    assert not _contract.TLD_TOKEN_RE.fullmatch("co.uk")
+    assert not _contract.TLD_TOKEN_RE.fullmatch("-bad-")
+
+
+def test_binding_missing_a_contract_key_fails_with_rebuild_message(monkeypatch):
+    # A compiled extension whose contract() predates a key seer-api reads
+    # must fail the import with instructions, not a KeyError later.
+    stale = dict(seer.contract())
+    del stale["tld_token_pattern"]
+    monkeypatch.setattr(seer, "contract", lambda: stale)
+    monkeypatch.delitem(sys.modules, "seer_api._core", raising=False)
+    with pytest.raises(ImportError, match="maturin develop"):
+        importlib.import_module("seer_api._core")
