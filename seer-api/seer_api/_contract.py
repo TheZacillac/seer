@@ -48,7 +48,7 @@ RECORD_TYPE_MAX_LENGTH: int = CONTRACT["record_type_max_length"]
 # punycode A-labels like "xn--p1ai"). Deliberately looser than full IDNA —
 # unknown-but-plausible TLDs return a payload with null fields; this only
 # rejects junk with a clear error. Never a URL/connect target.
-TLD_TOKEN_RE = re.compile(r"^\.?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+TLD_TOKEN_RE = re.compile(CONTRACT["tld_token_pattern"])
 
 # Longest domain name accepted (RFC 1035's 253-octet presentation form), and
 # the longest nameserver spec — room for a DoH URL (https://host/path).

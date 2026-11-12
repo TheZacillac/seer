@@ -36,6 +36,8 @@ pub struct SeerConfig {
     pub watch: WatchConfig,
     /// TUI settings (`seer tui`)
     pub tui: TuiConfig,
+    /// HTTP server settings (`seer-server`)
+    pub server: ServerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +87,33 @@ pub struct TuiConfig {
     pub theme: String,
 }
 
+/// Settings for the `seer-server` HTTP server. The CLI ignores them. The
+/// API key is not here: secrets stay out of the config file and come from
+/// the `SEER_API_KEY` environment variable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Address and port to listen on. Loopback by default: the server is
+    /// meant to sit behind a reverse proxy that terminates TLS.
+    pub bind: String,
+    /// Whether callers without an API key may use the public routes. Off by
+    /// default; with it off the server needs `SEER_API_KEY` to start.
+    pub public: bool,
+    /// Origins whose pages may read responses from a browser (CORS), e.g.
+    /// `"https://example.com"`. Empty by default; `"*"` allows any origin.
+    pub cors_origins: Vec<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8001".to_string(),
+            public: false,
+            cors_origins: Vec::new(),
+        }
+    }
+}
+
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
@@ -102,6 +131,7 @@ impl Default for SeerConfig {
             bulk: BulkConfig::default(),
             watch: WatchConfig::default(),
             tui: TuiConfig::default(),
+            server: ServerConfig::default(),
         }
     }
 }
@@ -311,6 +341,45 @@ impl SeerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_section_defaults_are_private_and_loopback() {
+        let config = SeerConfig::default();
+        assert_eq!(config.server.bind, "127.0.0.1:8001");
+        assert!(!config.server.public);
+        assert!(config.server.cors_origins.is_empty());
+    }
+
+    #[test]
+    fn server_section_parses() {
+        let config: SeerConfig = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:9000"
+public = true
+cors_origins = ["https://example.com"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.bind, "127.0.0.1:9000");
+        assert!(config.server.public);
+        assert_eq!(config.server.cors_origins, ["https://example.com"]);
+    }
+
+    #[test]
+    fn server_section_keys_are_known_and_typos_are_reported() {
+        let unknown = SeerConfig::unknown_keys(
+            "[server]\nbind = \"127.0.0.1:1\"\npublic = true\ncors_origins = []\npublc = true\n",
+        );
+        assert_eq!(unknown, ["server.publc"]);
+    }
+
+    #[test]
+    fn server_section_survives_default_toml_roundtrip() {
+        let parsed: SeerConfig = toml::from_str(&SeerConfig::default_toml()).unwrap();
+        assert_eq!(parsed.server.bind, "127.0.0.1:8001");
+        assert!(SeerConfig::default_toml().contains("[server]"));
+    }
 
     #[test]
     fn test_default_config() {

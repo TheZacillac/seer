@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["seer-core", "seer-cli", "seer-py"]
+members = ["seer-core", "seer-cli", "seer-py", "seer-server"]
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
@@ -44,6 +44,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # .tw answers HTTP/1.1 with 426 Upgrade Required). `h2` is already in the
 # tree via hickory's DoH.
 reqwest = { version = "0.13", features = ["rustls", "stream", "http2"], default-features = false }
+
+# HTTP server (seer-server only). hyper, tower and tower-http are already in
+# the tree through reqwest, so axum adds routing on the same stack. Default
+# features are off: no form, multipart, websocket or macro support is used.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio"] }
+tower-http = { version = "0.6", default-features = false, features = ["catch-panic", "cors", "set-header"] }
+# Test-only: `ServiceExt::oneshot` drives the router in-process, no socket.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Constant-time comparison of the API key (already in the tree via rustls).
+subtle = "2"
 
 # DNS resolution.
 # `tokio` is the runtime glue (the only default feature we keep —

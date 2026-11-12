@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tokio::sync::Notify;
@@ -700,11 +701,18 @@ impl SmartLookup {
             return Ok(cached);
         }
 
+        // Each stage is boxed: inline, their futures made a lookup 45 KB,
+        // and a future's bytes are carried by every caller up the stack
+        // (see `the_lookup_future_stays_small`). `boxed()` also erases the
+        // type, so a caller's `Send` proof stops here instead of walking
+        // every layer of the RDAP and WHOIS clients.
         let result = self
             .lookup_concurrent(&normalized, progress.clone())
+            .boxed()
             .await?;
         let result = self
             .attach_dns_nameservers(&normalized, result, progress)
+            .boxed()
             .await;
 
         // Cache a trimmed copy to limit memory usage before releasing
@@ -755,8 +763,9 @@ impl SmartLookup {
             cb("Querying RDAP and WHOIS concurrently");
         }
 
-        let rdap_fut = self.rdap_client.lookup_domain(domain);
-        let whois_fut = self.whois_client.lookup(domain);
+        // Boxed: the race moves both futures by value, and each is large.
+        let rdap_fut = self.rdap_client.lookup_domain(domain).boxed();
+        let whois_fut = self.whois_client.lookup(domain).boxed();
 
         // Race: a winner with usable data grants the loser only a grace
         // period; a winner that failed (or returned an unusable body) leaves
@@ -979,6 +988,19 @@ impl SmartLookup {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_lookup_future_stays_small() {
+        // A lookup races RDAP against WHOIS, then checks delegation and may
+        // fall back to an availability check. Held inline, those futures
+        // made this one tens of kilobytes, and a future's bytes are carried
+        // by every caller up the stack: a debug build needed more than a
+        // 2 MiB Tokio worker stack once `StatusClient::check` wrapped it,
+        // and aborted the process. The stages are boxed instead.
+        let lookup = SmartLookup::new();
+        let size = size_of_val(&lookup.lookup("example.com"));
+        assert!(size <= 4096, "lookup future grew to {size} bytes");
+    }
     use super::*;
     use crate::rdap::rdap_error_is_404;
 

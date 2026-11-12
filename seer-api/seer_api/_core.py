@@ -30,8 +30,33 @@ def _binding(name: str) -> Callable[..., Any]:
         ) from exc
 
 
+# Every key seer-api reads from `seer.contract()`.
+_CONTRACT_KEYS = (
+    "domain_max_length",
+    "nameserver_max_length",
+    "record_type_max_length",
+    "record_type_pattern",
+    "message_max_length",
+    "tld_token_pattern",
+    "rate_limits",
+)
+
+
+def _load_contract() -> dict[str, Any]:
+    """``seer.contract()``, checked for every key seer-api reads."""
+    contract = _binding("contract")()
+    missing = [key for key in _CONTRACT_KEYS if key not in contract]
+    if missing:
+        raise ImportError(
+            f"the installed seer bindings' contract has no {', '.join(missing)}; "
+            "they predate this seer-api. Rebuild them with "
+            "`cd seer-py && maturin develop --release`."
+        )
+    return contract
+
+
 # Limits and rate-limit classes: see seer-core's `contract` module.
-CONTRACT: dict[str, Any] = _binding("contract")()
+CONTRACT: dict[str, Any] = _load_contract()
 
 # (exception class, HTTP status) rows in match order; `seer.SeerError`, the
 # base class, is last.
