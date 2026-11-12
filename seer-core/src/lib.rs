@@ -22,6 +22,7 @@ pub mod cache;
 pub mod colors;
 pub mod config;
 pub mod confusables;
+pub mod contract;
 mod dates;
 pub mod diff;
 pub mod dkim;
