@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-11-12
+
 ### Changed
 - **TUI.** The four sections share one frame: boxes that touch share a
   single border line with junctions instead of doubling it, and content has
@@ -23,6 +25,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SSL / Cert · valid · 44d left`). The status bar ends with the output
   format and theme, and `?` help groups its keys under Navigate / Act /
   View.
+- **seer-server** refuses to start on a config file it cannot read or
+  parse, or that names a setting it does not know (it used to fall back to
+  defaults with a warning).
+- **seer-api.** The TLD token rule now comes from seer-core
+  (`contract::is_tld_token`) and is ASCII-only, as its error message says;
+  two non-ASCII letters Python's case-insensitive match used to let through
+  are now a 400.
+- **Shared contract.** Error classification, HTTP status codes, input limits
+  and rate-limit classes now live in seer-core (`ErrorCategory`, the
+  `contract` module) and are read by the Python bindings and seer-api
+  instead of being defined again there. Behaviour is unchanged. New
+  bindings: `seer.error_status_table()`, `seer.contract()`,
+  `seer.clean_message()`. seer-api needs bindings from this release or
+  later; with older ones it refuses to start and says to rebuild them.
+- `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
+  silently ignored); use `--format json`.
+- TUI: a `:` command with extra arguments (`:prop example.com MX`,
+  `:compare … MX`) is refused instead of dropping them; `:compare` accepts
+  `@server` spellings.
+- An unknown key or section in `~/.seer/config.toml` prints a warning, and
+  `seer doctor` reports it; the file still loads.
+- **seer-api (breaking for clients reading the body):** the API's own 429
+  is `{"detail": "Rate limit exceeded: …"}` with a `Retry-After` header,
+  matching every other error (it was `{"error": …}`).
 
 ### Fixed
 - **seer-core.** A lookup or status check no longer needs a very large
@@ -155,32 +181,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **seer-core.** `SeerError::category()` and `SeerError::root_cause()`,
   `ErrorCategory` with `http_status()`, and the `contract` module
   (`CostClass`, length limits, `clean_message`).
-
-### Changed
-- **seer-server** refuses to start on a config file it cannot read or
-  parse, or that names a setting it does not know (it used to fall back to
-  defaults with a warning).
-- **seer-api.** The TLD token rule now comes from seer-core
-  (`contract::is_tld_token`) and is ASCII-only, as its error message says;
-  two non-ASCII letters Python's case-insensitive match used to let through
-  are now a 400.
-- **Shared contract.** Error classification, HTTP status codes, input limits
-  and rate-limit classes now live in seer-core (`ErrorCategory`, the
-  `contract` module) and are read by the Python bindings and seer-api
-  instead of being defined again there. Behaviour is unchanged. New
-  bindings: `seer.error_status_table()`, `seer.contract()`,
-  `seer.clean_message()`. seer-api needs bindings from this release or
-  later; with older ones it refuses to start and says to rebuild them.
-- `-q` / `--fields` with `bulk` or `follow` is a usage error (they were
-  silently ignored); use `--format json`.
-- TUI: a `:` command with extra arguments (`:prop example.com MX`,
-  `:compare … MX`) is refused instead of dropping them; `:compare` accepts
-  `@server` spellings.
-- An unknown key or section in `~/.seer/config.toml` prints a warning, and
-  `seer doctor` reports it; the file still loads.
-- **seer-api (breaking for clients reading the body):** the API's own 429
-  is `{"detail": "Rate limit exceeded: …"}` with a `Retry-After` header,
-  matching every other error (it was `{"error": …}`).
 
 ## [0.58.0] - 2026-11-02
 
@@ -2406,7 +2406,8 @@ Two notable breaking changes landed in this period:
   The human and markdown formatters group both fields by record type and
   omit the per-type subheader when only one type is present.
 
-[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.58.0...HEAD
+[Unreleased]: https://github.com/TheZacillac/seer/compare/v0.59.0...HEAD
+[0.59.0]: https://github.com/TheZacillac/seer/compare/v0.58.0...v0.59.0
 [0.58.0]: https://github.com/TheZacillac/seer/compare/v0.57.0...v0.58.0
 [0.57.0]: https://github.com/TheZacillac/seer/compare/v0.56.0...v0.57.0
 [0.56.0]: https://github.com/TheZacillac/seer/compare/v0.55.0...v0.56.0
