@@ -49,7 +49,7 @@ reqwest = { version = "0.13", features = ["rustls", "stream", "http2"], default-
 # the tree through reqwest, so axum adds routing on the same stack. Default
 # features are off: no form, multipart, websocket or macro support is used.
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio"] }
-tower-http = { version = "0.6", default-features = false, features = ["catch-panic", "cors", "set-header"] }
+tower-http = { version = "0.7", default-features = false, features = ["catch-panic", "cors", "set-header"] }
 # Test-only: `ServiceExt::oneshot` drives the router in-process, no socket.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Constant-time comparison of the API key (already in the tree via rustls).
